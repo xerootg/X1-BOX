@@ -40,7 +40,33 @@ extern bool xemu_get_frame_skip(void);
 #include <android/log.h>
 #endif
 
+/*
+ * On-disk identity stamp used to gate cache reuse. Mismatch on any field
+ * (or wrong file size) triggers a wipe of spv_cache/, vk_pipeline_cache.bin
+ * and shader_module_keys.bin.
+ *
+ *   magic              — sanity marker; bump if this struct layout changes
+ *                        in a way that previous files would misinterpret.
+ *   renderer_mode      — CONFIG_DISPLAY_RENDERER enum value. Switching
+ *                        between GL and Vulkan invalidates VK caches
+ *                        (different shader emit path, layout qualifiers,
+ *                        etc.).
+ *   shader_key_size    — sizeof(ShaderModuleCacheKey). Any change to one
+ *                        of the cached state structs (PshState, VshState,
+ *                        GeomState, glsl_opts) shifts byte offsets, which
+ *                        re-interprets stale keys as garbage. Catching the
+ *                        size mismatch wipes before that garbage feeds the
+ *                        GLSL emitter and produces malformed shaders.
+ *   vendor_id, device_id, driver_version, pipeline_cache_uuid — Vulkan
+ *                        driver identity. Bumped drivers invalidate
+ *                        precompiled SPIR-V/pipeline cache.
+ */
+#define GPU_DRIVER_ID_MAGIC 0xCACE0001u
+
 typedef struct {
+    uint32_t magic;
+    uint32_t renderer_mode;
+    uint32_t shader_key_size;
     uint32_t vendor_id;
     uint32_t device_id;
     uint32_t driver_version;
@@ -77,6 +103,10 @@ static void check_driver_identity_and_wipe_caches(PGRAPHVkState *r)
     char *id_path = g_strdup_printf("%sgpu_driver_id.bin", base);
 
     GpuDriverIdentity current;
+    memset(&current, 0, sizeof(current));
+    current.magic = GPU_DRIVER_ID_MAGIC;
+    current.renderer_mode = (uint32_t)g_config.display.renderer;
+    current.shader_key_size = (uint32_t)sizeof(ShaderModuleCacheKey);
     current.vendor_id = r->device_props.vendorID;
     current.device_id = r->device_props.deviceID;
     current.driver_version = r->device_props.driverVersion;
@@ -120,6 +150,40 @@ static void check_driver_identity_and_wipe_caches(PGRAPHVkState *r)
                             sizeof(GpuDriverIdentity), NULL);
     }
 
+    g_free(id_path);
+}
+
+/*
+ * Stamp the on-disk gpu_driver_id.bin with `renderer_mode` so the next
+ * Vulkan launch will see the mode change and trigger a cache wipe.
+ *
+ * Called from the GL renderer's init when it takes over — without this,
+ * a VK → GL → VK round trip leaves the marker unchanged (the GL run
+ * doesn't touch it), so the next VK launch would happily load caches
+ * that may now be incompatible.
+ *
+ * Preserves all other fields so the wipe only fires on an actual mode
+ * change, not every cross-renderer boot.
+ */
+void pgraph_vk_stamp_cache_renderer_mode(int renderer_mode)
+{
+    if (!g_config.perf.cache_shaders) {
+        return;
+    }
+    const char *base = xemu_settings_get_base_path();
+    char *id_path = g_strdup_printf("%sgpu_driver_id.bin", base);
+    gchar *data = NULL;
+    gsize len = 0;
+    if (g_file_get_contents(id_path, &data, &len, NULL) &&
+        len == sizeof(GpuDriverIdentity)) {
+        GpuDriverIdentity *cur = (GpuDriverIdentity *)data;
+        if (cur->magic == GPU_DRIVER_ID_MAGIC &&
+            cur->renderer_mode != (uint32_t)renderer_mode) {
+            cur->renderer_mode = (uint32_t)renderer_mode;
+            g_file_set_contents(id_path, data, len, NULL);
+        }
+    }
+    g_free(data);
     g_free(id_path);
 }
 

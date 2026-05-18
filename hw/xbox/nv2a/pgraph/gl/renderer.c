@@ -84,9 +84,16 @@ static void early_context_init(void)
     glo_set_current(g_nv2a_context_display);
 }
 
+extern void pgraph_vk_stamp_cache_renderer_mode(int renderer_mode);
+
 static void pgraph_gl_init(NV2AState *d, Error **errp)
 {
     PGRAPHState *pg = &d->pgraph;
+
+    /* Stamp the shared gpu_driver_id.bin so next VK launch sees the mode
+     * change and wipes VK shader/pipeline caches. No-op if VK never ran
+     * on this install. */
+    pgraph_vk_stamp_cache_renderer_mode(CONFIG_DISPLAY_RENDERER_OPENGL);
 
     pg->gl_renderer_state = g_malloc0(sizeof(*pg->gl_renderer_state));
     PGRAPHGLState *r = pg->gl_renderer_state;
