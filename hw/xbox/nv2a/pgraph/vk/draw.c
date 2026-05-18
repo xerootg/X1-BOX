@@ -542,6 +542,7 @@ void pgraph_vk_init_pipelines(PGRAPHState *pg)
     for (int i = 0; i < NUM_SUBMIT_FRAMES; i++) {
         VK_CHECK(vkCreateFence(r->device, &fence_info, NULL,
                                &r->frame_fences[i]));
+        r->aux_main_semaphores[i] = VK_NULL_HANDLE;
     }
 
     VK_CHECK(
@@ -550,6 +551,16 @@ void pgraph_vk_init_pipelines(PGRAPHState *pg)
     VK_CHECK(vkCreateSemaphore(r->device, &semaphore_info, NULL,
                                &r->stall_chain_semaphore));
     r->stall_chain_pending = false;
+
+    /* Mali only: per-frame semaphore used to chain the aux CB submit to
+     * the main CB submit when they're split into two single-CB submits.
+     * See render_thread.c process_finish for the split rationale. */
+    if (r->is_mali) {
+        for (int i = 0; i < NUM_SUBMIT_FRAMES; i++) {
+            VK_CHECK(vkCreateSemaphore(r->device, &semaphore_info, NULL,
+                                       &r->aux_main_semaphores[i]));
+        }
+    }
 
     r->current_frame = 0;
     r->command_buffer_fence = r->frame_fences[0];
@@ -576,6 +587,10 @@ void pgraph_vk_finalize_pipelines(PGRAPHState *pg)
         }
         r->deferred_framebuffer_count[i] = 0;
         vkDestroyFence(r->device, r->frame_fences[i], NULL);
+        if (r->aux_main_semaphores[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(r->device, r->aux_main_semaphores[i], NULL);
+            r->aux_main_semaphores[i] = VK_NULL_HANDLE;
+        }
     }
     vkDestroyFence(r->device, r->aux_fence, NULL);
     vkDestroySemaphore(r->device, r->stall_chain_semaphore, NULL);
@@ -1866,6 +1881,33 @@ static void sync_staging_buffer(PGRAPHState *pg, VkCommandBuffer cmd,
         return;
     }
 
+    /*
+     * The src is a host-mapped staging buffer just written by pgraph_vk_append_to_buffer.
+     * On Mali (and any GPU where AUTO_PREFER_HOST selects non-coherent host-cached
+     * memory), CPU writes may still sit in CPU write-combining cache when the GPU
+     * issues the TRANSFER read below — producing per-frame variability in whatever
+     * the buffer feeds (inline-vertex texcoords, indices, uniforms). Flush the
+     * written range and add a HOST→TRANSFER barrier on the source. VMA no-ops the
+     * flush on coherent memory, so non-Mali keeps the cheap path.
+     * Mirrors the pattern used by flush_memory_buffer() for vertex_ram below.
+     */
+    VK_CHECK(vmaFlushAllocation(r->allocator, b_src->allocation,
+                                0, b_src->buffer_offset));
+
+    VkBufferMemoryBarrier host_barrier = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = b_src->buffer,
+        .offset = 0,
+        .size = b_src->buffer_offset,
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1,
+                         &host_barrier, 0, NULL);
+
     VkBufferCopy copy_region = { .size = b_src->buffer_offset };
     vkCmdCopyBuffer(cmd, b_src->buffer, b_dst->buffer, 1, &copy_region);
 
@@ -2032,6 +2074,41 @@ static void begin_render_pass(PGRAPHState *pg)
         .clearValueCount = 0,
         .pClearValues = NULL,
     };
+    /*
+     * Mali stock driver: color-only render passes (no depth attachment)
+     * after a depth-having render pass reliably hang the kcpu fence.
+     * Confirmed in logs: Halo 2 transitions zeta_fmt=129 → zeta_fmt=0
+     * at the Bungie fade-in and within 3 such RPs Mali dies.
+     *
+     * Insert an explicit pipeline barrier before begin_render_pass when
+     * zeta is null on Mali — forces prior color writes to fully drain
+     * before this depth-less RP starts reading them via load_op=LOAD.
+     */
+    if (r->is_mali && !r->zeta_binding && r->color_binding) {
+        VkImageMemoryBarrier color_drain = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = r->color_binding->image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
+            },
+        };
+        vkCmdPipelineBarrier(r->command_buffer,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            0, 0, NULL, 0, NULL, 1, &color_drain);
+    }
     vkCmdBeginRenderPass(r->command_buffer, &render_pass_begin_info,
                          VK_SUBPASS_CONTENTS_INLINE);
     r->in_render_pass = true;

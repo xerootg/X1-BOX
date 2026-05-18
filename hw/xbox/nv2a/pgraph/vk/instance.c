@@ -24,7 +24,6 @@
 
 #ifdef __ANDROID__
 #include <android/log.h>
-#include <vulkan/vulkan_android.h>
 #endif
 #include <volk.h>
 
@@ -151,11 +150,20 @@ add_extension_if_available(VkExtensionPropertiesArray *available_extensions,
 {
     if (is_extension_available(available_extensions, desired_extension_name)) {
         g_array_append_val(enabled_extension_names, desired_extension_name);
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "hakuX-vk-ext",
+                            "enabled: %s", desired_extension_name);
+#endif
         return true;
     }
 
     fprintf(stderr, "Warning: extension not available: %s\n",
             desired_extension_name);
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_WARN, "hakuX-vk-ext",
+                        "MISSING (loader does NOT advertise): %s",
+                        desired_extension_name);
+#endif
     return false;
 }
 
@@ -170,6 +178,7 @@ add_optional_instance_extension_names(PGRAPHState *pg,
         g_config.display.vulkan.validation_layers &&
         add_extension_if_available(available_extensions, enabled_extension_names,
                                    VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+
 }
 
 static bool create_instance(PGRAPHState *pg, Error **errp)
@@ -501,13 +510,20 @@ static void add_optional_device_extension_names(
      */
 # ifdef __ANDROID__
     extern bool xemu_android_vulkan_custom_driver_zip_loaded(void);
-    if (r->device_props.vendorID == 0x5143u &&
-        !xemu_android_vulkan_custom_driver_zip_loaded()) {
+    bool stock_qcom = r->device_props.vendorID == 0x5143u &&
+                      !xemu_android_vulkan_custom_driver_zip_loaded();
+    /* Mali stock driver: deterministic kcpu fence stall ~25s into gameplay
+     * with EDS3 enabled. Disable it pre-emptively. Costs us static pipeline
+     * blend state in exchange for stock-driver compatibility. */
+    bool stock_mali = r->is_mali;
+    if (stock_qcom || stock_mali) {
         r->eds3_blend_supported = false;
-        fprintf(stderr, "Qualcomm GPU: omitting %s (use static blend for stock-driver compatibility)\n",
+        fprintf(stderr, "%s GPU: omitting %s (use static blend for stock-driver compatibility)\n",
+                stock_qcom ? "Qualcomm" : "Mali",
                 VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
         __android_log_print(ANDROID_LOG_INFO, "hakuX",
-                              "Qualcomm stock driver: dynamic blend (EDS3) disabled");
+                              "%s stock driver: dynamic blend (EDS3) disabled",
+                              stock_qcom ? "Qualcomm" : "Mali");
     } else
 # endif
     {
@@ -536,13 +552,17 @@ static void add_optional_device_extension_names(
 
 #ifdef __ANDROID__
     extern bool xemu_android_vulkan_custom_driver_zip_loaded(void);
-    if (r->device_props.vendorID == 0x5143u &&
-        !xemu_android_vulkan_custom_driver_zip_loaded()) {
+    bool no_push_qcom = r->device_props.vendorID == 0x5143u &&
+                        !xemu_android_vulkan_custom_driver_zip_loaded();
+    bool no_push_mali = r->is_mali; /* mirror EDS3 workaround above */
+    if (no_push_qcom || no_push_mali) {
         r->push_descriptors_supported = false;
-        fprintf(stderr, "Qualcomm GPU: omitting %s (crashes in stock driver)\n",
+        fprintf(stderr, "%s GPU: omitting %s (crashes in stock driver)\n",
+                no_push_qcom ? "Qualcomm" : "Mali",
                 VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
         __android_log_print(ANDROID_LOG_INFO, "hakuX",
-                            "Qualcomm stock driver: push descriptors disabled");
+                            "%s stock driver: push descriptors disabled",
+                            no_push_qcom ? "Qualcomm" : "Mali");
     } else
 #endif
     {
@@ -550,6 +570,7 @@ static void add_optional_device_extension_names(
             available_extensions, enabled_extension_names,
             VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     }
+
 }
 
 static bool check_device_support_required_extensions(VkPhysicalDevice device)
@@ -640,6 +661,48 @@ static bool select_physical_device(PGRAPHState *pg, Error **errp)
     vkGetPhysicalDeviceProperties(r->physical_device, &r->device_props);
     xemu_settings_set_string(&g_config.display.vulkan.preferred_physical_device,
                              r->device_props.deviceName);
+
+    /* Vendor IDs that drive runtime quirks. Mali (ARM) needs a tail
+     * reservation on descriptor-bound buffers; see PGRAPHVkState::is_mali. */
+    r->is_mali = (r->device_props.vendorID == 0x13B5u);
+#ifdef __ANDROID__
+    if (r->is_mali) {
+        __android_log_print(ANDROID_LOG_INFO, "xemu-vulkan",
+                            "ARM Mali GPU detected (vendorID 0x13B5) — "
+                            "enabling Mali descriptor-prefetch tail reservation");
+
+        /*
+         * Mali stock driver: serialise CPU↔GPU to 1 in-flight frame.
+         *
+         * The pgraph_vk descriptor-set ring assumes that updates to a
+         * slot at index N happen only after every command buffer that
+         * referenced N has retired. With ≥2 frames in flight on Mali
+         * we hit a deterministic GPU hang ~25 submits in: the Khronos
+         * validator reports `vkCmdBindIndexBuffer added to CB invalid
+         * because bound VkDescriptorSet was destroyed or updated`,
+         * Mali firmware faults on that draw, kcpu fence never signals,
+         * vkWaitForFences returns VK_ERROR_DEVICE_LOST (-4). The crash
+         * surfaces at draw.c flush_all_frames or renderer.c framebuffer-
+         * surface wait, but the cause is the in-flight descriptor reuse.
+         *
+         * Forcing num_active_frames = 1 (handled at runtime by
+         * pgraph_vk_finish's desired_frames check) makes every submit
+         * wait on its own fence before reusing descriptor slots —
+         * eliminates the race entirely. Costs CPU/GPU overlap, gains
+         * BIOS animation that actually completes.
+         *
+         * Once we have a correct fix for the descriptor lifecycle
+         * (per-state-hash sets or explicit per-CB descriptor tracking)
+         * we can lift this serialisation.
+         */
+        extern void xemu_set_submit_frames(int);
+        xemu_set_submit_frames(1);
+        __android_log_print(ANDROID_LOG_INFO, "xemu-vulkan",
+                            "Mali stock driver: clamped submit_frames=1 "
+                            "to avoid descriptor lifetime race "
+                            "(VK_ERROR_DEVICE_LOST workaround)");
+    }
+#endif
 
     /*
      * Query extended driver properties (Vulkan 1.2+) to get the actual

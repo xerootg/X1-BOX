@@ -72,6 +72,119 @@ typedef struct TextureLayout {
     TextureLayer layers[6];
 } TextureLayout;
 
+/*
+ * Mali GPU silently drops VkComponentMapping swizzle on R8/R8G8 sampled views
+ * (and on BC1/BC2/BC3-equivalent fallbacks), returning raw channels regardless
+ * of swizzle. For NV2A formats that rely on swizzle to broadcast or relocate
+ * channels (Y8 → RGB, A8 → A, A8Y8 → RGB=Y A=second-byte, G8B8/R8B8 packed)
+ * we bake the swizzle into RGBA8 at upload time and use identity mapping on
+ * the view.
+ */
+static bool mali_format_needs_bake(int color_format)
+{
+    switch (color_format) {
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_AY8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_AY8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8Y8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8Y8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8B8:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static inline uint8_t apply_swizzle_byte(VkComponentSwizzle s,
+                                         uint8_t r, uint8_t g, uint8_t identity)
+{
+    switch (s) {
+    case VK_COMPONENT_SWIZZLE_R:        return r;
+    case VK_COMPONENT_SWIZZLE_G:        return g;
+    case VK_COMPONENT_SWIZZLE_B:        return 0;
+    case VK_COMPONENT_SWIZZLE_A:        return 0;
+    case VK_COMPONENT_SWIZZLE_ZERO:     return 0;
+    case VK_COMPONENT_SWIZZLE_ONE:      return 255;
+    case VK_COMPONENT_SWIZZLE_IDENTITY: return identity;
+    default:                            return 0;
+    }
+}
+
+/*
+ * Convert decoded texture data to RGBA8 with the swizzle from
+ * kelvin_color_format_vk_map[] baked into the pixel bytes. The source is the
+ * unswizzled (linear-memory-layout) buffer already produced by get_texture_layout.
+ * Returns a g_malloc'd buffer of size width*height*depth*4 and frees the source.
+ */
+static uint8_t *mali_bake_swizzle_to_rgba8(int color_format,
+                                           uint8_t *src,
+                                           unsigned int width,
+                                           unsigned int height,
+                                           unsigned int depth,
+                                           size_t *out_size)
+{
+    const VkColorFormatInfo *vkf = &kelvin_color_format_vk_map[color_format];
+    unsigned int src_bpp;
+
+    switch (vkf->vk_format) {
+    case VK_FORMAT_R8_UNORM:    src_bpp = 1; break;
+    case VK_FORMAT_R8G8_UNORM:  src_bpp = 2; break;
+    default:
+        /* Shouldn't reach here — mali_format_needs_bake gates this */
+        return src;
+    }
+
+    size_t num_pixels = (size_t)width * height * depth;
+    size_t rgba_size = num_pixels * 4;
+    uint8_t *dst = g_malloc(rgba_size);
+
+    VkComponentSwizzle sw_r = vkf->component_map.r;
+    VkComponentSwizzle sw_g = vkf->component_map.g;
+    VkComponentSwizzle sw_b = vkf->component_map.b;
+    VkComponentSwizzle sw_a = vkf->component_map.a;
+
+    for (size_t p = 0; p < num_pixels; p++) {
+        uint8_t b0 = src[p * src_bpp];
+        uint8_t b1 = (src_bpp >= 2) ? src[p * src_bpp + 1] : 0;
+        /* Identity falls through to the natural channel for that lane */
+        dst[p * 4 + 0] = apply_swizzle_byte(sw_r, b0, b1, b0);
+        dst[p * 4 + 1] = apply_swizzle_byte(sw_g, b0, b1, b1);
+        dst[p * 4 + 2] = apply_swizzle_byte(sw_b, b0, b1, 0);
+        dst[p * 4 + 3] = apply_swizzle_byte(sw_a, b0, b1, 255);
+    }
+
+    g_free(src);
+    *out_size = rgba_size;
+    return dst;
+}
+
+/*
+ * Returns the VkColorFormatInfo to use for a given NV2A color_format. On Mali
+ * for formats listed in mali_format_needs_bake(), overrides with a baked
+ * RGBA8 mapping and identity swizzle since the bake is applied at decode time.
+ */
+static VkColorFormatInfo get_color_format_info(PGRAPHVkState *r, int color_format)
+{
+    if (r->is_mali && mali_format_needs_bake(color_format)) {
+        VkColorFormatInfo baked = {
+            .vk_format = VK_FORMAT_R8G8B8A8_UNORM,
+            .component_map = {
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+            },
+        };
+        return baked;
+    }
+    return kelvin_color_format_vk_map[color_format];
+}
+
 static bool pgraph_vk_texture_range_valid(NV2AState *d,
                                           hwaddr vram_offset,
                                           size_t length)
@@ -242,6 +355,9 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
         adjusted_depth = MAX(16, s.depth * 2);
     }
 
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    bool mali_bake = r->is_mali && mali_format_needs_bake(s.color_format);
+
     TextureLayout *layout = g_malloc0(sizeof(TextureLayout));
 
     if (f.linear) {
@@ -259,6 +375,12 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
             converted = g_malloc(converted_size);
             memcpy_image(converted, texture_data_ptr, adjusted_width * f.bytes_per_pixel, dst_stride,
                          adjusted_pitch, adjusted_height);
+        }
+
+        if (mali_bake) {
+            converted = mali_bake_swizzle_to_rgba8(
+                s.color_format, converted, adjusted_width, adjusted_height,
+                1, &converted_size);
         }
 
         assert(s.levels == 1);
@@ -364,6 +486,12 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
                         // FIXME: Crop by 4 pixels on each side
                     }
 
+                    if (mali_bake) {
+                        converted = mali_bake_swizzle_to_rgba8(
+                            s.color_format, converted, tex_width, tex_height,
+                            1, &converted_size);
+                    }
+
                     layout->layers[layer].levels[level] = (TextureLevel){
                         .width = tex_width,
                         .height = tex_height,
@@ -431,6 +559,12 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
                 } else {
                     converted = unswizzled;
                     converted_size = unswizzled_size;
+                }
+
+                if (mali_bake) {
+                    converted = mali_bake_swizzle_to_rgba8(
+                        s.color_format, converted, width, height, depth,
+                        &converted_size);
                 }
 
                 layout->layers[0].levels[level] = (TextureLevel){
@@ -544,7 +678,7 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
     NV2A_PHASE_TIMER_BEGIN(texture_upload);
     PGRAPHVkState *r = pg->vk_renderer_state;
     TextureShape *state = &binding->key.state;
-    VkColorFormatInfo vkf = kelvin_color_format_vk_map[state->color_format];
+    VkColorFormatInfo vkf = get_color_format_info(r, state->color_format);
 
     VK_LOG("upload_texture: idx=%d fmt=%d %ux%u cubemap=%d levels=%d",
            texture_idx, state->color_format, state->width, state->height,
@@ -698,7 +832,7 @@ static void copy_zeta_surface_to_texture(PGRAPHState *pg, SurfaceBinding *surfac
     }
 
     TextureShape *state = &texture->key.state;
-    VkColorFormatInfo vkf = kelvin_color_format_vk_map[state->color_format];
+    VkColorFormatInfo vkf = get_color_format_info(r, state->color_format);
 
     nv2a_profile_inc_counter(NV2A_PROF_SURF_TO_TEX);
 
@@ -991,7 +1125,7 @@ static void copy_surface_to_texture(PGRAPHState *pg, SurfaceBinding *surface,
         pgraph_vk_flush_draw_queue(d);
     }
     TextureShape *state = &texture->key.state;
-    VkColorFormatInfo vkf = kelvin_color_format_vk_map[state->color_format];
+    VkColorFormatInfo vkf = get_color_format_info(r, state->color_format);
 
     nv2a_profile_inc_counter(NV2A_PROF_SURF_TO_TEX);
 
@@ -1068,7 +1202,8 @@ static unsigned int vk_format_texel_size(VkFormat format)
     }
 }
 
-static bool check_surface_to_texture_compatiblity(const SurfaceBinding *surface,
+static bool check_surface_to_texture_compatiblity(PGRAPHVkState *r,
+                                                  const SurfaceBinding *surface,
                                                   const TextureShape *shape)
 {
     if (surface->width != shape->width ||
@@ -1080,6 +1215,15 @@ static bool check_surface_to_texture_compatiblity(const SurfaceBinding *surface,
 
     if (!surface->color) {
         return true;
+    }
+
+    /*
+     * Mali bake-to-RGBA8 paths cannot be direct-bound from a surface — the
+     * surface holds raw channel-ordered bytes while the texture view expects
+     * the swizzle baked into a different layout. Force a copy path instead.
+     */
+    if (r->is_mali && mali_format_needs_bake(shape->color_format)) {
+        return false;
     }
 
     VkColorFormatInfo tex_vkf = kelvin_color_format_vk_map[shape->color_format];
@@ -1354,7 +1498,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     SurfaceBinding *surface = pgraph_vk_surface_get(d, texture_vram_offset);
     if (surface && state.levels == 1) {
         surface_to_texture =
-            check_surface_to_texture_compatiblity(surface, &state);
+            check_surface_to_texture_compatiblity(r, surface, &state);
 
         if (!surface_to_texture && surface->color) {
             trace_nv2a_pgraph_surface_texture_compat_failed(
@@ -1378,7 +1522,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         QTAILQ_FOREACH(shelved, &r->shelved_surfaces, entry) {
             if (shelved->vram_addr == texture_vram_offset) {
                 bool compat = check_surface_to_texture_compatiblity(
-                    shelved, &state);
+                    r, shelved, &state);
                 if (shelved->draw_dirty && compat) {
                     surface = shelved;
                     surface_to_texture = true;
@@ -1447,6 +1591,44 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         possibly_dirty = true;
     }
 
+    /*
+     * Mali stock driver: feedback-loop sampling (texture image == current
+     * render target) reliably hangs the kcpu fence and trips DEVICE_LOST.
+     * Per-draw logging in begin_draw confirmed this is the killing pattern
+     * at Halo 2's Bungie fade-in (3-way feedback loop on the same color
+     * surface, recurring shader hash 0x76632dd7f6845143). The fix: when
+     * we detect this, force the copy-then-bind path instead of direct-bind
+     * — the copy lands in a separate VkImage that's not the current RT,
+     * which Mali handles fine. Costs one extra blit per such bind; cheap
+     * vs a GPU TDR.
+     *
+     * Implementation note: when surface_to_texture and the surface matches
+     * an active render target on Mali, we (a) invalidate snode->draw_time
+     * so the fast-reuse path below ("Same draw_time, reuse direct view")
+     * is skipped and we re-enter the slow path, and (b) disable
+     * can_direct_bind in the slow path so we fall through to
+     * copy_surface_to_texture.
+     */
+    /* Mali stock driver: direct-binding a color surface as a texture keeps
+     * the image in VK_IMAGE_LAYOUT_GENERAL for sampling (see
+     * bind_surface_as_texture — old=GENERAL, new=GENERAL). On Mali's
+     * tile-based renderer, sampling from GENERAL is a known hang source —
+     * the driver can't tell whether the image is still in tile memory
+     * (recent RT) or has been resolved, and conservatively stalls. Confirmed
+     * via per-draw logging: Halo 2's Bungie fade-in kills Mali on a draw
+     * with tsd_mask=0xe (3 color surfaces direct-bound in GENERAL), repeated
+     * pipeline+shader fingerprint across runs. The fix: route ALL Mali
+     * color surface samples through copy_surface_to_texture, which lands
+     * the texture image in SHADER_READ_ONLY_OPTIMAL — the layout Mali
+     * actually wants. Costs one blit per such bind; cheap vs a GPU TDR.
+     * Zeta direct-bind already uses DEPTH_STENCIL_READ_ONLY_OPTIMAL so it
+     * doesn't need this; only color is affected. */
+    bool is_mali_color_direct_bind = surface_to_texture && r->is_mali &&
+        surface && surface->color;
+    if (is_mali_color_direct_bind && binding_found) {
+        snode->draw_time = 0;
+    }
+
     if (!surface_to_texture && !possibly_dirty_checked) {
         bool skip_dirty_check = binding_found &&
             snode->dirty_check_frame == pg->frame_time &&
@@ -1498,8 +1680,9 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
                     pgraph_vk_flush_all_frames(pg);
                 }
                 bool can_direct_bind =
-                    surface->color ||
-                    !(surface->host_fmt.aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
+                    (surface->color ||
+                     !(surface->host_fmt.aspect & VK_IMAGE_ASPECT_STENCIL_BIT))
+                    && !is_mali_color_direct_bind;
 
                 if (can_direct_bind) {
                     VkImageLayout direct_layout;
@@ -1548,6 +1731,19 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
                 r->tex_surface_direct[texture_idx] = true;
                 r->tex_surface_direct_views[texture_idx] =
                     surface->image_view;
+                /*
+                 * Must also refresh the bound layout. The slow path above
+                 * sets this; this fast path used to skip it, leaving the
+                 * field at whatever it was last set to — UNDEFINED (0) on
+                 * a never-bound unit. The descriptor written in
+                 * write_descriptor_set / write_push_descriptor uses this
+                 * directly as imageLayout, and Mali's stock driver hangs
+                 * the kcpu fence on imageLayout=UNDEFINED. Mirror the slow
+                 * path's direct_layout selection.
+                 */
+                r->tex_surface_direct_layout[texture_idx] = surface->color
+                    ? VK_IMAGE_LAYOUT_GENERAL
+                    : VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
             }
         } else {
             if (possibly_dirty && content_hash != snode->hash) {
@@ -1572,7 +1768,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     snode->possibly_dirty = false;
     snode->hash = content_hash;
 
-    VkColorFormatInfo vkf = kelvin_color_format_vk_map[state.color_format];
+    VkColorFormatInfo vkf = get_color_format_info(r, state.color_format);
     assert(vkf.vk_format != 0);
     assert(0 < state.dimensionality);
     assert(state.dimensionality < ARRAY_SIZE(dimensionality_to_vk_image_type));
@@ -1850,8 +2046,9 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
 
     if (surface_to_texture) {
         bool can_direct_bind =
-            surface->color ||
-            !(surface->host_fmt.aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
+            (surface->color ||
+             !(surface->host_fmt.aspect & VK_IMAGE_ASPECT_STENCIL_BIT))
+            && !is_mali_color_direct_bind;
 
         if (can_direct_bind) {
             VkImageLayout direct_layout;

@@ -1377,6 +1377,26 @@ void pgraph_vk_bind_shaders(PGRAPHState *pg)
 
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    /* Publish runtime zeta-attachment status to PshState so the GLSL emitter
+     * can skip the gl_FragDepth write when no depth attachment is bound.
+     * Halo 2 keeps ZWRITEENABLE set even for color-only draws — the Xbox
+     * registers say "I want to write depth" but the renderer's per-surface
+     * binding logic has already decided not to attach zeta. Without this
+     * flag the shader emits gl_FragDepth into a missing attachment and
+     * Mali's stock driver hangs the kcpu fence. */
+    bool new_no_zeta = (r->zeta_binding == NULL);
+    bool zeta_state_flipped = (new_no_zeta != pg->rp_has_no_zeta_attachment);
+    pg->rp_has_no_zeta_attachment = new_no_zeta;
+
+    /* If the zeta-attachment binding state flipped since the last shader-
+     * state derivation, the cached_shader_state is stale — its PshState
+     * has the OLD depth_output_enabled and would resolve to the wrong
+     * shader variant (gl_FragDepth on a color-only RP, or missing on a
+     * color+depth RP → either Mali hangs or visuals corrupt). */
+    if (zeta_state_flipped) {
+        r->cached_shader_state_valid = false;
+    }
+
     r->shader_bindings_changed = false;
 
     if (!r->shader_binding ||

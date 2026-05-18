@@ -983,6 +983,17 @@ typedef struct PGRAPHVkState {
     int max_vertex_push_attrs;
 #endif
     bool push_descriptors_supported;
+
+    /*
+     * is_mali: physical device is an ARM Mali GPU (vendorID 0x13B5).
+     * Mali's stock Android driver speculatively prefetches several cache
+     * lines past the end of any descriptor-bound range (UBO/vertex/index)
+     * and faults on out-of-buffer pages, surfacing as VK_ERROR_DEVICE_LOST
+     * on the NEXT submit (which makes the crash look unrelated to any
+     * specific draw). The fix is a tail reservation on every device-local
+     * buffer that is bound by descriptor — see pgraph_vk_buffer_has_space_for.
+     */
+    bool is_mali;
     VkDescriptorSetLayout push_tex_set_layout;
     VkDescriptorSetLayout push_ubo_set_layout;
     VkDescriptorPool push_ubo_pool;
@@ -1009,6 +1020,11 @@ typedef struct PGRAPHVkState {
     bool frame_submitted[NUM_SUBMIT_FRAMES];
     bool frame_enqueued[NUM_SUBMIT_FRAMES];
     VkSemaphore stall_chain_semaphore;
+    /* Per-frame semaphore used on Mali to split the aux+main CB submit
+     * into two single-CB submits (see render_thread.c process_finish).
+     * Only created/used when r->is_mali is true. Allocated alongside
+     * frame_fences for lifetime parity. */
+    VkSemaphore aux_main_semaphores[NUM_SUBMIT_FRAMES];
     bool stall_chain_pending;
     int current_frame;
 

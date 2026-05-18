@@ -71,6 +71,14 @@ typedef struct PshState {
     bool depth_clipping;
     bool z_perspective;
     bool depth_needed;
+    /* Whether the gl_FragDepth WRITE in main() should be emitted. False when
+     * depth_needed is true but the active host RP has no depth attachment
+     * (writing gl_FragDepth into a missing attachment is UB and hangs Mali's
+     * tile-resolve). Independent of depth_needed so that depth_clipping's
+     * software near/far discard and the zvalue computation still run on
+     * color-only RPs — those are needed for visual correctness even when
+     * the depth output goes nowhere. */
+    bool depth_output_enabled;
 
     unsigned int surface_zeta_format;
     enum PshDepthFormat depth_format;

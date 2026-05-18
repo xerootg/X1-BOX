@@ -148,6 +148,19 @@ typedef struct PGRAPHState {
     SurfaceShape surface_shape;
     SurfaceShape last_surface_shape;
 
+    /* Renderer-published flag: true while the active host render pass has
+     * NO zeta attachment, even though the Xbox program may still have
+     * NV_PGRAPH_CONTROL_0_ZWRITEENABLE / ZENABLE / depth_clipping set.
+     * Used by pgraph_glsl_set_psh_state to suppress gl_FragDepth emission
+     * when no depth attachment is bound — writing depth into a missing
+     * attachment is UB per the Vulkan spec and pathologically hangs Mali's
+     * tile-resolve (~10 such draws → kcpu fence timeout → DEVICE_LOST).
+     * See [[project-mali-pgraph-vk-devicelost]] — Halo 2 Bungie fade-in.
+     * Set by pgraph_vk_bind_shaders before pgraph_glsl_get_shader_state so
+     * the value reaches PshState and is included in the shader-state hash,
+     * giving us a no-zeta shader variant per shader_state. */
+    bool rp_has_no_zeta_attachment;
+
     struct {
         int clip_x;
         int clip_width;

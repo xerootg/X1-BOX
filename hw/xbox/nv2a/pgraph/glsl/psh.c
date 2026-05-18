@@ -116,13 +116,42 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
         NV_PGRAPH_ZCOMPRESSOCCLUDE_ZCLAMP_EN_CULL;
 
     /* Depth needed flag — used by VK for depth output in fragment shader.
-     * GL handles depth via fixed-function pipeline. */
+     * GL handles depth via fixed-function pipeline.
+     *
+     * Critical Mali fix: ALSO gate on the surface actually having a zeta
+     * attachment. Halo 2 sets NV_PGRAPH_CONTROL_0_ZENABLE in the Xbox-side
+     * z-control reg even for color-only surface configs (Bungie fade-in:
+     * SET_SURFACE_FORMAT_ZETA=0). Without this gate the GLSL emitter then
+     * writes gl_FragDepth (psh.c ~line 1590) into a framebuffer with no
+     * depth attachment — undefined behaviour per the Vulkan spec, and Mali's
+     * stock driver pathologically hangs the kcpu fence within ~10 such
+     * draws (verified offline-compile: "Modifies coverage / Uses late ZS").
+     * Suspect-shader fingerprint that survived every other Mali workaround:
+     * pgraph_glsl_hash_shader_state == 0x76632dd7f6845143, TRIANGLE_STRIP,
+     * 30+ draws into the color-only RP at Halo 2's Bungie fade-in. See
+     * [[project-mali-pgraph-vk-devicelost]] for the full investigation. */
     if (g_config.display.renderer != CONFIG_DISPLAY_RENDERER_OPENGL) {
         uint32_t ctl0 = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0);
         bool depth_test = ctl0 & NV_PGRAPH_CONTROL_0_ZENABLE;
         bool depth_write = !!(ctl0 & NV_PGRAPH_CONTROL_0_ZWRITEENABLE);
         state->depth_needed = depth_test || depth_write ||
                               state->depth_clipping;
+        /* gl_FragDepth write is gated separately: even when xemu wants the
+         * shader to take over depth (depth_needed=true), the WRITE only
+         * goes anywhere if a depth attachment is actually bound to the
+         * active host RP. Writing gl_FragDepth into a framebuffer with no
+         * depth attachment is UB per the Vulkan spec and pathologically
+         * hangs Mali's tile-resolve (Halo 2 Bungie fade-in repro: ~10
+         * draws of shader_state hash 0x76632dd7f6845143 → kcpu fence
+         * timeout → DEVICE_LOST). We MUST keep the rest of the depth
+         * machinery — depth_clipping discard for software near/far clip,
+         * zvalue compute — running, otherwise out-of-range geometry
+         * renders and title-screen corruption ensues. The flag below is
+         * what tells the gl_FragDepth emit (psh.c ~line 1590) to stay
+         * silent on color-only RPs. Renderer-published flag — see
+         * pg->rp_has_no_zeta_attachment doc-comment in pgraph.h. */
+        state->depth_output_enabled = state->depth_needed &&
+                                      !pg->rp_has_no_zeta_attachment;
     }
 
     int num_stages = pgraph_reg_r(pg, NV_PGRAPH_COMBINECTL) & 0xFF;
@@ -1143,7 +1172,16 @@ static MString* psh_convert(struct PixelShader *ps)
                 "zvalue += depthFactor*triMZ;\n");
         }
 
-        if (ps->state->depth_clipping) {
+        /* Discard out-of-clip-range pixels only when a depth attachment is
+         * actually bound. On color-only RPs the discard is pointless (no
+         * depth test) but it forces Mali into late-ZS + coverage-modify
+         * scheduling, which serialises tile work and stutters audio/video
+         * during fades and UI overlays. Fall through to the clamp branch
+         * in that case — Vulkan's primitive-level depth clipping already
+         * handles most out-of-range geometry; any fringe survives only
+         * within the depth-bias window which is sub-pixel for typical
+         * NV2A content. */
+        if (ps->state->depth_clipping && ps->state->depth_output_enabled) {
             mstring_append(
                 clip, "if (zvalue < clipRange.z || clipRange.w < zvalue) {\n"
                       "  discard;\n"
@@ -1583,7 +1621,12 @@ static MString* psh_convert(struct PixelShader *ps)
         }
     }
 
-    if (ps->state->depth_needed) {
+    /* depth_output_enabled (not depth_needed): keeps zvalue compute and the
+     * depth_clipping discard alive on color-only RPs, but suppresses the
+     * actual gl_FragDepth store when no depth attachment is bound. See the
+     * full comment in pgraph_glsl_set_psh_state for why this split matters
+     * (UB write into missing attachment hangs Mali's tile-resolve). */
+    if (ps->state->depth_output_enabled) {
         switch (ps->state->depth_format) {
         case DEPTH_FORMAT_D16:
             mstring_append(

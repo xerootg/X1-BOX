@@ -20,6 +20,12 @@
 #include "qemu/osdep.h"
 #include "renderer.h"
 
+#include "hw/xbox/nv2a/debug.h"
+#include <sched.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 void pgraph_vk_snapshot_state(PGRAPHState *pg, RenderCommandSnapshot *snap)
 {
     memcpy(snap->regs, pg->regs_, sizeof(snap->regs));
@@ -130,25 +136,98 @@ static void process_finish(PGRAPHVkState *r, RenderCommand *cmd)
         signal_count = 1;
     }
 
-    VkCommandBuffer cbs[] = {
-        cmd->finish.aux_command_buffer, cmd->finish.command_buffer
-    };
-    VkSubmitInfo submit_info = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = ARRAY_SIZE(cbs),
-        .pCommandBuffers = cbs,
-        .waitSemaphoreCount = wait_count,
-        .pWaitSemaphores = wait_sems,
-        .pWaitDstStageMask = wait_stages,
-        .signalSemaphoreCount = signal_count,
-        .pSignalSemaphores = signal_sems,
-    };
-
     vkResetFences(r->device, 1, &cmd->finish.fence);
-    VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info,
-                           cmd->finish.fence));
+
+#ifdef __ANDROID__
+    if (r->is_mali) {
+        /*
+         * Mali stock driver path: split aux + main into two separate
+         * single-CB submits, joined by a per-frame semaphore. Two reasons:
+         *
+         *   1. Mali handles frequent small submits well but reliably
+         *      faults when given both CBs as one VkSubmitInfo with
+         *      commandBufferCount=2. Issuing each CB in its own submit
+         *      side-steps the fault.
+         *   2. With two submits, Mali finishes the aux work (staging
+         *      copies, WAR barrier) and processes its scheduling before
+         *      seeing the main CB's draws — so any kcpu-fence stall
+         *      surfaces against the *aux* submit on its own, not buried
+         *      behind a frame's worth of draws.
+         *
+         * The aux→main handoff uses r->aux_main_semaphores[frame_index],
+         * a binary semaphore allocated alongside frame_fences. We signal
+         * it on the aux submit and wait on it (at VERTEX_INPUT_BIT |
+         * TRANSFER_BIT) on the main submit, matching the aux→main
+         * pipeline barrier currently emitted in pgraph_vk_finish.
+         *
+         * chain_wait / chain_signal (stall_chain_semaphore, used for
+         * present chains) stays on the *main* submit — it's the
+         * frame-end synchronisation point, semantically a property of
+         * the draw work, not the staging copies.
+         */
+        VkSemaphore aux_main_sem =
+            r->aux_main_semaphores[cmd->finish.frame_index];
+
+        VkSubmitInfo aux_submit = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd->finish.aux_command_buffer,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &aux_main_sem,
+        };
+        VK_CHECK(vkQueueSubmit(r->queue, 1, &aux_submit, VK_NULL_HANDLE));
+
+        VkPipelineStageFlags aux_wait_stage =
+            VK_PIPELINE_STAGE_TRANSFER_BIT |
+            VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+
+        VkSemaphore main_wait_sems[2];
+        VkPipelineStageFlags main_wait_stages[2];
+        uint32_t main_wait_count = 0;
+        if (wait_count) {
+            main_wait_sems[main_wait_count] = wait_sems[0];
+            main_wait_stages[main_wait_count] = wait_stages[0];
+            main_wait_count++;
+        }
+        main_wait_sems[main_wait_count] = aux_main_sem;
+        main_wait_stages[main_wait_count] = aux_wait_stage;
+        main_wait_count++;
+
+        VkSubmitInfo main_submit = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd->finish.command_buffer,
+            .waitSemaphoreCount = main_wait_count,
+            .pWaitSemaphores = main_wait_sems,
+            .pWaitDstStageMask = main_wait_stages,
+            .signalSemaphoreCount = signal_count,
+            .pSignalSemaphores = signal_sems,
+        };
+        VK_CHECK(vkQueueSubmit(r->queue, 1, &main_submit,
+                               cmd->finish.fence));
+    } else
+#endif
+    {
+        VkCommandBuffer cbs[] = {
+            cmd->finish.aux_command_buffer, cmd->finish.command_buffer
+        };
+        VkSubmitInfo submit_info = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = ARRAY_SIZE(cbs),
+            .pCommandBuffers = cbs,
+            .waitSemaphoreCount = wait_count,
+            .pWaitSemaphores = wait_sems,
+            .pWaitDstStageMask = wait_stages,
+            .signalSemaphoreCount = signal_count,
+            .pSignalSemaphores = signal_sems,
+        };
+        VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info,
+                               cmd->finish.fence));
+    }
+
     qatomic_set(&r->frame_submitted[cmd->finish.frame_index], true);
-    qatomic_inc(&r->submit_count);
+    qatomic_inc_fetch(&r->submit_count);
 
     if (!cmd->finish.deferred) {
         VK_CHECK(vkWaitForFences(r->device, 1, &cmd->finish.fence,

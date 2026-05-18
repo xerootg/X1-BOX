@@ -23,6 +23,12 @@
 #include <android/log.h>
 #endif
 
+/* Mali speculatively prefetches past the last vertex of a draw. We over-
+ * allocate fs->vertex_ram by this many bytes and lie about the usable size
+ * in pgraph_vk_buffer_has_space_for(). Defined here so both the allocation
+ * site and the size check below see it. */
+#define MALI_DESCRIPTOR_TAIL_RESERVATION (1024u * 1024u)
+
 typedef struct MemoryBudget {
     size_t total_heap;
     size_t renderer_budget;
@@ -287,10 +293,20 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
         .buffer_size = index_size,
     };
 
+    /* On Mali stock driver, vertex_ram is bound directly via
+     * vkCmdBindVertexBuffers (skipping has_space_for's reservation logic).
+     * Mali's tile-binner speculatively prefetches several cache lines past
+     * the last vertex of a draw; without padding the buffer end, that
+     * prefetch walks off the buffer's mapped pages and faults, surfacing
+     * as VK_ERROR_DEVICE_LOST on the NEXT submit (which is why the kcpu
+     * fence stalls 3 s before the validator can complain). Over-allocate
+     * by MALI_DESCRIPTOR_TAIL_RESERVATION so prefetch always lands on a
+     * mapped page. The extra bytes are never written; cost is ~1 MiB. */
     r->storage_buffers[BUFFER_VERTEX_RAM] = (StorageBuffer){
         .alloc_info = host_alloc_create_info,
         .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        .buffer_size = memory_region_size(d->vram),
+        .buffer_size = memory_region_size(d->vram)
+                     + (r->is_mali ? MALI_DESCRIPTOR_TAIL_RESERVATION : 0),
     };
 
     r->bitmap_size = memory_region_size(d->vram) / 4096;
@@ -426,10 +442,13 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             .buffer_size = stg_cap,
         };
+        /* Per-frame vertex_ram: same Mali prefetch over-allocation rule
+         * as the shared BUFFER_VERTEX_RAM above (see comment there). */
         fs->vertex_ram = (StorageBuffer){
             .alloc_info = host_alloc_create_info,
             .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-            .buffer_size = memory_region_size(d->vram),
+            .buffer_size = memory_region_size(d->vram)
+                         + (r->is_mali ? MALI_DESCRIPTOR_TAIL_RESERVATION : 0),
         };
         fs->vertex_ram_flush_min = VK_WHOLE_SIZE;
         fs->vertex_ram_flush_max = 0;
@@ -546,13 +565,44 @@ void pgraph_vk_finalize_buffers(NV2AState *d)
     r->uploaded_bitmap = NULL;
 }
 
+/*
+ * Tail reservation kept at the end of every descriptor-bound buffer on Mali.
+ * Mali's stock driver speculatively prefetches several cache lines past the
+ * end of the bound descriptor / vertex / index range; without this
+ * reservation, bindings that land close to the buffer end have prefetch
+ * walk off the buffer's mapped pages and fault, surfacing as
+ * VK_ERROR_DEVICE_LOST on the NEXT submit (which is why the crash signature
+ * looks unrelated to any specific draw).
+ *
+ * Two complementary applications of this constant:
+ *   1. pgraph_vk_buffer_has_space_for() reports the staging buffers as
+ *      MALI_DESCRIPTOR_TAIL_RESERVATION bytes smaller than they really are,
+ *      so any UBO/vertex-inline/index ring allocation wraps early and the
+ *      mirrored device-local bind never reaches the buffer's last page.
+ *   2. fs->vertex_ram is OVER-ALLOCATED by MALI_DESCRIPTOR_TAIL_RESERVATION
+ *      (see buffer_init below) since that buffer is bound directly without
+ *      going through has_space_for. The extra tail is never written but
+ *      ensures Mali prefetch off the last vertex always lands on a mapped
+ *      page.
+ *
+ * 1 MiB is overkill but cheap (1 MiB on a 32+ MiB ring is <3% overhead) and
+ * gives runway for any future Mali driver that prefetches further ahead than
+ * current observed behaviour.
+ *
+ * The macro itself is defined at the top of this file so both uses see it.
+ */
+
 bool pgraph_vk_buffer_has_space_for(PGRAPHState *pg, int index,
                                     VkDeviceSize size,
                                     VkDeviceAddress alignment)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
     StorageBuffer *b = get_staging_buffer(r, index);
-    return (ROUND_UP(b->buffer_offset, alignment) + size) <= b->buffer_size;
+    VkDeviceSize usable = b->buffer_size;
+    if (r->is_mali && usable > MALI_DESCRIPTOR_TAIL_RESERVATION) {
+        usable -= MALI_DESCRIPTOR_TAIL_RESERVATION;
+    }
+    return (ROUND_UP(b->buffer_offset, alignment) + size) <= usable;
 }
 
 VkDeviceSize pgraph_vk_append_to_buffer(PGRAPHState *pg, int index, void **data,
