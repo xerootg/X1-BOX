@@ -21,6 +21,9 @@
 #ifdef CONFIG_PTHREAD_SET_NAME_NP
 #include <pthread_np.h>
 #endif
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 static bool name_threads;
 
@@ -367,14 +370,38 @@ static void *qemu_thread_start(void *args)
 
     /* Attempt to set the threads name; note that this is for debug, so
      * we're not going to fail if we can't set it.
+     *
+     * The kernel comm field is capped at TASK_COMM_LEN-1 = 15 chars on
+     * Linux/Android. glibc's pthread_setname_np silently truncates, but
+     * bionic returns ERANGE without setting the name at all. So when the
+     * name is too long we manually truncate and try again. As an extra
+     * fallback we use prctl(PR_SET_NAME, ...) which is documented to
+     * silently truncate everywhere this code path runs.
      */
     if (name_threads && qemu_thread_args->name) {
+        const char *name = qemu_thread_args->name;
+        char truncated[16];
+        size_t name_len = strlen(name);
+        const char *use_name = name;
+        if (name_len > 15) {
+            memcpy(truncated, name, 15);
+            truncated[15] = '\0';
+            use_name = truncated;
+        }
 # if defined(CONFIG_PTHREAD_SETNAME_NP_W_TID)
-        pthread_setname_np(pthread_self(), qemu_thread_args->name);
+        if (pthread_setname_np(pthread_self(), use_name) != 0) {
+#  ifdef __linux__
+            prctl(PR_SET_NAME, (unsigned long)use_name, 0, 0, 0);
+#  endif
+        }
 # elif defined(CONFIG_PTHREAD_SETNAME_NP_WO_TID)
-        pthread_setname_np(qemu_thread_args->name);
+        if (pthread_setname_np(use_name) != 0) {
+#  ifdef __linux__
+            prctl(PR_SET_NAME, (unsigned long)use_name, 0, 0, 0);
+#  endif
+        }
 # elif defined(CONFIG_PTHREAD_SET_NAME_NP)
-        pthread_set_name_np(pthread_self(), qemu_thread_args->name);
+        pthread_set_name_np(pthread_self(), use_name);
 # endif
     }
     QEMU_TSAN_ANNOTATE_THREAD_NAME(qemu_thread_args->name);

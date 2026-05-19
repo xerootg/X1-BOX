@@ -1,5 +1,7 @@
 package com.izzy2lost.x1box
 
+import android.app.AlarmManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -144,6 +146,7 @@ class MainActivity : SDLActivity(), InputManager.InputDeviceListener {
   }
 
   override fun onCreate(savedInstanceState: Bundle?) {
+    installEmulatorCrashRecovery()
     super.onCreate(savedInstanceState)
     DebugLog.initialize(this)
     val prefs = getSharedPreferences("x1box_prefs", Context.MODE_PRIVATE)
@@ -214,6 +217,42 @@ class MainActivity : SDLActivity(), InputManager.InputDeviceListener {
       swipeUpGestureRecognizer.reset()
     }
     return super.dispatchTouchEvent(event)
+  }
+
+  /**
+   * Catch any uncaught exception while the emulator activity is alive and
+   * relaunch into the game library instead of letting the OS dump the user
+   * back to the home screen. The relaunch is scheduled via AlarmManager
+   * before we kill the process so it survives the current process going
+   * away (e.g. when the native library failed to load and the JVM is in an
+   * unrecoverable state).
+   */
+  private fun installEmulatorCrashRecovery() {
+    val appContext = applicationContext
+    val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
+    Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+      try {
+        android.util.Log.e(TAG, "Uncaught exception in emulator; returning to game library", throwable)
+        val intent = Intent(appContext, GameLibraryActivity::class.java).apply {
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        }
+        val piFlags = PendingIntent.FLAG_IMMUTABLE or
+          PendingIntent.FLAG_ONE_SHOT or
+          PendingIntent.FLAG_CANCEL_CURRENT
+        val pendingIntent = PendingIntent.getActivity(appContext, 0, intent, piFlags)
+        val alarmManager = appContext.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
+        alarmManager?.set(AlarmManager.RTC, System.currentTimeMillis() + 150, pendingIntent)
+      } catch (_: Throwable) {
+        // Best-effort. If even the relaunch scheduling failed, fall through
+        // to the previous handler so the OS dialog at least surfaces.
+      }
+      try {
+        previousHandler?.uncaughtException(thread, throwable)
+      } catch (_: Throwable) {
+      }
+      Process.killProcess(Process.myPid())
+      kotlin.system.exitProcess(10)
+    }
   }
 
   private fun hideSystemUI() {

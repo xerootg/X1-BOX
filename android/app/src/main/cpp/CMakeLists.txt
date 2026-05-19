@@ -1063,6 +1063,7 @@ target_compile_definitions(xemu_core PRIVATE
   CONFIG_ATOMIC64
   CONFIG_PPOLL
   CONFIG_PRCTL_PR_SET_TIMERSLACK
+  CONFIG_PTHREAD_SETNAME_NP_W_TID
   COMPILING_PER_TARGET
   CONFIG_TARGET=\"config-target.h\"
   QEMU_VERSION=\"${QEMU_VERSION_STR}\"
@@ -1073,6 +1074,7 @@ target_compile_definitions(xemu_core PRIVATE
 )
 
 target_compile_options(xemu_core PRIVATE -g1
+  -fno-emulated-tls
   $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>,$<CONFIG:MinSizeRel>>:-UNDEBUG>
 )
 
@@ -1187,6 +1189,7 @@ if(XEMU_ENABLE_VULKAN)
 endif()
 
 target_compile_options(xemu PRIVATE -fexceptions -frtti -g1
+  -fno-emulated-tls
   $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>,$<CONFIG:MinSizeRel>>:-UNDEBUG>
 )
 

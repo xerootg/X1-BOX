@@ -295,12 +295,30 @@ object DebugLog {
       val thread = Thread({
         try {
           process.inputStream.bufferedReader().use { reader ->
-            FileOutputStream(targetFile, true).bufferedWriter(Charsets.UTF_8).use { writer ->
+            // Use a generously sized buffer (64 KB) and only flush
+            // periodically. Flushing on every line is catastrophically
+            // expensive when the device emits high-rate logspam (e.g.
+            // AAudio underrun notifications can fire thousands of times
+            // per second), because each flush is a sync write syscall.
+            // With this strategy we still durably persist within ~1 s of
+            // any new log line — more than fine for post-mortem debug —
+            // while letting the kernel batch the writes.
+            java.io.BufferedWriter(
+              java.io.OutputStreamWriter(FileOutputStream(targetFile, true), Charsets.UTF_8),
+              64 * 1024,
+            ).use { writer ->
+              var lastFlushNs = System.nanoTime()
+              val flushIntervalNs = 1_000_000_000L
               while (true) {
                 val line = reader.readLine() ?: break
                 writer.appendLine(line)
-                writer.flush()
+                val now = System.nanoTime()
+                if (now - lastFlushNs >= flushIntervalNs) {
+                  writer.flush()
+                  lastFlushNs = now
+                }
               }
+              writer.flush()
             }
           }
         } catch (_: Exception) {

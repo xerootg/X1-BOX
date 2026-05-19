@@ -1014,6 +1014,7 @@ static SetupFiles SyncSetupFiles() {
 extern "C" int xemu_android_main(int argc, char** argv);
 extern "C" void qemu_init(int argc, char** argv);
 extern "C" int (*qemu_main)(void);
+extern "C" void qemu_thread_naming(bool enable);
 extern "C" void xemu_android_display_preinit(void);
 extern "C" void xemu_android_display_wait_ready(void);
 extern "C" void xemu_android_display_loop(void);
@@ -1104,6 +1105,19 @@ extern "C" int xemu_android_main(int argc, char** argv) {
     LogError("xemu core not linked; qemu_main missing");
     return 1;
   }
+
+  /*
+   * Make every QEMU helper thread carry its real name via
+   * pthread_setname_np. Upstream QEMU gates this behind
+   * `-name debug-threads=on`, which the Android frontend never
+   * passes. Without it, every qemu_thread_create() — voice
+   * workers, AIO pool, pgraph workers, iothreads, etc. — inherits
+   * the parent's name, which makes /proc/<pid>/task/ effectively
+   * unreadable for profilers. The naming syscall is a one-time
+   * cost per thread and has no observable runtime overhead.
+   */
+  qemu_thread_naming(true);
+
   LogInfo("xemu_android_main: qemu_init");
   auto t_init_start = SDL_GetTicks();
   qemu_init(argc, argv);
