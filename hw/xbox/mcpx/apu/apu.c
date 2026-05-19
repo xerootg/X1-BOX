@@ -135,29 +135,33 @@ static void throttle(MCPXAPUState *d)
     }
 
 #ifdef __ANDROID__
-    /* Android scheduler granularity is often too coarse for the extra
-     * low-watermark pacing below and can make speech sound dragged out.
-     * Keep FIFO backpressure, but let the output callback set the pace.
-     */
-    d->next_frame_time_us = 0;
-    return;
+    /* Allow the deadline to slip by ~8 audio frames (~43 ms) before
+     * snapping forward — Android's scheduler can easily oversleep by
+     * several ms, and a too-tight catch-up window was the original
+     * reason this whole branch was disabled here. */
+    const int64_t catchup_limit_us = 8 * EP_FRAME_US;
+#else
+    /* Desktop schedulers track the period reliably, so reset the moment
+     * we slip a single frame. */
+    const int64_t catchup_limit_us = EP_FRAME_US;
 #endif
 
     if (queued_bytes > d->monitor.queued_bytes_low) {
         int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         if (d->next_frame_time_us == 0 ||
-            now_us - d->next_frame_time_us > EP_FRAME_US) {
+            now_us - d->next_frame_time_us > catchup_limit_us) {
             d->next_frame_time_us = now_us;
         }
         while (!qatomic_read(&d->exiting)) {
             now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-            int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
-            if (remaining_ms > 0) {
-                int sleep_ms = remaining_ms > INT_MAX ? INT_MAX : (int)remaining_ms;
-                qemu_cond_timedwait(&d->cond, &d->lock, sleep_ms);
-            } else {
+            int64_t remaining_us = d->next_frame_time_us - now_us;
+            if (remaining_us <= 0) {
                 break;
             }
+            /* Round up to >= 1 ms so we don't busy-spin on hosts whose
+             * cond_timedwait returns immediately for sub-ms timeouts. */
+            int sleep_ms = (int)((remaining_us + 999) / 1000);
+            qemu_cond_timedwait(&d->cond, &d->lock, sleep_ms);
         }
         d->next_frame_time_us += EP_FRAME_US;
 
@@ -217,12 +221,28 @@ static void se_frame(MCPXAPUState *d)
         }
 
         if (d->monitor.fifo_capacity_bytes > 0) {
-            qemu_spin_lock(&d->monitor.fifo_lock);
-            int num_bytes_free = (int)fifo8_num_free(&d->monitor.fifo);
-            assert(num_bytes_free >= sizeof(d->monitor.frame_buf));
-            fifo8_push_all(&d->monitor.fifo, (uint8_t *)d->monitor.frame_buf,
-                           sizeof(d->monitor.frame_buf));
-            qemu_spin_unlock(&d->monitor.fifo_lock);
+            if (d->monitor.output_is_float) {
+                /* Convert s16 → float32 in normalized [-1, 1] range to match
+                 * AAUDIO_FORMAT_PCM_FLOAT semantics. */
+                float fbuf[256][2];
+                for (int i = 0; i < 256; i++) {
+                    fbuf[i][0] = (float)d->monitor.frame_buf[i][0] / 32768.0f;
+                    fbuf[i][1] = (float)d->monitor.frame_buf[i][1] / 32768.0f;
+                }
+                qemu_spin_lock(&d->monitor.fifo_lock);
+                int num_bytes_free = (int)fifo8_num_free(&d->monitor.fifo);
+                assert(num_bytes_free >= sizeof(fbuf));
+                fifo8_push_all(&d->monitor.fifo, (uint8_t *)fbuf, sizeof(fbuf));
+                qemu_spin_unlock(&d->monitor.fifo_lock);
+            } else {
+                qemu_spin_lock(&d->monitor.fifo_lock);
+                int num_bytes_free = (int)fifo8_num_free(&d->monitor.fifo);
+                assert(num_bytes_free >= sizeof(d->monitor.frame_buf));
+                fifo8_push_all(&d->monitor.fifo,
+                               (uint8_t *)d->monitor.frame_buf,
+                               sizeof(d->monitor.frame_buf));
+                qemu_spin_unlock(&d->monitor.fifo_lock);
+            }
         }
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
     }
@@ -269,57 +289,6 @@ static int getenv_int_clamped(const char *name, int min_value, int max_value,
     return (int)parsed;
 }
 
-static void monitor_apply_fade_in(uint8_t *stream, int len)
-{
-    int frame_bytes = sizeof(int16_t[2]);
-    int frames = len / frame_bytes;
-
-    if (frames <= 1) {
-        return;
-    }
-
-    int fade_frames = MIN(frames, 64);
-    int16_t *samples = (int16_t *)stream;
-    for (int i = 0; i < fade_frames; i++) {
-        int gain_num = i;
-        int gain_den = fade_frames - 1;
-        samples[i * 2 + 0] = (int16_t)((samples[i * 2 + 0] * gain_num) / gain_den);
-        samples[i * 2 + 1] = (int16_t)((samples[i * 2 + 1] * gain_num) / gain_den);
-    }
-}
-
-static void monitor_fill_underrun(const int16_t start_sample[2], uint8_t *stream,
-                                  int len)
-{
-    int frame_bytes = sizeof(int16_t[2]);
-    int frames = len / frame_bytes;
-    int16_t *out = (int16_t *)stream;
-
-    if (frames == 1) {
-        out[0] = 0;
-        out[1] = 0;
-    } else if (frames > 1) {
-        int fade_frames = MIN(frames, 64);
-        for (int i = 0; i < fade_frames; i++) {
-            int gain_num = fade_frames - 1 - i;
-            int gain_den = fade_frames - 1;
-            out[i * 2 + 0] =
-                (int16_t)((start_sample[0] * gain_num) / gain_den);
-            out[i * 2 + 1] =
-                (int16_t)((start_sample[1] * gain_num) / gain_den);
-        }
-        if (fade_frames < frames) {
-            memset(stream + (fade_frames * frame_bytes), 0,
-                   (frames - fade_frames) * frame_bytes);
-        }
-    }
-
-    int tail_bytes = len - (frames * frame_bytes);
-    if (tail_bytes > 0) {
-        memset(stream + (frames * frame_bytes), 0, tail_bytes);
-    }
-}
-
 static void monitor_sink_cb(void *opaque, uint8_t *stream, int free_b)
 {
     MCPXAPUState *s = MCPX_APU_DEVICE(opaque);
@@ -329,22 +298,16 @@ static void monitor_sink_cb(void *opaque, uint8_t *stream, int free_b)
         return;
     }
 
-    int avail = 0;
-    int wait_attempts = 10;
-    for (int i = 0; i < wait_attempts; i++) {
-        qemu_spin_lock(&s->monitor.fifo_lock);
-        avail = fifo8_num_used(&s->monitor.fifo);
-        qemu_spin_unlock(&s->monitor.fifo_lock);
-        if (avail >= free_b) {
-            break;
-        }
-        sleep_ns(500000);
-        qemu_cond_broadcast(&s->cond);
-        if (!runstate_is_running()) {
-            memset(stream, 0, free_b);
-            return;
-        }
-    }
+    /* Audio output callbacks must return promptly. AAudio on Android uses
+     * "frames per burst" of ~96–192 frames (2–4 ms at 48 kHz) and treats
+     * any callback that misses its burst deadline as a glitch. The previous
+     * 10 × 0.5 ms spin-wait for the FIFO to fill was longer than AAudio's
+     * burst period, which caused fast/chunky playback. Take whatever's in
+     * the FIFO right now; the underrun-fill path below smooths gaps. */
+    int avail;
+    qemu_spin_lock(&s->monitor.fifo_lock);
+    avail = fifo8_num_used(&s->monitor.fifo);
+    qemu_spin_unlock(&s->monitor.fifo_lock);
 
     int copied = 0;
     int to_copy = MIN(free_b, avail);
@@ -360,29 +323,15 @@ static void monitor_sink_cb(void *opaque, uint8_t *stream, int free_b)
         copied += chunk_len;
     }
 
-    if (copied > 0 && s->monitor.resume_fade_pending) {
-        monitor_apply_fade_in(stream, copied);
-        s->monitor.resume_fade_pending = false;
-    }
-
+    /* Pad any shortfall with silence — matches Cemu's CubebAPI data_cb
+     * pattern. We used to fade-out to last_sample then fade-in on
+     * resume, but with AAudio's ~500 Hz callback rate any periodic
+     * underrun makes those fades audible as amplitude-modulated pulses.
+     * Hardware audio devices already have anti-click filtering at the
+     * output stage; a clean silence gap is less perceptible than a
+     * sub-ms ramp imposed on every callback boundary. */
     if (copied < free_b) {
-        int16_t fill_from[2] = {
-            s->monitor.last_output_sample[0],
-            s->monitor.last_output_sample[1],
-        };
-        if (copied >= sizeof(fill_from)) {
-            memcpy(fill_from, stream + copied - sizeof(fill_from),
-                   sizeof(fill_from));
-        }
-        monitor_fill_underrun(fill_from, stream + copied, free_b - copied);
-        s->monitor.resume_fade_pending = true;
-    }
-
-    if (free_b >= sizeof(s->monitor.last_output_sample)) {
-        int16_t *last = (int16_t *)(stream + free_b -
-                                    sizeof(s->monitor.last_output_sample));
-        s->monitor.last_output_sample[0] = last[0];
-        s->monitor.last_output_sample[1] = last[1];
+        memset(stream + copied, 0, free_b - copied);
     }
 
     qemu_cond_broadcast(&s->cond);
@@ -395,9 +344,7 @@ static void monitor_init(MCPXAPUState *d)
     d->monitor.device_buffer_bytes = 0;
     d->monitor.queued_bytes_low = 0;
     d->monitor.queued_bytes_high = 0;
-    d->monitor.last_output_sample[0] = 0;
-    d->monitor.last_output_sample[1] = 0;
-    d->monitor.resume_fade_pending = false;
+    d->monitor.output_is_float = false;
 
     int fifo_frames = 3;
     int audio_samples = 512;
@@ -410,9 +357,6 @@ static void monitor_init(MCPXAPUState *d)
     audio_samples = getenv_int_clamped("XEMU_ANDROID_AUDIO_SAMPLES", 256, 4096,
                                        audio_samples);
 #endif
-    int fifo_capacity_bytes = fifo_frames * sizeof(d->monitor.frame_buf);
-    fifo8_create(&d->monitor.fifo, fifo_capacity_bytes);
-
     struct SDL_AudioSpec sdl_audio_spec = {
         .freq = 48000,
         .format = AUDIO_S16LSB,
@@ -438,6 +382,14 @@ static void monitor_init(MCPXAPUState *d)
         return;
     }
 
+    /* SDL's AAudio backend silently swaps our requested PCM_I16 stream for
+     * PCM_FLOAT when the hardware is float-native (common on Tensor / modern
+     * Pixels). It updates obtained.format but does NOT convert samples, so
+     * raw s16 bytes get reinterpreted as float32 by the device — audible as
+     * varying-intensity pops. Detect the mismatch and convert at push time
+     * so AAudio works correctly without forcing OpenSL ES. */
+    d->monitor.output_is_float = SDL_AUDIO_ISFLOAT(obtained_audio_spec.format);
+
     int bytes_per_sample = SDL_AUDIO_BITSIZE(obtained_audio_spec.format) / 8;
     if (bytes_per_sample <= 0) {
         bytes_per_sample = SDL_AUDIO_BITSIZE(sdl_audio_spec.format) / 8;
@@ -453,18 +405,32 @@ static void monitor_init(MCPXAPUState *d)
                               bytes_per_sample;
     }
 
+    /* frame_bytes is the size of one push to the FIFO in OUTPUT-format
+     * bytes (which is what the consumer's callback drains). When the
+     * device wants float32, each push doubles in size vs. the s16 case. */
     int frame_bytes = sizeof(d->monitor.frame_buf);
+    if (d->monitor.output_is_float) {
+        frame_bytes *= sizeof(float) / sizeof(int16_t);  // ×2
+    }
+    int fifo_capacity_bytes = fifo_frames * frame_bytes;
+    fifo8_create(&d->monitor.fifo, fifo_capacity_bytes);
     int drain_bytes = MAX(device_buffer_bytes, frame_bytes);
+#ifdef __ANDROID__
+    /* AAudio's "frames per burst" can be as small as 96 frames (~384 B at
+     * 48 kHz stereo s16), and its callbacks fire at ~500 Hz. The producer
+     * pushes 1 KiB every ~5.3 ms (~187 Hz). If queued_bytes_low collapses
+     * to the burst size, the FIFO routinely dips below a single callback's
+     * size between producer pushes, every dip triggers the underrun
+     * fade-in/fade-out, and the device output sounds like a stream of
+     * pops at the callback rate. Force enough headroom that the FIFO
+     * stays above the burst size even when one producer push slips. */
+    drain_bytes = MAX(drain_bytes, 4 * frame_bytes);
+#endif
     int max_high = MAX(fifo_capacity_bytes - frame_bytes, frame_bytes);
     d->monitor.fifo_capacity_bytes = fifo_capacity_bytes;
     d->monitor.device_buffer_bytes = device_buffer_bytes;
-#ifdef __ANDROID__
     d->monitor.queued_bytes_high = MIN(3 * drain_bytes, max_high);
     d->monitor.queued_bytes_low = MIN(drain_bytes, d->monitor.queued_bytes_high);
-#else
-    d->monitor.queued_bytes_high = MIN(3 * drain_bytes, max_high);
-    d->monitor.queued_bytes_low = MIN(drain_bytes, d->monitor.queued_bytes_high);
-#endif
 
     SDL_PauseAudioDevice(sdl_audio_dev, 0);
 }
