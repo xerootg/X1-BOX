@@ -2020,7 +2020,17 @@ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_P
             d->regs[current] = d->regs[next];
         }
     }
+    /* Release d->lock around voice_work_dispatch so guest MMIO writes to
+     * GP/EP DSP registers (gp_write / ep_write — both take d->lock) can
+     * proceed while the voice workers run. Without this, a vCPU MMIO
+     * write that lands while we're sleeping in cond_wait(work_finished)
+     * deadlocks the entire emulator: the vCPU can't take d->lock, so it
+     * can't write ISTS to unblock anything else either. voice_work_dispatch
+     * synchronizes via vwd->lock + the workers_pending bitmap; d->lock
+     * was never doing useful work here. */
+    qemu_mutex_unlock(&d->lock);
     voice_work_dispatch(d, mixbins);
+    qemu_mutex_lock(&d->lock);
 
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
         /* Mix all voices together to hear any audible voice */
