@@ -1020,6 +1020,20 @@ typedef struct PGRAPHVkState {
     VkFence frame_fences[NUM_SUBMIT_FRAMES];
     bool frame_submitted[NUM_SUBMIT_FRAMES];
     bool frame_enqueued[NUM_SUBMIT_FRAMES];
+    /*
+     * Signaled by render_thread_func's process_finish() right after
+     * frame_submitted[idx] is set true. Replaces a sched_yield() spin
+     * loop in pgraph_vk_finish (draw.c) that burned ~6% of pfifo CPU
+     * waiting for vkQueueSubmit to return from the render thread. On
+     * Mali the wait is occasionally tens of ms (render thread is in
+     * its 4 s safety fence wait on a prior submit), and the spinner
+     * was burning a core for nothing.
+     *
+     * Producer (pfifo / vCPU side) resets the event just before
+     * enqueuing work for that slot; render thread sets it after
+     * submit. Read+wait is therefore race-free.
+     */
+    QemuEvent frame_submitted_event[NUM_SUBMIT_FRAMES];
     VkSemaphore stall_chain_semaphore;
     /* Per-frame semaphore used on Mali to split the aux+main CB submit
      * into two single-CB submits (see render_thread.c process_finish).

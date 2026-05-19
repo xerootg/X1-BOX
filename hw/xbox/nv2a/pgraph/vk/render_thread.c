@@ -230,6 +230,12 @@ static void process_finish(PGRAPHVkState *r, RenderCommand *cmd)
     }
 
     qatomic_set(&r->frame_submitted[cmd->finish.frame_index], true);
+    /*
+     * Wake any pgraph_vk_finish caller spinning in the producer-side
+     * wait for this slot's submit. Replaces sched_yield() in draw.c —
+     * see PGRAPHVkState::frame_submitted_event in renderer.h.
+     */
+    qemu_event_set(&r->frame_submitted_event[cmd->finish.frame_index]);
     int submit_idx = qatomic_inc_fetch(&r->submit_count);
 
 #ifdef __ANDROID__

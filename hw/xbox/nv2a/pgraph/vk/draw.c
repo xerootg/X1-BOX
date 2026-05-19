@@ -2657,18 +2657,31 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
 
             if (deferred) {
                 deferred_frame = r->current_frame;
+                /*
+                 * Reset the per-slot submit event before publishing the
+                 * work. Only we (the producer) can touch this slot at
+                 * this point — the render thread can't have signalled
+                 * for THIS submit yet, and any prior signal for the
+                 * same slot is stale. Order matters: reset must happen
+                 * before the enqueue store so the render thread sees a
+                 * fresh event when it sets it post-submit.
+                 */
+                qemu_event_reset(&r->frame_submitted_event[r->current_frame]);
                 r->frame_enqueued[r->current_frame] = true;
             }
 
             pgraph_vk_render_thread_enqueue(r, cmd);
 
             if (deferred) {
-                /* Spin-wait for render thread to complete vkQueueSubmit.
-                 * Faster than QemuEvent (no futex/eventfd syscall overhead).
-                 * Typically completes in <100μs. */
-                while (!qatomic_read(&r->frame_submitted[deferred_frame])) {
-                    sched_yield();
-                }
+                /*
+                 * Was: sched_yield() spin loop. On Mali the wait can
+                 * take many ms while the render thread is in its
+                 * per-submit fence-safety wait on a previous frame —
+                 * the spinner was burning ~6% of pfifo CPU on yields.
+                 * Sleep on the event instead; ~5 µs futex wake is
+                 * negligible vs the latency we were already paying.
+                 */
+                qemu_event_wait(&r->frame_submitted_event[deferred_frame]);
             }
 
             if (!deferred) {
@@ -2729,15 +2742,23 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
 
             int next_frame = (r->current_frame + 1) % r->num_active_frames;
 
-            /* If the next frame slot was enqueued for deferred submission
+            /*
+             * If the next frame slot was enqueued for deferred submission
              * but the render thread hasn't completed vkQueueSubmit yet,
-             * spin-wait until it does. With 3 frame slots this rarely
-             * triggers since there's 2 frames of pipeline headroom. */
+             * block on the submit event. Was a sched_yield() spin — same
+             * fix as the deferred-finish wait above. With 3 frame slots
+             * this path rarely triggers (2 frames of pipeline headroom),
+             * but when it does fire on Mali it can wait tens of ms.
+             *
+             * Keep the frame_submitted pre-check: a non-deferred
+             * presenting path may set frame_submitted=true without
+             * going through the render thread queue, in which case the
+             * event for this slot was never re-armed for the latest
+             * submission. The atomic read covers that case.
+             */
             if (r->frame_enqueued[next_frame] &&
                 !qatomic_read(&r->frame_submitted[next_frame])) {
-                while (!qatomic_read(&r->frame_submitted[next_frame])) {
-                    sched_yield();
-                }
+                qemu_event_wait(&r->frame_submitted_event[next_frame]);
             }
             r->frame_enqueued[next_frame] = false;
 

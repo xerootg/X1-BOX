@@ -63,6 +63,7 @@ static void create_command_buffers(PGRAPHState *pg)
     for (int i = 0; i < NUM_SUBMIT_FRAMES; i++) {
         r->frame_submitted[i] = false;
         r->deferred_framebuffer_count[i] = 0;
+        qemu_event_init(&r->frame_submitted_event[i], false);
     }
 }
 
@@ -72,6 +73,10 @@ static void destroy_command_buffers(PGRAPHState *pg)
 
     vkFreeCommandBuffers(r->device, r->command_pool,
                          ARRAY_SIZE(r->command_buffers), r->command_buffers);
+
+    for (int i = 0; i < NUM_SUBMIT_FRAMES; i++) {
+        qemu_event_destroy(&r->frame_submitted_event[i]);
+    }
 
     r->command_buffer = VK_NULL_HANDLE;
     r->aux_command_buffer = VK_NULL_HANDLE;
