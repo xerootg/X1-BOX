@@ -20,6 +20,12 @@
  */
 
 #include "apu_int.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 MCPXAPUState *g_state; // Used via debug handlers
 
@@ -706,8 +712,22 @@ type_init(mcpx_apu_register);
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#ifdef __ANDROID__
+    prctl(PR_SET_NAME, (unsigned long)"mcpx.apu_thread", 0, 0, 0);
+    __android_log_print(ANDROID_LOG_INFO, "x1box-thread",
+                        "mcpx_apu_frame_thread entered: tid=%d",
+                        (int)syscall(__NR_gettid));
+#endif
     qemu_mutex_lock(&d->lock);
     while (!qatomic_read(&d->exiting)) {
+#ifdef __ANDROID__
+        /* Re-pin name each iteration. The APU thread calls bql_lock /
+         * update_irq paths that can attach to the JVM (PCI IRQ raise
+         * goes through chipset → ioapic → KVM-style routing, some of
+         * which on Android touches JNI for SystemServer signalling).
+         * One prctl per audio frame is cheap. */
+        prctl(PR_SET_NAME, (unsigned long)"mcpx.apu_thread", 0, 0, 0);
+#endif
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
@@ -736,7 +756,30 @@ static void *mcpx_apu_frame_thread(void *arg)
             continue;
         }
         throttle(d);
+        /*
+         * se_frame is the bulk of the per-frame work — voice fanout
+         * (already lock-aware: it drops d->lock around the workers'
+         * cond_wait) plus mcpx_apu_dsp_frame (now lock-aware: it grabs
+         * d->gp.dsp_lock / d->ep.dsp_lock only around dsp_run, not the
+         * whole frame).
+         *
+         * Holding d->lock across the entire frame used to pin the vCPU
+         * on futex_wait for hundreds of µs at every GP/EP MMIO write
+         * (~15% of vCPU time on Halo 2's title screen). Drop the lock
+         * here so the vCPU can update DSP memory concurrently with the
+         * apu_thread, then re-acquire for the loop-top register check.
+         *
+         * Nothing else in se_frame's reach reads d->-protected state:
+         *   - per-apu-thread fields (ep_frame_div, frame_count_*,
+         *     next_frame_time_us) are touched only here
+         *   - register reads use qatomic
+         *   - monitor.fifo / monitor.frame_buf have their own locking
+         *   - voice-worker coordination uses vwd->lock
+         *   - DSP state is guarded by the per-DSP locks
+         */
+        qemu_mutex_unlock(&d->lock);
         se_frame((void *)d);
+        qemu_mutex_lock(&d->lock);
     }
     qemu_mutex_unlock(&d->lock);
     return NULL;

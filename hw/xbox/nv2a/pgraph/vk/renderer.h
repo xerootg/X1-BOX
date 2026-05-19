@@ -1014,6 +1014,7 @@ typedef struct PGRAPHVkState {
 #define NUM_SUBMIT_FRAMES 3
     int num_active_frames;
     VkQueue queue;
+    uint32_t queue_family; /* graphics + present queue family index */
     VkCommandPool command_pool;
     VkCommandBuffer command_buffers[NUM_SUBMIT_FRAMES * 2];
     VkFence frame_fences[NUM_SUBMIT_FRAMES];
@@ -1068,6 +1069,21 @@ typedef struct PGRAPHVkState {
     GArray *render_passes; // RenderPass
     bool in_render_pass;
     bool in_draw;
+    /* Mali-debug: reentrancy guard for the per-render-pass FLUSH submit
+     * triggered after end_render_pass. pgraph_vk_finish itself calls
+     * end_render_pass internally; without this guard the hook would
+     * recurse infinitely. Default false, set/cleared by pgraph_vk_finish. */
+    bool in_finish_no_recurse;
+    /* Mali-debug: per-RP submit count within the current frame, logged on
+     * fault so we know which RP died. Reset at frame start. */
+    uint32_t rp_submits_in_frame;
+    /* Diagnostic only: when set, end_render_pass on Mali fires
+     * pgraph_vk_finish(FLUSH) after every RP so the FAULT log can tell us
+     * which RP killed the GPU (rp_in_frame=N). Costs ~2× submit rate and
+     * on Halo 2's Bungie fade-in may exhaust Mali's outstanding kcpu
+     * fence slots, so we default it OFF and only flip it on for active
+     * isolation runs. See draw.c end_render_pass. */
+    bool mali_per_rp_finish;
     bool color_drawn_in_cb;
     bool zeta_drawn_in_cb;
 

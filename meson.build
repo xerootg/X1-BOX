@@ -2485,11 +2485,6 @@ config_host_data.set('CONFIG_AUDIO_DRIVERS',
 have_host_block_device = (host_os != 'darwin' or
     cc.has_header('IOKit/storage/IOMedia.h'))
 
-have_renderdoc = false
-if have_system and get_option('renderdoc').enabled()
-  have_renderdoc = true
-endif
-
 have_vtune = false
 vtune_path = get_option('vtune')
 if vtune_path != ''
@@ -2756,7 +2751,6 @@ config_host_data.set('QEMU_VERSION_MICRO', meson.project_version().split('.')[2]
 
 config_host_data.set_quoted('CONFIG_HOST_DSOSUF', host_dsosuf)
 config_host_data.set('HAVE_HOST_BLOCK_DEVICE', have_host_block_device)
-config_host_data.set('CONFIG_RENDERDOC', have_renderdoc)
 
 have_coroutine_pool = get_option('coroutine_pool')
 if get_option('debug_stack_usage') and have_coroutine_pool

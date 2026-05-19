@@ -314,48 +314,68 @@ static void gp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     MCPXAPUState *d = opaque;
 
-    qemu_mutex_lock(&d->lock);
-
     assert(size == 4);
     assert(addr % 4 == 0);
 
     DPRINTF("mcpx apu GP: [0x%" HWADDR_PRIx "] = 0x%lx\n", addr, val);
 
+    /*
+     * We used to take d->lock here, which serialised every guest MMIO
+     * write against the entire apu_thread frame cycle. Halo 2
+     * reprograms GPXMEM / GPYMEM / GPPMEM heavily, so the vCPU would
+     * park on futex_wait for hundreds of microseconds per write while
+     * mcpx_apu_dsp_frame was running. Now we use the per-DSP lock
+     * (d->gp.dsp_lock) which only blocks while the apu_thread is
+     * actually inside the GP DSP run (a much shorter window).
+     */
     switch (addr) {
     case NV_PAPU_GPXMEM ... NV_PAPU_GPXMEM + 0x1000 * 4 - 1: {
         uint32_t xaddr = (addr - NV_PAPU_GPXMEM) / 4;
-        // fprintf(stderr, "gp write xmem %x = %x\n", xaddr, val);
+        qemu_mutex_lock(&d->gp.dsp_lock);
         dsp_write_memory(d->gp.dsp, 'X', xaddr, val);
+        qemu_mutex_unlock(&d->gp.dsp_lock);
         break;
     }
     case NV_PAPU_GPMIXBUF ... NV_PAPU_GPMIXBUF + 0x400 * 4 - 1: {
         uint32_t xaddr = (addr - NV_PAPU_GPMIXBUF) / 4;
-        // fprintf(stderr, "gp write xmixbuf %x = %x\n", xaddr, val);
+        qemu_mutex_lock(&d->gp.dsp_lock);
         dsp_write_memory(d->gp.dsp, 'X', GP_DSP_MIXBUF_BASE + xaddr, val);
+        qemu_mutex_unlock(&d->gp.dsp_lock);
         break;
     }
     case NV_PAPU_GPYMEM ... NV_PAPU_GPYMEM + 0x800 * 4 - 1: {
         uint32_t yaddr = (addr - NV_PAPU_GPYMEM) / 4;
-        // fprintf(stderr, "gp write ymem %x = %x\n", yaddr, val);
+        qemu_mutex_lock(&d->gp.dsp_lock);
         dsp_write_memory(d->gp.dsp, 'Y', yaddr, val);
+        qemu_mutex_unlock(&d->gp.dsp_lock);
         break;
     }
     case NV_PAPU_GPPMEM ... NV_PAPU_GPPMEM + 0x1000 * 4 - 1: {
         uint32_t paddr = (addr - NV_PAPU_GPPMEM) / 4;
-        // fprintf(stderr, "gp write pmem %x = %x\n", paddr, val);
+        qemu_mutex_lock(&d->gp.dsp_lock);
         dsp_write_memory(d->gp.dsp, 'P', paddr, val);
+        qemu_mutex_unlock(&d->gp.dsp_lock);
         break;
     }
     case NV_PAPU_GPRST:
+        /*
+         * proc_rst_write may reset the DSP's internal state. Hold the
+         * dsp lock so it can't race with apu_thread's dsp_run.
+         */
+        qemu_mutex_lock(&d->gp.dsp_lock);
         proc_rst_write(d->gp.dsp, d->gp.regs[NV_PAPU_GPRST], val);
         d->gp.regs[NV_PAPU_GPRST] = val;
+        qemu_mutex_unlock(&d->gp.dsp_lock);
         break;
     default:
-        d->gp.regs[addr] = val;
+        /*
+         * Plain register write. d->gp.regs is read by the apu_thread
+         * (e.g. the GPRST checks in mcpx_apu_dsp_frame), so an atomic
+         * store is enough — no exclusive section needed.
+         */
+        qatomic_set(&d->gp.regs[addr], val);
         break;
     }
-
-    qemu_mutex_unlock(&d->lock);
 }
 
 const MemoryRegionOps gp_ops = {
@@ -404,43 +424,45 @@ static void ep_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     MCPXAPUState *d = opaque;
 
-    qemu_mutex_lock(&d->lock);
-
     assert(size == 4);
     assert(addr % 4 == 0);
 
     DPRINTF("mcpx apu EP: [0x%" HWADDR_PRIx "] = 0x%lx\n", addr, val);
 
+    /* See gp_write — same per-DSP-lock rationale. */
     switch (addr) {
     case NV_PAPU_EPXMEM ... NV_PAPU_EPXMEM + 0xC00 * 4 - 1: {
         uint32_t xaddr = (addr - NV_PAPU_EPXMEM) / 4;
+        qemu_mutex_lock(&d->ep.dsp_lock);
         dsp_write_memory(d->ep.dsp, 'X', xaddr, val);
-        // fprintf(stderr, "ep write xmem %x = %x\n", xaddr, val);
+        qemu_mutex_unlock(&d->ep.dsp_lock);
         break;
     }
     case NV_PAPU_EPYMEM ... NV_PAPU_EPYMEM + 0x100 * 4 - 1: {
         uint32_t yaddr = (addr - NV_PAPU_EPYMEM) / 4;
+        qemu_mutex_lock(&d->ep.dsp_lock);
         dsp_write_memory(d->ep.dsp, 'Y', yaddr, val);
-        // fprintf(stderr, "ep write ymem %x = %x\n", yaddr, val);
+        qemu_mutex_unlock(&d->ep.dsp_lock);
         break;
     }
     case NV_PAPU_EPPMEM ... NV_PAPU_EPPMEM + 0x1000 * 4 - 1: {
         uint32_t paddr = (addr - NV_PAPU_EPPMEM) / 4;
-        // fprintf(stderr, "ep write pmem %x = %x\n", paddr, val);
+        qemu_mutex_lock(&d->ep.dsp_lock);
         dsp_write_memory(d->ep.dsp, 'P', paddr, val);
+        qemu_mutex_unlock(&d->ep.dsp_lock);
         break;
     }
     case NV_PAPU_EPRST:
+        qemu_mutex_lock(&d->ep.dsp_lock);
         proc_rst_write(d->ep.dsp, d->ep.regs[NV_PAPU_EPRST], val);
         d->ep.regs[NV_PAPU_EPRST] = val;
         d->ep_frame_div = 0; /* FIXME: Still unsure about frame sync */
+        qemu_mutex_unlock(&d->ep.dsp_lock);
         break;
     default:
-        d->ep.regs[addr] = val;
+        qatomic_set(&d->ep.regs[addr], val);
         break;
     }
-
-    qemu_mutex_unlock(&d->lock);
 }
 
 const MemoryRegionOps ep_ops = {
@@ -450,6 +472,25 @@ const MemoryRegionOps ep_ops = {
 
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    /*
+     * Hold the per-DSP lock only across the actual DSP work (memory
+     * write + dsp_run). Outside of these critical sections the vCPU's
+     * gp_write / ep_write are free to update DSP memory without
+     * blocking on the apu_thread. The GP and EP locks are separate so
+     * a vCPU write to one DSP can proceed while the other is running.
+     */
+    bool gp_enabled = (qatomic_read(&d->gp.regs[NV_PAPU_GPRST]) &
+                       NV_PAPU_GPRST_GPRST) &&
+                      (qatomic_read(&d->gp.regs[NV_PAPU_GPRST]) &
+                       NV_PAPU_GPRST_GPDSPRST);
+    bool ep_enabled = (qatomic_read(&d->ep.regs[NV_PAPU_EPRST]) &
+                       NV_PAPU_GPRST_GPRST) &&
+                      (qatomic_read(&d->ep.regs[NV_PAPU_EPRST]) &
+                       NV_PAPU_GPRST_GPDSPRST);
+
+    /* Run GP under gp.dsp_lock. */
+    qemu_mutex_lock(&d->gp.dsp_lock);
+
     /* Write VP results to the GP DSP MIXBUF */
     for (int mixbin = 0; mixbin < NUM_MIXBINS; mixbin++) {
         uint32_t base = GP_DSP_MIXBUF_BASE + mixbin * NUM_SAMPLES_PER_FRAME;
@@ -459,12 +500,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
         }
     }
 
-    bool ep_enabled = (d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPRST) &&
-                      (d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPDSPRST);
-
-    /* Run GP */
-    if ((d->gp.regs[NV_PAPU_GPRST] & NV_PAPU_GPRST_GPRST) &&
-        (d->gp.regs[NV_PAPU_GPRST] & NV_PAPU_GPRST_GPDSPRST)) {
+    if (gp_enabled) {
         dsp_start_frame(d->gp.dsp);
         dsp_set_halt_requested(d->gp.dsp, false);
         dsp_set_cycle_count(d->gp.dsp, 0);
@@ -485,24 +521,27 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
             }
         }
     }
+    qemu_mutex_unlock(&d->gp.dsp_lock);
 
-    /* Run EP */
-    if ((d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPRST) &&
-        (d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPDSPRST)) {
-        if (d->ep_frame_div % 8 == 0) {
-            dsp_start_frame(d->ep.dsp);
-            dsp_set_halt_requested(d->ep.dsp, false);
-            dsp_set_cycle_count(d->ep.dsp, 0);
-            do {
-                dsp_run(d->ep.dsp, 1000);
-            } while (!dsp_get_halt_requested(d->ep.dsp) && d->ep.realtime);
-            g_dbg.ep.cycles = dsp_get_cycle_count(d->ep.dsp);
-        }
+    /* Run EP under ep.dsp_lock. */
+    if (ep_enabled && d->ep_frame_div % 8 == 0) {
+        qemu_mutex_lock(&d->ep.dsp_lock);
+        dsp_start_frame(d->ep.dsp);
+        dsp_set_halt_requested(d->ep.dsp, false);
+        dsp_set_cycle_count(d->ep.dsp, 0);
+        do {
+            dsp_run(d->ep.dsp, 1000);
+        } while (!dsp_get_halt_requested(d->ep.dsp) && d->ep.realtime);
+        g_dbg.ep.cycles = dsp_get_cycle_count(d->ep.dsp);
+        qemu_mutex_unlock(&d->ep.dsp_lock);
     }
 }
 
 void mcpx_apu_dsp_init(MCPXAPUState *d)
 {
+    qemu_mutex_init(&d->gp.dsp_lock);
+    qemu_mutex_init(&d->ep.dsp_lock);
+
     d->gp.dsp = dsp_init(d, gp_scratch_rw, gp_fifo_rw, true);
     dsp_set_halt_requested(d->gp.dsp, false);
     dsp_set_cycle_count(d->gp.dsp, 0);

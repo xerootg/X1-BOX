@@ -21,6 +21,12 @@
 
 #include "hw/xbox/mcpx/apu/apu_int.h"
 #include "adpcm.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 /*
  * Fast guest-RAM read for the audio voice processor.
@@ -1687,6 +1693,13 @@ static void *voice_worker_thread(void *arg)
     MCPXAPUState *d = arg;
     VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
 
+#ifdef __ANDROID__
+    prctl(PR_SET_NAME, (unsigned long)"mcpx.voice_work", 0, 0, 0);
+    __android_log_print(ANDROID_LOG_INFO, "x1box-thread",
+                        "voice_worker_thread entered: tid=%d",
+                        (int)syscall(__NR_gettid));
+#endif
+
     rcu_register_thread();
     qemu_mutex_lock(&vwd->lock);
 
@@ -1695,6 +1708,14 @@ static void *voice_worker_thread(void *arg)
     self->queue_len = 0;
 
     do {
+#ifdef __ANDROID__
+        /* Re-pin name each iteration — see [[feedback_jvm_renames_comm]]:
+         * any JNI attach in voice-processing call paths (e.g. via SDL
+         * audio, libsamplerate's allocator hitting an AOT cache) can
+         * overwrite our kernel comm. One prctl per audio frame is
+         * cheap (~1500 calls/s when realtime, no measurable overhead). */
+        prctl(PR_SET_NAME, (unsigned long)"mcpx.voice_work", 0, 0, 0);
+#endif
         int64_t start_time = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         g_dbg.vp.workers[worker_id].num_voices = self->queue_len;
 

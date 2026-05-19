@@ -24,6 +24,9 @@
 #include <sched.h>
 #ifdef __ANDROID__
 #include <android/log.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 void pgraph_vk_snapshot_state(PGRAPHState *pg, RenderCommandSnapshot *snap)
@@ -227,7 +230,83 @@ static void process_finish(PGRAPHVkState *r, RenderCommand *cmd)
     }
 
     qatomic_set(&r->frame_submitted[cmd->finish.frame_index], true);
-    qatomic_inc_fetch(&r->submit_count);
+    int submit_idx = qatomic_inc_fetch(&r->submit_count);
+
+#ifdef __ANDROID__
+    /*
+     * Mali stock driver: poll the submit's fence so we can distinguish
+     * "slow frame" from "GPU faulted" early. A bounded wait of 4 s gives
+     * Mali firmware longer than its own 3 s kcpu throttle to either
+     * complete the submit or surface VK_ERROR_DEVICE_LOST. On DEVICE_LOST
+     * we abort here with the submit metadata, so we can tell which submit
+     * killed the GPU (previously the lost surfaced several frames later in
+     * an unrelated pgraph_vk_finish wait, losing the actual offender).
+     *
+     * On TIMEOUT we just fall through — the work isn't done but the GPU
+     * isn't dead yet, so the original deferred / post_fence_cb waits below
+     * handle the wait correctly.
+     *
+     * Routed through __android_log_assert (see [[feedback_vk_check_logging]])
+     * so the message survives libc's abort path.
+     */
+    if (r->is_mali) {
+        const uint64_t timeout_ns = 4000ULL * 1000ULL * 1000ULL;
+        VkResult wait = vkWaitForFences(r->device, 1, &cmd->finish.fence,
+                                        VK_TRUE, timeout_ns);
+        if (wait == VK_ERROR_DEVICE_LOST) {
+            /*
+             * Graceful DEVICE_LOST handling. Replaces the old
+             * __android_log_assert (libc abort + SIGABRT + tombstone +
+             * "x1-box has stopped responding" dialog), which was a
+             * terrible UX every time Mali's stock driver tripped.
+             *
+             * Steps:
+             *   1. Log the fault metadata via __android_log_print (loud
+             *      ANDROID_LOG_FATAL severity, but no abort).
+             *   2. Request a clean QEMU shutdown via
+             *      qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI).
+             *      The main loop processes that and exits cleanly,
+             *      taking the JVM with it. User returns to the launcher
+             *      instead of seeing an ANR dialog.
+             *   3. Loop with sched_yield() — we can't keep submitting on
+             *      this thread (queue is dead) and we don't want to
+             *      return into process_finish's normal flow (which would
+             *      VK_CHECK and abort). Yielding until shutdown lets the
+             *      main thread drive the exit.
+             */
+            __android_log_print(ANDROID_LOG_FATAL, "hakuX-vk",
+                "Mali submit #%d FAULT: vkWaitForFences=%d (DEVICE_LOST) "
+                "finish_reason=%d frame_index=%d deferred=%d "
+                "rp_in_frame=%u aux_cb=%p main_cb=%p — "
+                "requesting graceful shutdown",
+                submit_idx, (int)wait,
+                (int)cmd->finish.reason, cmd->finish.frame_index,
+                cmd->finish.deferred ? 1 : 0,
+                r->rp_submits_in_frame,
+                (void *)cmd->finish.aux_command_buffer,
+                (void *)cmd->finish.command_buffer);
+
+            /*
+             * Request a clean emulator quit (returns to launcher
+             * activity, user sees a real "this stopped" instead of
+             * a crash dialog or frozen screen). Then park the thread
+             * so it can't drive any more Vulkan into the dead device.
+             */
+            nv2a_dbg_request_emulator_quit();
+            for (;;) { sleep(60); }
+        }
+        if (wait == VK_TIMEOUT) {
+            /* Slow submit but not faulted. Log once so we know Mali is
+             * struggling; the deferred / post_fence_cb wait below will
+             * pick up signaling whenever it actually happens. */
+            __android_log_print(ANDROID_LOG_WARN, "hakuX-vk",
+                "Mali submit #%d slow (>4s, not faulted yet): "
+                "finish_reason=%d frame_index=%d rp_in_frame=%u",
+                submit_idx, (int)cmd->finish.reason,
+                cmd->finish.frame_index, r->rp_submits_in_frame);
+        }
+    }
+#endif
 
     if (!cmd->finish.deferred) {
         VK_CHECK(vkWaitForFences(r->device, 1, &cmd->finish.fence,
@@ -276,7 +355,31 @@ static void *render_thread_func(void *opaque)
     PGRAPHVkState *r = opaque;
     RenderThread *rt = &r->render_thread;
 
+#ifdef __ANDROID__
+    /* Belt-and-suspenders rename: qemu_thread_create already calls
+     * pthread_setname_np with "pgraph.vk.render", but on some builds the
+     * thread shows up in /proc/<pid>/task/<tid>/comm as "Thread-N"
+     * anyway. Force the name from inside the thread to catch any race
+     * with the kernel comm field. */
+    prctl(PR_SET_NAME, (unsigned long)"pgraph.vk.rende", 0, 0, 0);
+    __android_log_print(ANDROID_LOG_INFO, "x1box-thread",
+                        "render_thread_func entered: tid=%d",
+                        (int)syscall(__NR_gettid));
+#endif
+
     while (true) {
+#ifdef __ANDROID__
+        /*
+         * Re-pin the kernel comm field every iteration. When this
+         * thread calls into libvulkan / Mali's vendor driver, those
+         * paths may attach the thread to the JVM (for AHardwareBuffer
+         * queries, HDR metadata, etc.). On attach, ART rewrites our
+         * comm to a default "Thread-N" string, which makes /proc-based
+         * profiling useless. Re-applying prctl once per loop turn
+         * costs one syscall and restores the name within ~one frame.
+         */
+        prctl(PR_SET_NAME, (unsigned long)"pgraph.vk.rende", 0, 0, 0);
+#endif
         qemu_mutex_lock(&rt->lock);
 
         while (QSIMPLEQ_EMPTY(&rt->queue) && !rt->shutdown) {

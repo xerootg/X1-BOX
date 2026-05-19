@@ -21,12 +21,29 @@
  */
 
 #include "renderer.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 static void *submit_worker_func(void *opaque)
 {
     PGRAPHVkState *r = opaque;
 
+#ifdef __ANDROID__
+    prctl(PR_SET_NAME, (unsigned long)"pgraph.vk.submi", 0, 0, 0);
+    __android_log_print(ANDROID_LOG_INFO, "x1box-thread",
+                        "submit_worker_func entered: tid=%d",
+                        (int)syscall(__NR_gettid));
+#endif
+
     while (true) {
+#ifdef __ANDROID__
+        /* Re-pin name; JVM can rename us if libvulkan attaches mid-submit. */
+        prctl(PR_SET_NAME, (unsigned long)"pgraph.vk.submi", 0, 0, 0);
+#endif
         qemu_mutex_lock(&r->submit_worker.lock);
 
         while (QSIMPLEQ_EMPTY(&r->submit_worker.queue) &&

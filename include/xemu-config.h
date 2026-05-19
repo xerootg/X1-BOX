@@ -204,9 +204,7 @@ struct config {
     struct display {
         CONFIG_DISPLAY_RENDERER renderer;
         struct {
-            bool validation_layers;
             bool debug_shaders;
-            bool assert_on_validation_msg;
             const char *preferred_physical_device;
         } vulkan;
         struct {

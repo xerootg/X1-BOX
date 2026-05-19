@@ -22,7 +22,7 @@ val hasReleaseKeystore = hasKeystoreProperties &&
 android {
   namespace = "com.izzy2lost.x1box"
   compileSdk = 36
-  buildToolsVersion = "36.1.0"
+  buildToolsVersion = "37.0.0"
   ndkVersion = "29.0.14206865"
 
   defaultConfig {
@@ -107,8 +107,8 @@ android {
   }
 
   compileOptions {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
   }
 
 }
@@ -124,6 +124,6 @@ dependencies {
 
 kotlin {
   compilerOptions {
-    jvmTarget.set(JvmTarget.JVM_21)
+    jvmTarget.set(JvmTarget.JVM_17)
   }
 }

@@ -22,6 +22,7 @@
 #define HW_XBOX_MCPX_APU_GP_EP_H
 
 #include "qemu/osdep.h"
+#include "qemu/thread.h"
 #include "hw/hw.h"
 #include "hw/pci/pci.h"
 #include "hw/xbox/mcpx/apu/apu_regs.h"
@@ -35,6 +36,15 @@ typedef struct MCPXAPUGPState {
     MemoryRegion mmio;
     DSPState *dsp;
     uint32_t regs[0x10000];
+    /*
+     * Serializes accesses to the GP DSP between the guest (via gp_write
+     * to GPXMEM / GPMIXBUF / GPYMEM / GPPMEM) and the apu_thread (which
+     * runs the GP DSP frame in mcpx_apu_dsp_frame). The wider d->lock
+     * used to cover both, but that pinned the vCPU on futex_wait for
+     * the entire duration of a DSP frame (hundreds of microseconds per
+     * audio frame) — see the comment in mcpx_apu_dsp_frame.
+     */
+    QemuMutex dsp_lock;
 } MCPXAPUGPState;
 
 typedef struct MCPXAPUEPState {
@@ -42,6 +52,8 @@ typedef struct MCPXAPUEPState {
     MemoryRegion mmio;
     DSPState *dsp;
     uint32_t regs[0x10000];
+    /* See MCPXAPUGPState::dsp_lock. */
+    QemuMutex dsp_lock;
 } MCPXAPUEPState;
 
 extern const MemoryRegionOps gp_ops;

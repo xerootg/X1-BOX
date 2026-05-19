@@ -8,9 +8,6 @@ specific_ss.add(files(
 	'texture.c',
 	'vertex.c',
 	))
-if have_renderdoc
-	specific_ss.add(files('debug_renderdoc.c'))
-endif
 subdir('thirdparty')
 subdir('null')
 subdir('gl')

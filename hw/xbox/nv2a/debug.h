@@ -417,12 +417,15 @@ static inline void nv2a_profile_inc_counter(enum NV2A_PROF_COUNTERS_ENUM cnt)
 
 #endif /* NV2A_PERF_LOG */
 
-void nv2a_dbg_renderdoc_init(void);
-void *nv2a_dbg_renderdoc_get_api(void);
-bool nv2a_dbg_renderdoc_available(void);
-void nv2a_dbg_renderdoc_capture_frames(int num_frames, bool trace);
-extern int renderdoc_capture_frames;
-extern bool renderdoc_trace_frames;
+/* Cleanly request the emulator to quit and return to the launcher
+ * activity (Android) / shut down (desktop). Pushes SDL_QUIT to wake
+ * the main loop and calls qemu_system_shutdown_request. Safe to call
+ * from any thread; uses SDL_PushEvent which is thread-safe.
+ *
+ * Use this instead of abort/_exit on DEVICE_LOST so the user returns
+ * to the game library / desktop instead of seeing an ANR dialog or
+ * frozen screen. */
+void nv2a_dbg_request_emulator_quit(void);
 
 void nv2a_dbg_set_rt_dump_path(const char *dir);
 

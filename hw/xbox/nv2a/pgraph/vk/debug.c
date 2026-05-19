@@ -24,50 +24,30 @@
 #include <dlfcn.h>
 #endif
 
-#ifdef CONFIG_RENDERDOC
-#include "trace/control.h"
-
-#pragma GCC diagnostic ignored "-Wstrict-prototypes"
-#include "thirdparty/renderdoc_app.h"
-#endif
+#include "system/runstate.h"
+#include <SDL.h>
 
 int nv2a_vk_dgroup_indent = 0;
 
 void pgraph_vk_debug_init(void)
 {
-#ifdef CONFIG_RENDERDOC
-    nv2a_dbg_renderdoc_init();
-#endif
 }
 
 void pgraph_vk_debug_frame_terminator(void)
 {
-#ifdef CONFIG_RENDERDOC
-    if (nv2a_dbg_renderdoc_available()) {
-        RENDERDOC_API_1_6_0 *rdoc_api = nv2a_dbg_renderdoc_get_api();
+}
 
-        PGRAPHVkState *r = g_nv2a->pgraph.vk_renderer_state;
-        if (rdoc_api->IsTargetControlConnected()) {
-            bool capturing = rdoc_api->IsFrameCapturing();
-            if (capturing && renderdoc_capture_frames == 0) {
-                rdoc_api->EndFrameCapture(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(r->instance), 0);
-                if (renderdoc_trace_frames) {
-                    trace_enable_events("-nv2a_pgraph_*");
-                    renderdoc_trace_frames = false;
-                }
-            }
-            if (renderdoc_capture_frames > 0) {
-                if (!capturing) {
-                    if (renderdoc_trace_frames) {
-                        trace_enable_events("nv2a_pgraph_*");
-                    }
-                    rdoc_api->StartFrameCapture(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(r->instance), 0);
-                }
-                --renderdoc_capture_frames;
-            }
-        }
-    }
-#endif
+/* Request a clean emulator shutdown. Called from VK_CHECK and the Mali
+ * DEVICE_LOST handler in render_thread.c so the user lands back at the
+ * launcher activity instead of seeing an ANR / abort tombstone. Thread-
+ * safe: SDL_PushEvent is documented as safe from any thread, and
+ * qemu_system_shutdown_request only flips an atomic flag the main loop
+ * polls. */
+void nv2a_dbg_request_emulator_quit(void)
+{
+    SDL_Event quit = { .type = SDL_QUIT };
+    SDL_PushEvent(&quit);
+    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
 }
 
 void pgraph_vk_insert_debug_marker(PGRAPHVkState *r, VkCommandBuffer cmd,

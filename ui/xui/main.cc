@@ -221,13 +221,6 @@ void xemu_hud_render(void)
     ImGui::NewFrame();
     ProcessKeyboardShortcuts();
 
-#if defined(CONFIG_RENDERDOC)
-    if (g_capture_renderdoc_frame) {
-        nv2a_dbg_renderdoc_capture_frames(1, false);
-        g_capture_renderdoc_frame = false;
-    }
-#endif
-
     if (g_config.display.ui.show_menubar && !first_boot_window.is_open) {
         // Auto-hide main menu after 5s of inactivity
         static uint32_t last_check = 0;

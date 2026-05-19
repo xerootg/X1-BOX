@@ -24,22 +24,17 @@
 
 #ifdef __ANDROID__
 #include <android/log.h>
+#include <vulkan/vulkan_android.h>
 #endif
 #include <volk.h>
 
 #define VkExtensionPropertiesArray GArray
 #define StringArray GArray
 
-static bool enable_validation = false;
-static bool renderdoc_layer_active = false;
 static bool external_capture_layer_active = false;
 
 /* Filled during select_physical_device for display in the Android overlay. */
 char g_vulkan_driver_info[256] = "Vulkan: initializing...";
-
-static char const *const validation_layers[] = {
-    "VK_LAYER_KHRONOS_validation",
-};
 
 static char const *const required_device_extensions[] = {
 #ifdef WIN32
@@ -75,39 +70,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     fprintf(stderr, "[vk] %s\n", pCallbackData->pMessage);
 #endif
 
-    if ((messageType & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) &&
-        (messageSeverity & (VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-                            VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT))) {
-        assert(!g_config.display.vulkan.assert_on_validation_msg);
-    }
     return VK_FALSE;
-}
-
-static bool check_validation_layer_support(void)
-{
-    uint32_t num_available_layers;
-    vkEnumerateInstanceLayerProperties(&num_available_layers, NULL);
-
-    g_autofree VkLayerProperties *available_layers =
-        g_malloc_n(num_available_layers, sizeof(VkLayerProperties));
-    vkEnumerateInstanceLayerProperties(&num_available_layers, available_layers);
-
-    for (int i = 0; i < ARRAY_SIZE(validation_layers); i++) {
-        bool found = false;
-        for (int j = 0; j < num_available_layers; j++) {
-            if (!strcmp(validation_layers[i], available_layers[j].layerName)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            fprintf(stderr, "desired validation layer not found: %s\n",
-                    validation_layers[i]);
-            return false;
-        }
-    }
-
-    return true;
 }
 
 static VkExtensionPropertiesArray *
@@ -174,11 +137,14 @@ add_optional_instance_extension_names(PGRAPHState *pg,
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    /* Always try to enable VK_EXT_debug_utils so debug markers, vendor
+     * GPU debuggers, and side-loaded validation layers have a place to
+     * route messages. The extension may not be advertised in release
+     * loaders; if absent, debug_utils_extension_enabled stays false and
+     * the marker helpers in vk/debug.c short-circuit. */
     r->debug_utils_extension_enabled =
-        g_config.display.vulkan.validation_layers &&
         add_extension_if_available(available_extensions, enabled_extension_names,
                                    VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-
 }
 
 static bool create_instance(PGRAPHState *pg, Error **errp)
@@ -187,29 +153,11 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
     VkResult result;
 
 #ifdef __ANDROID__
-    /*
-     * When RenderDoc is injected, use the standard Vulkan loader so
-     * RenderDoc's layer can intercept all API calls.  Custom drivers
-     * loaded via adrenotools bypass the loader layer chain, making
-     * RenderDoc report "Vulkan (Unsupported)".
-     */
-    bool use_standard_loader = false;
-#ifdef CONFIG_RENDERDOC
-    if (nv2a_dbg_renderdoc_available()) {
-        fprintf(stderr, "RenderDoc detected — using standard Vulkan loader "
-                        "(custom driver bypassed for capture)\n");
-        use_standard_loader = true;
-    }
-#endif
-    if (!use_standard_loader) {
-        extern PFN_vkGetInstanceProcAddr xemu_android_get_vk_proc_addr(void);
-        PFN_vkGetInstanceProcAddr custom_proc = xemu_android_get_vk_proc_addr();
-        if (custom_proc) {
-            volkInitializeCustom(custom_proc);
-            result = VK_SUCCESS;
-        } else {
-            result = volkInitialize();
-        }
+    extern PFN_vkGetInstanceProcAddr xemu_android_get_vk_proc_addr(void);
+    PFN_vkGetInstanceProcAddr custom_proc = xemu_android_get_vk_proc_addr();
+    if (custom_proc) {
+        volkInitializeCustom(custom_proc);
+        result = VK_SUCCESS;
     } else {
         result = volkInitialize();
     }
@@ -270,11 +218,7 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
         .ppEnabledExtensionNames = enabled_instance_extension_names,
     };
 
-    enable_validation = g_config.display.vulkan.validation_layers;
-
 #ifdef __ANDROID__
-    __android_log_print(ANDROID_LOG_INFO, "xemu-vk-validation",
-                        "validation_layers config = %d", enable_validation ? 1 : 0);
     {
         uint32_t n = 0;
         vkEnumerateInstanceLayerProperties(&n, NULL);
@@ -298,23 +242,11 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
     }
 #endif
 
-    VkValidationFeatureEnableEXT enables[] = {
-        VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
-        // VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT,
-    };
-
-    VkValidationFeaturesEXT validationFeatures = {
-        .sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
-        .enabledValidationFeatureCount = ARRAY_SIZE(enables),
-        .pEnabledValidationFeatures = enables,
-    };
-
     const char *all_layers[8];
     uint32_t all_layer_count = 0;
 
     {
         static const char *capture_layers[] = {
-            "VK_LAYER_RENDERDOC_Capture",
             "VkLayerGPA",
             "GFXReconstruct",
             NULL,
@@ -335,38 +267,11 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
                                             lp[i].layerName);
 #endif
                         all_layers[all_layer_count++] = capture_layers[j];
-                        if (!strcmp(capture_layers[j],
-                                   "VK_LAYER_RENDERDOC_Capture")) {
-                            renderdoc_layer_active = true;
-                        }
                         external_capture_layer_active = true;
                     }
                 }
             }
             g_free(lp);
-        }
-    }
-
-    if (enable_validation) {
-        if (check_validation_layer_support()) {
-            fprintf(stderr, "Warning: Validation layers enabled. Expect "
-                            "performance impact.\n");
-#ifdef __ANDROID__
-            __android_log_print(ANDROID_LOG_WARN, "xemu-vk-validation",
-                                "Validation layers ENABLED — expect performance impact");
-#endif
-            for (int i = 0; i < ARRAY_SIZE(validation_layers); i++) {
-                all_layers[all_layer_count++] = validation_layers[i];
-            }
-            create_info.pNext = &validationFeatures;
-        } else {
-            fprintf(stderr, "Warning: validation layers not available\n");
-#ifdef __ANDROID__
-            __android_log_print(ANDROID_LOG_ERROR, "xemu-vk-validation",
-                                "Validation layers requested but NOT AVAILABLE — "
-                                "push the layer .so via adb");
-#endif
-            enable_validation = false;
         }
     }
 
@@ -382,19 +287,6 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
     }
 
     volkLoadInstance(r->instance);
-
-#ifdef CONFIG_RENDERDOC
-    if (!nv2a_dbg_renderdoc_available()) {
-        nv2a_dbg_renderdoc_init();
-        if (nv2a_dbg_renderdoc_available()) {
-            fprintf(stderr, "RenderDoc API found after instance creation\n");
-#ifdef __ANDROID__
-            __android_log_print(ANDROID_LOG_INFO, "xemu-vk-debug",
-                                "RenderDoc API found after instance creation");
-#endif
-        }
-    }
-#endif
 
     if (r->debug_utils_extension_enabled) {
         VkDebugUtilsMessengerCreateInfoEXT messenger_info = {
@@ -1047,11 +939,6 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         .pNext = next_struct,
     };
 
-    if (enable_validation) {
-        device_create_info.enabledLayerCount = ARRAY_SIZE(validation_layers);
-        device_create_info.ppEnabledLayerNames = validation_layers;
-    }
-
 #ifdef __ANDROID__
     __android_log_print(ANDROID_LOG_INFO, "hakuX",
                         "vk init stage: vkCreateDevice");
@@ -1099,6 +986,7 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         OPT_DYNAMIC_BLEND && r->eds3_blend_supported);
 
     vkGetDeviceQueue(r->device, indices.queue_family, 0, &r->queue);
+    r->queue_family = indices.queue_family;
     return true;
 }
 

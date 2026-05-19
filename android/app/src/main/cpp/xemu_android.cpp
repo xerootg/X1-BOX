@@ -8,6 +8,8 @@
 #include <android/log.h>
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
 #include <jni.h>
 
 #include <atomic>
@@ -28,6 +30,89 @@
 
 #include "xemu-settings.h"
 #include "hw/xbox/nv2a/debug.h"
+
+#include <pthread.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+
+/*
+ * pthread_create interposer.
+ *
+ * Many threads in the running process (libsamplerate, SDL audio backends,
+ * various third-party static libs linked into libxemu.so) call
+ * pthread_create directly rather than going through qemu_thread_create,
+ * so they inherit the Java VM's default "Thread-N" name in
+ * /proc/<pid>/task/<tid>/comm. That makes /proc-based profiling
+ * effectively useless for those threads — we can't tell which library
+ * spawned them, and "top -H" just shows "Thread-4 @ 39% CPU" with no
+ * way to attribute the load.
+ *
+ * `-Wl,--wrap=pthread_create` (added in CMakeLists.txt for the xemu
+ * target) routes every pthread_create call resolved inside libxemu.so
+ * — including from statically-linked deps — through __wrap_pthread_create.
+ * We log the caller's return address and install a tiny shim around
+ * start_routine that:
+ *   1. assigns a fallback name "x1box-pthr-NNN" if no one else has
+ *      named the thread within a few syscalls of entry, and
+ *   2. emits a logcat line with TID + name + caller PC so we can map
+ *      "Thread-N" back to whichever static lib spawned it.
+ *
+ * Threads that get a real name later (via qemu_thread_create's
+ * pthread_setname_np or the prctl backups we added to each xemu thread
+ * function) simply overwrite the fallback name — no harm done.
+ */
+extern "C" int __real_pthread_create(pthread_t *thread,
+                                     const pthread_attr_t *attr,
+                                     void *(*start_routine)(void *),
+                                     void *arg);
+
+namespace {
+struct PthrShim {
+    void *(*start_routine)(void *);
+    void *arg;
+    void *caller_pc;
+    int spawn_index;
+};
+std::atomic<int> g_pthr_counter{0};
+
+void *pthr_shim_entry(void *raw)
+{
+    auto *shim = static_cast<PthrShim *>(raw);
+    void *(*start_routine)(void *) = shim->start_routine;
+    void *arg = shim->arg;
+    int idx = shim->spawn_index;
+    void *caller_pc = shim->caller_pc;
+    delete shim;
+
+    char fallback[16];
+    snprintf(fallback, sizeof(fallback), "x1box-pthr-%d", idx);
+    prctl(PR_SET_NAME, (unsigned long)fallback, 0, 0, 0);
+
+    __android_log_print(ANDROID_LOG_INFO, "x1box-thread",
+                        "pthread_create: tid=%d fallback_name=%s caller_pc=%p",
+                        (int)syscall(__NR_gettid), fallback, caller_pc);
+
+    return start_routine(arg);
+}
+}
+
+extern "C" int __wrap_pthread_create(pthread_t *thread,
+                                     const pthread_attr_t *attr,
+                                     void *(*start_routine)(void *),
+                                     void *arg)
+{
+    auto *shim = new PthrShim{
+        start_routine,
+        arg,
+        __builtin_return_address(0),
+        g_pthr_counter.fetch_add(1),
+    };
+    int rc = __real_pthread_create(thread, attr, pthr_shim_entry, shim);
+    if (rc != 0) {
+        delete shim;
+    }
+    return rc;
+}
 
 extern "C" void xemu_set_fp_safe(bool enable);
 extern "C" bool xemu_get_fp_safe(void);
@@ -602,7 +687,6 @@ struct DisplaySettings {
   int mem_limit_mib = 64;
   bool vsync = false;
   bool unlock_framerate = true;
-  bool validation_layers = false;
   bool skip_boot_anim = true;
   bool fp_jit = true;
   bool use_dsp = false;
@@ -674,10 +758,6 @@ static bool WriteConfigToml(const std::string& config_path,
   toml::table* display_ui = EnsureTable(*display, "ui");
   if (display_ui) {
     display_ui->insert_or_assign("aspect_ratio", ds.aspect_ratio);
-  }
-  toml::table* display_vulkan = EnsureTable(*display, "vulkan");
-  if (display_vulkan) {
-    display_vulkan->insert_or_assign("validation_layers", ds.validation_layers);
   }
   if (!audio_vp->contains("num_workers")) {
     audio_vp->insert_or_assign("num_workers", 0);
@@ -880,7 +960,6 @@ static SetupFiles SyncSetupFiles() {
       env, activity, "setting_vsync",
       GetPrefBool(env, activity, "vsync", false));
   ds.unlock_framerate = GetPrefBool(env, activity, "unlock_framerate", true);
-  ds.validation_layers = GetPrefBool(env, activity, "validation_layers", false);
   ds.skip_boot_anim = GetPrefBool(env, activity, "setting_skip_boot_anim", true);
   ds.use_dsp = GetPrefBool(env, activity, "setting_use_dsp", false);
   ds.use_dsp_jit = GetPrefBool(env, activity, "setting_use_dsp_jit", true);
@@ -1112,9 +1191,10 @@ extern "C" int xemu_android_main(int argc, char** argv) {
    * `-name debug-threads=on`, which the Android frontend never
    * passes. Without it, every qemu_thread_create() — voice
    * workers, AIO pool, pgraph workers, iothreads, etc. — inherits
-   * the parent's name, which makes /proc/<pid>/task/ effectively
-   * unreadable for profilers. The naming syscall is a one-time
-   * cost per thread and has no observable runtime overhead.
+   * the parent's "qemu_main" comm, which makes /proc/<pid>/task/
+   * effectively unreadable for profilers. The naming syscall is
+   * a one-time cost per thread and has no observable runtime
+   * overhead in steady state.
    */
   qemu_thread_naming(true);
 
@@ -1336,6 +1416,24 @@ extern "C" int SDL_main(int argc, char* argv[]) {
       LogInfoInt("SDL_main: passing DVD fd %d via -add-fd", g_dvd_fd);
     }
 
+    // Optional QEMU gdbstub. Set XEMU_ANDROID_GDB_PORT via the env_vars pref
+    // (read in SyncSetupFiles) to have qemu open a TCP listener for gdb. Set
+    // XEMU_ANDROID_GDB_PAUSE=1 to also halt the guest at startup until gdb
+    // attaches. Driven by tools/x1box_debugger_mcp.py.
+    const char* gdb_port = SDL_getenv("XEMU_ANDROID_GDB_PORT");
+    if (gdb_port && gdb_port[0] != '\0') {
+      std::string gdb_spec = std::string("tcp::") + gdb_port;
+      arg_storage.emplace_back("-gdb");
+      arg_storage.emplace_back(gdb_spec);
+      const char* gdb_pause = SDL_getenv("XEMU_ANDROID_GDB_PAUSE");
+      if (gdb_pause && gdb_pause[0] == '1') {
+        arg_storage.emplace_back("-S");
+        LogInfoFmt("SDL_main: gdbstub %s (halted at boot)", gdb_spec.c_str());
+      } else {
+        LogInfoFmt("SDL_main: gdbstub %s (running)", gdb_spec.c_str());
+      }
+    }
+
     std::vector<char*> xemu_argv;
     xemu_argv.reserve(arg_storage.size() + 1);
     for (auto& arg : arg_storage) {
@@ -1463,18 +1561,6 @@ Java_com_izzy2lost_x1box_MainActivity_nativeGetShaderStats(JNIEnv *env, jobject)
     char buf[256];
     nv2a_profile_get_shader_stats_str(buf, sizeof(buf));
     return env->NewStringUTF(buf);
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_izzy2lost_x1box_MainActivity_nativeCaptureFrame(JNIEnv *, jobject)
-{
-#ifdef CONFIG_RENDERDOC
-    if (nv2a_dbg_renderdoc_available()) {
-        nv2a_dbg_renderdoc_capture_frames(1, false);
-        return JNI_TRUE;
-    }
-#endif
-    return JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1646,6 +1732,108 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_izzy2lost_x1box_MainActivity_nativeExitEmulation(JNIEnv *, jobject)
 {
     xemu_android_request_exit();
+}
+
+/*
+ * Called from the Mali DEVICE_LOST crash path (nv2a_dbg_request_emulator_quit
+ * → here → _exit(0)). Pushes GameLibraryActivity onto a fresh task before the
+ * :xemu process dies, so the user lands on the library screen instead of the
+ * Android home screen.
+ *
+ * Mirrors MainActivity.requestClose(RETURN_TO_LIBRARY) but reachable from C:
+ *   - resolves Activity.startActivity via the class loader of the running
+ *     MainActivity (FindClass from a non-Java thread can't locate app classes)
+ *   - constructs an Intent for .GameLibraryActivity with the same flags the
+ *     Kotlin path uses (NEW_TASK | CLEAR_TOP | SINGLE_TOP)
+ *
+ * Best-effort: any JNI failure (no activity yet, class not on the loader,
+ * exception thrown) is swallowed and logged — the caller is about to _exit
+ * anyway, so falling back to the Android home screen is acceptable. Returns
+ * true if startActivity was successfully invoked, false otherwise.
+ */
+extern "C" bool xemu_android_launch_game_library_for_crash(void)
+{
+    JNIEnv* env = GetEnv();
+    if (!env) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag,
+            "launch_game_library_for_crash: no JNIEnv — skipping");
+        return false;
+    }
+    jobject activity = GetActivity(env);
+    if (!activity) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag,
+            "launch_game_library_for_crash: no Activity — skipping");
+        return false;
+    }
+
+    bool ok = false;
+    /* Use the activity's class loader so we can resolve our app's classes
+     * (FindClass from a worker thread/JNI-attach path won't find them). */
+    jclass activityClass = env->GetObjectClass(activity);
+    jmethodID getClassLoader = env->GetMethodID(
+        activityClass, "getClassLoader", "()Ljava/lang/ClassLoader;");
+    if (!getClassLoader || HasException(env, "getClassLoader resolve")) {
+        goto done;
+    }
+    {
+        jobject classLoader = env->CallObjectMethod(activity, getClassLoader);
+        if (HasException(env, "getClassLoader call") || !classLoader) {
+            goto done;
+        }
+        jclass classLoaderClass = env->GetObjectClass(classLoader);
+        jmethodID loadClass = env->GetMethodID(
+            classLoaderClass, "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;");
+        if (!loadClass) {
+            env->DeleteLocalRef(classLoader);
+            goto done;
+        }
+
+        jstring gameLibName = env->NewStringUTF(
+            "com.izzy2lost.x1box.GameLibraryActivity");
+        jclass gameLibClass = static_cast<jclass>(
+            env->CallObjectMethod(classLoader, loadClass, gameLibName));
+        env->DeleteLocalRef(gameLibName);
+        env->DeleteLocalRef(classLoader);
+        if (HasException(env, "loadClass(GameLibraryActivity)") ||
+            !gameLibClass) {
+            goto done;
+        }
+
+        jclass intentClass = env->FindClass("android/content/Intent");
+        jmethodID intentCtor = env->GetMethodID(intentClass, "<init>",
+            "(Landroid/content/Context;Ljava/lang/Class;)V");
+        jobject intent = env->NewObject(intentClass, intentCtor,
+                                        activity, gameLibClass);
+        env->DeleteLocalRef(gameLibClass);
+        if (HasException(env, "new Intent") || !intent) {
+            goto done;
+        }
+
+        /* FLAG_ACTIVITY_NEW_TASK (0x10000000) | FLAG_ACTIVITY_CLEAR_TOP
+         * (0x04000000) | FLAG_ACTIVITY_SINGLE_TOP (0x20000000) — same as
+         * MainActivity.requestClose's Kotlin path. */
+        const jint flags = 0x10000000 | 0x04000000 | 0x20000000;
+        jmethodID addFlags = env->GetMethodID(intentClass, "addFlags",
+            "(I)Landroid/content/Intent;");
+        jobject after = env->CallObjectMethod(intent, addFlags, flags);
+        if (after) env->DeleteLocalRef(after);
+
+        jmethodID startActivity = env->GetMethodID(activityClass,
+            "startActivity", "(Landroid/content/Intent;)V");
+        env->CallVoidMethod(activity, startActivity, intent);
+        env->DeleteLocalRef(intent);
+        if (HasException(env, "startActivity(GameLibraryActivity)")) {
+            goto done;
+        }
+        ok = true;
+        __android_log_print(ANDROID_LOG_INFO, kLogTag,
+            "launch_game_library_for_crash: queued GameLibraryActivity in a "
+            "fresh task — Android will bring it forward once :xemu dies");
+    }
+
+done:
+    return ok;
 }
 
 #ifdef CONFIG_VULKAN

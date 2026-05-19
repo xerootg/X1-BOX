@@ -292,7 +292,7 @@ object DebugLog {
         .redirectErrorStream(true)
         .start()
 
-      val thread = Thread({
+      val thread = Thread(Runnable {
         try {
           process.inputStream.bufferedReader().use { reader ->
             // Use a generously sized buffer (64 KB) and only flush

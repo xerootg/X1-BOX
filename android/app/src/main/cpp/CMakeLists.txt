@@ -186,7 +186,13 @@ if(XEMU_ENABLE_VULKAN)
 
   add_library(volk_static STATIC "${volk_SOURCE_DIR}/volk.c")
   target_include_directories(volk_static PUBLIC "${volk_SOURCE_DIR}")
-  target_compile_definitions(volk_static PUBLIC VK_NO_PROTOTYPES)
+  target_compile_definitions(volk_static PUBLIC
+    VK_NO_PROTOTYPES
+    # Enable the Android-platform Vulkan symbols (e.g.
+    # vkGetAndroidHardwareBufferPropertiesANDROID) needed by xemu's
+    # AHardwareBuffer display path.
+    VK_USE_PLATFORM_ANDROID_KHR
+  )
 
   set(GLSLANG_GIT_REV "b5782e52ee2f7b3e40bb9c80d15b47016e008bc9")
   set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
@@ -624,6 +630,10 @@ list(FILTER XEMU_CORE_SOURCES EXCLUDE REGEX "disas[\\\\/]capstone\\.c$")
 list(FILTER XEMU_CORE_SOURCES EXCLUDE REGEX "fsdev[\\\\/].*\\.c$")
 list(FILTER XEMU_CORE_SOURCES EXCLUDE REGEX "gdbstub[\\\\/]user-target\\.c$")
 list(FILTER XEMU_CORE_SOURCES EXCLUDE REGEX "gdbstub[\\\\/]user\\.c$")
+# Pulled into the xemu_force_keep_objs OBJECT lib below so its type_init()
+# constructor survives the static-archive dead-code elimination. Required for
+# `-gdb tcp::PORT` to find the `socket` char driver.
+list(FILTER XEMU_CORE_SOURCES EXCLUDE REGEX "chardev[\\\\/]char-socket\\.c$")
 list(FILTER XEMU_CORE_SOURCES EXCLUDE REGEX "ui[\\\\/]xemu-settings\\.cc$")
 list(FILTER XEMU_CORE_SOURCES EXCLUDE REGEX "ui[\\\\/]xui[\\\\/].*")
 list(FILTER XEMU_CORE_SOURCES EXCLUDE REGEX "hw[\\\\/]9pfs[\\\\/].*\\.c$")
@@ -757,12 +767,34 @@ list(FILTER XEMU_CORE_SOURCES EXCLUDE REGEX "tcg[\\\\/]debuginfo\\.c$")
 list(FILTER XEMU_CORE_SOURCES EXCLUDE REGEX "tcg[\\\\/]tci\\.c$")
 list(FILTER XEMU_CORE_SOURCES EXCLUDE REGEX "ui[\\\\/]spice.*\\.c$")
 list(FILTER XEMU_CORE_SOURCES EXCLUDE REGEX "hw[\\\\/]char[\\\\/].*\\.c$")
+# Generate gdb_static_features[] (the register/feature XML lookup table) by
+# running QEMU's own feature_to_c.py over the i386 gdb-xml files. Without
+# this, the gdbstub binds and accepts breakpoints/memory but every register
+# read (`g`, `p<N>`) returns empty because the static feature table is
+# empty — see stubs/gdbstub.c. Upstream meson does this step automatically;
+# the Android cmake port previously fell back to the empty stub.
+set(XEMU_GDB_FEATURES_C "${CMAKE_BINARY_DIR}/gdb-static-features.c")
+set(XEMU_GDB_XML_FILES
+  "${REPO_ROOT}/gdb-xml/i386-32bit.xml"
+  "${REPO_ROOT}/gdb-xml/i386-32bit-linux.xml"
+)
+add_custom_command(
+  OUTPUT "${XEMU_GDB_FEATURES_C}"
+  COMMAND ${CMAKE_COMMAND} -E env
+          ${PYTHON_EXECUTABLE} "${REPO_ROOT}/scripts/feature_to_c.py"
+          ${XEMU_GDB_XML_FILES} > "${XEMU_GDB_FEATURES_C}"
+  DEPENDS ${XEMU_GDB_XML_FILES} "${REPO_ROOT}/scripts/feature_to_c.py"
+  COMMENT "Generating GDB static features from gdb-xml/*.xml"
+  VERBATIM
+)
+add_custom_target(xemu_gdb_static_features DEPENDS "${XEMU_GDB_FEATURES_C}")
+
 list(APPEND XEMU_CORE_SOURCES
   "${REPO_ROOT}/accel/stubs/kvm-stub.c"
   "${REPO_ROOT}/crypto/tlscreds.c"
   "${REPO_ROOT}/crypto/tlssession.c"
   "${REPO_ROOT}/migration/colo-stubs.c"
-  "${REPO_ROOT}/stubs/gdbstub.c"
+  "${XEMU_GDB_FEATURES_C}"
   "${REPO_ROOT}/stubs/target-get-monitor-def.c"
   "${REPO_ROOT}/stubs/target-monitor-defs.c"
   "${REPO_ROOT}/stubs/xen-hw-stub.c"
@@ -1054,15 +1086,24 @@ target_compile_definitions(xemu_core PRIVATE
   CONFIG_OPENGL
   $<$<BOOL:${XEMU_ENABLE_VULKAN}>:CONFIG_VULKAN>
   $<$<BOOL:${XEMU_ENABLE_VULKAN}>:VK_NO_PROTOTYPES>
+  # Expose Android-platform Vulkan symbols (vkGetAndroidHardwareBuffer*,
+  # etc.) to xemu_core sources. Needed by xemu's AHardwareBuffer display
+  # path. volk_static is built with the same flag so the function-pointer
+  # storage exists at link time.
+  $<$<BOOL:${XEMU_ENABLE_VULKAN}>:VK_USE_PLATFORM_ANDROID_KHR>
   $<$<BOOL:${XEMU_ENABLE_VULKAN}>:VMA_STATIC_VULKAN_FUNCTIONS=0>
   $<$<BOOL:${XEMU_ENABLE_VULKAN}>:VMA_DYNAMIC_VULKAN_FUNCTIONS=0>
-  CONFIG_RENDERDOC
   $<$<BOOL:${XEMU_OPT_NATIVE_FLOAT}>:XEMU_OPT_NATIVE_FLOAT=1>
   $<$<BOOL:${XEMU_OPT_TCG_PEEPHOLE}>:XEMU_OPT_TCG_PEEPHOLE=1>
   $<$<BOOL:${XEMU_OPT_TB_CACHE_HINTS}>:XEMU_OPT_TB_CACHE_HINTS=1>
   CONFIG_ATOMIC64
   CONFIG_PPOLL
   CONFIG_PRCTL_PR_SET_TIMERSLACK
+  # Bionic's pthread_setname_np takes (pthread_t, const char*) — the
+  # W_TID flavor. Defining this enables QEMU's qemu_thread_create() ->
+  # pthread_setname_np path so every worker thread gets its real name
+  # in /proc/<pid>/task/<tid>/comm. Without it qemu_thread_naming(true)
+  # is silently a no-op and every thread shows as "qemu_main".
   CONFIG_PTHREAD_SETNAME_NP_W_TID
   COMPILING_PER_TARGET
   CONFIG_TARGET=\"config-target.h\"
@@ -1106,7 +1147,32 @@ target_include_directories(xemu_core PRIVATE
   $<$<BOOL:${XEMU_ENABLE_VULKAN}>:${volk_SOURCE_DIR}>
 )
 
-add_dependencies(xemu_core glib_ep)
+add_dependencies(xemu_core glib_ep xemu_gdb_static_features)
+
+# --- Force-keep chardev backends -------------------------------------------
+# QEMU registers chardev backends via type_init()/__attribute__((constructor))
+# in .o files whose symbols are otherwise all-static. The linker drops these
+# .o entirely when linking the xemu_core static archive into libxemu.so,
+# stripping the .init_array entries with them — so `-gdb tcp::PORT` fails
+# at runtime with "'socket' is not a valid char driver name".
+#
+# An OBJECT library bypasses the dead-code-elim path: its .o files are
+# materialised directly into the final link line, so their constructors
+# always survive. Only add files that we've also EXCLUDEd from
+# XEMU_CORE_SOURCES above to avoid duplicate symbols.
+add_library(xemu_force_keep_objs OBJECT
+  "${REPO_ROOT}/chardev/char-socket.c"
+)
+target_compile_definitions(xemu_force_keep_objs PRIVATE
+  $<TARGET_PROPERTY:xemu_core,COMPILE_DEFINITIONS>
+)
+target_include_directories(xemu_force_keep_objs PRIVATE
+  $<TARGET_PROPERTY:xemu_core,INCLUDE_DIRECTORIES>
+)
+target_compile_options(xemu_force_keep_objs PRIVATE
+  $<TARGET_PROPERTY:xemu_core,COMPILE_OPTIONS>
+)
+add_dependencies(xemu_force_keep_objs glib_ep)
 
 target_link_libraries(xemu_core PRIVATE
   dsp56300_emu_ffi
@@ -1179,7 +1245,6 @@ add_library(xemu SHARED
 )
 
 target_compile_definitions(xemu PRIVATE ANDROID __ANDROID__ XBOX CONFIG_SDL CONFIG_OPENGL
-  CONFIG_RENDERDOC
   $<$<BOOL:${XEMU_OPT_NATIVE_FLOAT}>:XEMU_OPT_NATIVE_FLOAT=1>
   $<$<BOOL:${XEMU_OPT_TCG_PEEPHOLE}>:XEMU_OPT_TCG_PEEPHOLE=1>
   $<$<BOOL:${XEMU_OPT_TB_CACHE_HINTS}>:XEMU_OPT_TB_CACHE_HINTS=1>
@@ -1192,6 +1257,13 @@ target_compile_options(xemu PRIVATE -fexceptions -frtti -g1
   -fno-emulated-tls
   $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>,$<CONFIG:MinSizeRel>>:-UNDEBUG>
 )
+
+# Route pthread_create calls resolved inside libxemu.so through
+# __wrap_pthread_create in xemu_android.cpp. See that function's comment
+# for why we need this — it catches the "Thread-N" threads that statically
+# linked deps (SDL2, libsamplerate, etc) spawn directly via libc, so they
+# show up with a real name in /proc/<pid>/task/<tid>/comm.
+target_link_options(xemu PRIVATE "-Wl,--wrap=pthread_create")
 
 target_include_directories(xemu PRIVATE
   "${REPO_ROOT}"
@@ -1238,6 +1310,7 @@ endif()
 
 target_link_libraries(xemu PRIVATE
   xemu_core
+  xemu_force_keep_objs   # OBJECT lib — see below, force-link chardev backends
   dsp56300_emu_ffi
   slirp_static
   iconv_stub

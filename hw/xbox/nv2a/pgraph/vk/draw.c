@@ -24,6 +24,7 @@
 #include "system/physmem.h"
 #include "ui/xemu-settings.h"
 #include "hw/xbox/nv2a/pgraph/prim_rewrite.h"
+#include "hw/xbox/nv2a/debug.h"
 #include <math.h>
 
 static bool g_xemu_fast_fences = false;
@@ -37,6 +38,7 @@ static int g_xemu_submit_frames = 3;
 struct OptBisectStats g_opt_stats;
 
 #ifdef __ANDROID__
+extern bool xemu_android_is_debug_logging_enabled(void);
 #define VAF_LOG(...) __android_log_print(ANDROID_LOG_WARN, "xemu-vaf", __VA_ARGS__)
 #else
 #define VAF_LOG(...) do { fprintf(stderr, "[xemu-vaf] "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
@@ -1284,6 +1286,97 @@ static void create_pipeline(PGRAPHState *pg)
         return;
     }
 
+#ifdef __ANDROID__
+    /*
+     * Mali killer-shader SPIR-V/GLSL dump. Identified via per-draw logging
+     * (see begin_draw): the shader_state hash 0x76632dd7f6845143 (TRIANGLE_
+     * STRIP, ~37 draws into a color-only RP) consistently kills Mali's
+     * kcpu fence at Halo 2's Bungie fade-in. Captures both SPIR-V blobs
+     * and GLSL source to disk so we can run them through Mali's offline
+     * compiler / spirv-dis to find the offending instruction.
+     *
+     * Dump is one-shot per process (idempotent across pipeline create calls
+     * for the same shader). Lives in the public files dir so adb / MCP can
+     * pull without root. */
+    {
+        /* Dump every unique shader_state hash we see, up to a cap. Useful
+         * for diagnosing pgraph_vk rendering bugs in simpler ROMs (the
+         * xemu-dashboard text-atlas corruption is the current target).
+         * Each shader goes to shader_dump/<hash>_{vsh,psh,geom}.{spv,glsl}.
+         * Cap at 32 to keep disk usage bounded across long sessions. */
+        #define SHADER_DUMP_HASH_TABLE_SIZE 32
+        static uint64_t s_dumped_hashes[SHADER_DUMP_HASH_TABLE_SIZE];
+        static int s_dumped_count;
+        uint64_t shader_hash =
+            pgraph_glsl_hash_shader_state(&key.shader_state);
+        bool already_dumped = false;
+        for (int di = 0; di < s_dumped_count; di++) {
+            if (s_dumped_hashes[di] == shader_hash) {
+                already_dumped = true; break;
+            }
+        }
+        if (!already_dumped && s_dumped_count < SHADER_DUMP_HASH_TABLE_SIZE) {
+            s_dumped_hashes[s_dumped_count++] = shader_hash;
+            char dir[256];
+            snprintf(dir, sizeof(dir),
+                "/storage/emulated/0/Android/data/com.izzy2lost.x1box"
+                "/files/x1box/shader_dump/%016" PRIx64, shader_hash);
+            g_mkdir_with_parents(dir, 0755);
+            __android_log_print(ANDROID_LOG_WARN, "hakuX-vk-shaderdump",
+                "shader 0x%016" PRIx64 " seen at pipeline-create — "
+                "dumping vsh/psh/geom SPIR-V + GLSL to %s",
+                shader_hash, dir);
+
+            struct {
+                const char *name;
+                ShaderModuleInfo *info;
+            } stages[] = {
+                { "vsh",  r->shader_binding->vsh.module_info },
+                { "psh",  r->shader_binding->psh.module_info },
+                { "geom", r->shader_binding->geom.module_info },
+            };
+            for (size_t si = 0; si < G_N_ELEMENTS(stages); si++) {
+                if (!stages[si].info) continue;
+                char path[512];
+
+                if (stages[si].info->spirv && stages[si].info->spirv->len) {
+                    snprintf(path, sizeof(path), "%s/killer_%s.spv",
+                             dir, stages[si].name);
+                    FILE *f = fopen(path, "wb");
+                    if (f) {
+                        fwrite(stages[si].info->spirv->data, 1,
+                               stages[si].info->spirv->len, f);
+                        fclose(f);
+                        __android_log_print(ANDROID_LOG_INFO,
+                            "hakuX-vk-shaderdump",
+                            "wrote %u bytes -> %s",
+                            stages[si].info->spirv->len, path);
+                    } else {
+                        __android_log_print(ANDROID_LOG_ERROR,
+                            "hakuX-vk-shaderdump",
+                            "fopen(%s) failed: %s", path, strerror(errno));
+                    }
+                }
+
+                if (stages[si].info->glsl) {
+                    snprintf(path, sizeof(path), "%s/killer_%s.glsl",
+                             dir, stages[si].name);
+                    FILE *f = fopen(path, "w");
+                    if (f) {
+                        fwrite(stages[si].info->glsl, 1,
+                               strlen(stages[si].info->glsl), f);
+                        fclose(f);
+                        __android_log_print(ANDROID_LOG_INFO,
+                            "hakuX-vk-shaderdump",
+                            "wrote glsl -> %s", path);
+                    }
+                }
+            }
+            /* s_dumped_hashes[] tracks this hash; no separate flag. */
+        }
+    }
+#endif
+
     int num_active_shader_stages = 0;
     VkPipelineShaderStageCreateInfo shader_stages[3];
 
@@ -2074,6 +2167,7 @@ static void begin_render_pass(PGRAPHState *pg)
         .clearValueCount = 0,
         .pClearValues = NULL,
     };
+#ifdef __ANDROID__
     /*
      * Mali stock driver: color-only render passes (no depth attachment)
      * after a depth-having render pass reliably hang the kcpu fence.
@@ -2083,6 +2177,8 @@ static void begin_render_pass(PGRAPHState *pg)
      * Insert an explicit pipeline barrier before begin_render_pass when
      * zeta is null on Mali — forces prior color writes to fully drain
      * before this depth-less RP starts reading them via load_op=LOAD.
+     * Without this, Mali appears to confuse the in-flight color
+     * read/write semantics across the depth-RP → color-only-RP boundary.
      */
     if (r->is_mali && !r->zeta_binding && r->color_binding) {
         VkImageMemoryBarrier color_drain = {
@@ -2109,9 +2205,34 @@ static void begin_render_pass(PGRAPHState *pg)
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             0, 0, NULL, 0, NULL, 1, &color_drain);
     }
+#endif
+
     vkCmdBeginRenderPass(r->command_buffer, &render_pass_begin_info,
                          VK_SUBPASS_CONTENTS_INLINE);
     r->in_render_pass = true;
+
+#ifdef __ANDROID__
+    /* Mali diagnostic: log every RP begin with the surface metadata that
+     * uniquely identifies which Xbox draw this RP is for. The
+     * rp_in_frame counter logged on FAULT correlates with the Nth
+     * "rp_begin" line emitted in the current Xbox frame. */
+    if (r->is_mali && xemu_android_is_debug_logging_enabled()) {
+        VkFormat color_fmt = r->color_binding
+            ? r->color_binding->host_fmt.vk_format : VK_FORMAT_UNDEFINED;
+        VkFormat zeta_fmt = r->zeta_binding
+            ? r->zeta_binding->host_fmt.vk_format : VK_FORMAT_UNDEFINED;
+        __android_log_print(ANDROID_LOG_INFO, "hakuX-vk-mali",
+            "rp_begin idx=%u w=%u h=%u color_fmt=%d zeta_fmt=%d "
+            "color_load=%d zeta_load=%d color_surf=%p zeta_surf=%p",
+            r->rp_submits_in_frame,
+            vp_width, vp_height,
+            (int)color_fmt, (int)zeta_fmt,
+            (int)begin_state.color_load_op,
+            (int)begin_state.zeta_load_op,
+            (void *)r->color_binding,
+            (void *)r->zeta_binding);
+    }
+#endif
 
     if (r->gpu_ts_supported &&
         r->gpu_ts_rp_index < GPU_TS_MAX_RENDER_PASSES) {
@@ -2138,6 +2259,53 @@ static void end_render_pass(PGRAPHVkState *r)
         }
         vkCmdEndRenderPass(r->command_buffer);
         r->in_render_pass = false;
+
+#ifdef __ANDROID__
+        /*
+         * Mali fault isolation: end+submit+wait per render pass so we can
+         * tell exactly which RP killed the GPU. Without this, the whole
+         * frame's draws batch into one CB and the FAULT log just says
+         * "submit #N FLIP_STALL faulted" — useless for pinpointing the
+         * offending RP. With this on, each RP's draws ship as their own
+         * single-CB submit with finish_reason=FLUSH, so the FAULT log
+         * surfaces against the *specific* RP that hung Mali.
+         *
+         * Costs: ~2× submit rate (RPBreaks/frame in hakuX-stall stats
+         * doubles), but Cemu confirms Mali handles frequent submits
+         * cheaply, and submit_frames=1 already serializes us so the
+         * marginal cost is small.
+         *
+         * Recursion-guarded via in_finish_no_recurse because
+         * pgraph_vk_finish itself calls end_render_pass — without the
+         * guard this hook would loop forever.
+         *
+         * Only fires when there are actual draws queued in the current
+         * CB (rp_draws_in_cb > 0 via draws_in_cb proxy). Empty CB submits
+         * are pure overhead.
+         */
+        /* Only safe when we're NOT inside a draw call. end_render_pass is
+         * sometimes invoked from within begin_draw / end_draw between
+         * setting in_draw=true and back to false (e.g. when a render pass
+         * needs to break mid-draw for a barrier). Triggering finish there
+         * trips pgraph_vk_finish's "!r->in_draw" assert.
+         *
+         * Diagnostic hook only — DO NOT enable in shipping builds. Costs
+         * ~2× submit rate (one per RP), and on Halo 2's Bungie fade-in
+         * the rapid-fire color-only RPs may exhaust Mali's outstanding
+         * kcpu fence slots before the GPU drains. Guarded behind
+         * mali_per_rp_finish so we can toggle it for fault isolation
+         * without rebuilding. Default OFF: with this off the FAULT log
+         * loses rp_in_frame=N precision (the whole frame batches into
+         * one submit) but Mali isn't drowning in submits. Enable only
+         * when actively narrowing down which RP killed the GPU. */
+        if (r->is_mali && r->mali_per_rp_finish &&
+            !r->in_finish_no_recurse &&
+            r->in_command_buffer && r->draws_in_cb > 0 && !r->in_draw) {
+            PGRAPHState *pg = &r->nv2a->pgraph;
+            r->rp_submits_in_frame++;
+            pgraph_vk_finish(pg, VK_FINISH_REASON_FLUSH);
+        }
+#endif
     }
 }
 
@@ -2238,6 +2406,10 @@ static void flush_draw_queue_internal(NV2AState *d);
 
 void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
 {
+    PGRAPHVkState *r_guard = pg->vk_renderer_state;
+    bool prev_in_finish = r_guard->in_finish_no_recurse;
+    r_guard->in_finish_no_recurse = true;
+
     OPT_STAT_INC(finish_calls);
     switch (finish_reason) {
     case VK_FINISH_REASON_VERTEX_BUFFER_DIRTY: OPT_STAT_INC(finish_vtx_dirty); break;
@@ -2271,6 +2443,10 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
     if (finish_reason == VK_FINISH_REASON_FLIP_STALL ||
         finish_reason == VK_FINISH_REASON_PRESENTING) {
         opt_stats_log_and_reset();
+        /* Reset Mali per-RP submit counter at the frame boundary so the
+         * FAULT log's rp_in_frame value reflects how many RP submits
+         * preceded the offending one within the same Xbox frame. */
+        r->rp_submits_in_frame = 0;
     }
 
     int desired_frames = g_xemu_submit_frames;
@@ -2679,6 +2855,8 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
     pgraph_vk_process_pending_reports_internal(d);
 
     NV2A_PHASE_TIMER_END(finish);
+
+    r_guard->in_finish_no_recurse = prev_in_finish;
 }
 
 void pgraph_vk_begin_command_buffer(PGRAPHState *pg)
@@ -3495,6 +3673,70 @@ static void begin_draw(PGRAPHState *pg)
 #endif
         }
     }
+
+#ifdef __ANDROID__
+    /*
+     * Mali per-draw isolation: when we're inside a color-only RP on Mali
+     * (the one that kills the stock driver mid-Bungie-fade-in), log every
+     * draw with enough state to identify the offending one. The per-RP
+     * finish hook in end_render_pass already pins the *render pass* that
+     * faulted (rp_in_frame=N); this narrows it down to the *draw* inside
+     * that RP.
+     *
+     * Logged fields:
+     *   pipeline / layout — cheap unique fingerprint of the pipeline cache
+     *     entry. Stable across runs (deterministic cache), so a recurring
+     *     value across faults pinpoints the killer pipeline.
+     *   prim / draw_time — primitive topology + Xbox draw-time counter for
+     *     correlating across runs.
+     *   tsd_mask / tsd_layouts — bitmap of which texture units are sampling
+     *     a surface that's ALSO bound as the render target (feedback loop
+     *     candidates), plus the VkImageLayout each is bound at. A nonzero
+     *     mask with GENERAL layouts (= 1) is the smoking gun for hypothesis
+     *     #1 in [[project-mali-pgraph-vk-devicelost]] — Mali stock driver
+     *     not tolerating feedback-loop sampling. tsd_layouts encoded as
+     *     four nibbles low→high (unit 0 .. unit 3).
+     *   shader — pgraph_glsl_hash_shader_state of the pipeline's embedded
+     *     ShaderState. Stable across runs; if the same hash recurs in the
+     *     killing draw across reproductions, we can dump SPIR-V for that
+     *     vsh+psh+geom combo and run it through Mali's offline compiler
+     *     to investigate hypothesis #3 (problematic shader instruction).
+     *
+     * Filter aggressively to keep volume sane: Mali only, color-only RP
+     * only (zeta_binding == NULL && color_binding != NULL), skip
+     * pg->clearing (clear ops aren't where Mali dies and they're noisy).
+     */
+    if (r->is_mali && r->color_binding && !r->zeta_binding && !pg->clearing &&
+        xemu_android_is_debug_logging_enabled()) {
+        uint32_t tsd_mask = 0;
+        uint32_t tsd_layouts = 0;
+        for (int t = 0; t < NV2A_MAX_TEXTURES; t++) {
+            if (r->tex_surface_direct[t]) {
+                tsd_mask |= (1u << t);
+            }
+            tsd_layouts |=
+                ((uint32_t)(r->tex_surface_direct_layout[t] & 0xF)) << (t * 4);
+        }
+        uint64_t shader_hash = r->pipeline_binding
+            ? pgraph_glsl_hash_shader_state(
+                  &r->pipeline_binding->key.shader_state)
+            : 0;
+        __android_log_print(ANDROID_LOG_INFO, "hakuX-vk-mali",
+            "draw_in_bad_rp rp_idx=%u draw_in_cb=%u pipeline=%p layout=%p "
+            "prim=%u draw_time=%u tsd_mask=0x%x tsd_layouts=0x%04x "
+            "shader=0x%016" PRIx64,
+            r->rp_submits_in_frame,
+            r->draws_in_cb,
+            (void *)(r->pipeline_binding
+                     ? r->pipeline_binding->pipeline : VK_NULL_HANDLE),
+            (void *)(r->pipeline_binding
+                     ? r->pipeline_binding->layout : VK_NULL_HANDLE),
+            (unsigned)pg->primitive_mode,
+            (unsigned)pg->draw_time,
+            tsd_mask, tsd_layouts,
+            shader_hash);
+    }
+#endif
 
     r->in_draw = true;
 }

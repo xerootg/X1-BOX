@@ -404,6 +404,18 @@ static void *qemu_thread_start(void *args)
         pthread_set_name_np(pthread_self(), use_name);
 # endif
     }
+#ifdef __ANDROID__
+    {
+        extern int __android_log_print(int prio, const char *tag,
+                                       const char *fmt, ...);
+        int tid = (int)syscall(__NR_gettid);
+        const char *log_name = (qemu_thread_args->name && qemu_thread_args->name[0])
+                               ? qemu_thread_args->name : "(unnamed)";
+        __android_log_print(4 /* INFO */, "x1box-thread",
+                            "qemu_thread_create: tid=%d name=%s name_threads=%d",
+                            tid, log_name, (int)name_threads);
+    }
+#endif
     QEMU_TSAN_ANNOTATE_THREAD_NAME(qemu_thread_args->name);
     g_free(qemu_thread_args->name);
     g_free(qemu_thread_args);

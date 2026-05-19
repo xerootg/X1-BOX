@@ -20,6 +20,12 @@
 #include "renderer.h"
 #include "qemu/fast-hash.h"
 #include "qemu/mstring.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #if OPT_ASYNC_COMPILE
 
@@ -145,7 +151,18 @@ static void *compile_worker_func(void *opaque)
 {
     PGRAPHVkState *r = opaque;
 
+#ifdef __ANDROID__
+    prctl(PR_SET_NAME, (unsigned long)"pgraph.vk.compi", 0, 0, 0);
+    __android_log_print(ANDROID_LOG_INFO, "x1box-thread",
+                        "compile_worker_func entered: tid=%d",
+                        (int)syscall(__NR_gettid));
+#endif
+
     while (true) {
+#ifdef __ANDROID__
+        /* Re-pin name; glslang / spirv-cross may attach to JVM. */
+        prctl(PR_SET_NAME, (unsigned long)"pgraph.vk.compi", 0, 0, 0);
+#endif
         qemu_mutex_lock(&r->compile_worker.lock);
 
         while (QSIMPLEQ_EMPTY(&r->compile_worker.queue) &&

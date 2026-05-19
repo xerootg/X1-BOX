@@ -28,13 +28,6 @@
 #include <stdarg.h>
 #include <assert.h>
 
-#ifdef CONFIG_RENDERDOC
-#include "trace/control.h"
-
-#pragma GCC diagnostic ignored "-Wstrict-prototypes"
-#include "thirdparty/renderdoc_app.h"
-#endif
-
 #define CHECK_GL_ERROR() do { \
   GLenum error = glGetError(); \
   if (error != GL_NO_ERROR) {  \
@@ -69,9 +62,6 @@ void gl_debug_initialize(void)
 #endif
     }
 
-#ifdef CONFIG_RENDERDOC
-    nv2a_dbg_renderdoc_init();
-#endif
 }
 
 void gl_debug_message(bool cc, const char *fmt, ...)
@@ -150,44 +140,6 @@ void gl_debug_frame_terminator(void)
 {
     CHECK_GL_ERROR();
 
-#ifdef CONFIG_RENDERDOC
-    if (nv2a_dbg_renderdoc_available()) {
-
-        RENDERDOC_API_1_6_0 *rdoc_api = nv2a_dbg_renderdoc_get_api();
-
-        if (rdoc_api->IsTargetControlConnected()) {
-            bool capturing = rdoc_api->IsFrameCapturing();
-            if (capturing && renderdoc_capture_frames == 0) {
-                rdoc_api->EndFrameCapture(NULL, NULL);
-                GLenum error = glGetError();
-                if (error != GL_NO_ERROR) {
-                    fprintf(stderr,
-                            "Renderdoc EndFrameCapture triggered GL error 0x%X - ignoring\n",
-                            error);
-                }
-                if (renderdoc_trace_frames) {
-                    trace_enable_events("-nv2a_pgraph_*");
-                    renderdoc_trace_frames = false;
-                }
-            }
-            if (renderdoc_capture_frames > 0) {
-                if (!capturing) {
-                    if (renderdoc_trace_frames) {
-                        trace_enable_events("nv2a_pgraph_*");
-                    }
-                    rdoc_api->StartFrameCapture(NULL, NULL);
-                    GLenum error = glGetError();
-                    if (error != GL_NO_ERROR) {
-                        fprintf(stderr,
-                                "Renderdoc StartFrameCapture triggered GL error 0x%X - ignoring\n",
-                                error);
-                    }
-                }
-                --renderdoc_capture_frames;
-            }
-        }
-    }
-#endif
     if (has_GL_GREMEDY_frame_terminator) {
         glFrameTerminatorGREMEDY();
         CHECK_GL_ERROR();
