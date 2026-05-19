@@ -452,6 +452,62 @@ set_target_properties(dsp56300_emu_ffi PROPERTIES
 )
 add_dependencies(dsp56300_emu_ffi dsp56300_emu_ffi_build)
 
+# ---------------------------------------------------------------------------
+# Cranelift TCG tier-2 JIT backend
+# ---------------------------------------------------------------------------
+# The crate lives at <repo>/rust/cranelift-tcg/ and produces a staticlib
+# `libcranelift_tcg.a` cross-compiled for aarch64-linux-android. It pulls
+# cranelift-{codegen,frontend,jit,module,native} 0.130, matching the
+# dsp56300 backend so a single cranelift instance ends up in the binary.
+set(CRANELIFT_TCG_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../../../rust/cranelift-tcg")
+get_filename_component(CRANELIFT_TCG_DIR "${CRANELIFT_TCG_DIR}" ABSOLUTE)
+set(CRANELIFT_TCG_TARGET "aarch64-linux-android")
+set(CRANELIFT_TCG_TARGET_DIR "${CMAKE_BINARY_DIR}/rust-target-cranelift-tcg")
+set(CRANELIFT_TCG_LIB
+  "${CRANELIFT_TCG_TARGET_DIR}/${CRANELIFT_TCG_TARGET}/release/libcranelift_tcg.a"
+)
+set(CRANELIFT_TCG_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../../../include")
+get_filename_component(CRANELIFT_TCG_INCLUDE_DIR "${CRANELIFT_TCG_INCLUDE_DIR}" ABSOLUTE)
+set(CRANELIFT_TCG_LINKER
+  "${NDK_TOOLCHAIN}/aarch64-linux-android${ANDROID_API}-clang"
+)
+set(CRANELIFT_TCG_AR "${NDK_TOOLCHAIN}/llvm-ar")
+
+file(GLOB_RECURSE CRANELIFT_TCG_SOURCES CONFIGURE_DEPENDS
+  "${CRANELIFT_TCG_DIR}/Cargo.toml"
+  "${CRANELIFT_TCG_DIR}/src/*.rs"
+)
+
+add_custom_command(
+  OUTPUT "${CRANELIFT_TCG_LIB}"
+  COMMAND "${CMAKE_COMMAND}" -E env
+    "CARGO_TARGET_DIR=${CRANELIFT_TCG_TARGET_DIR}"
+    "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${CRANELIFT_TCG_LINKER}"
+    "CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=${CRANELIFT_TCG_AR}"
+    "CC_aarch64_linux_android=${CRANELIFT_TCG_LINKER}"
+    "AR_aarch64_linux_android=${CRANELIFT_TCG_AR}"
+    ${DSP56300_CARGO_ENV_VARS}
+    "${CARGO_EXECUTABLE}" build
+    --manifest-path "${CRANELIFT_TCG_DIR}/Cargo.toml"
+    --release
+    --target "${CRANELIFT_TCG_TARGET}"
+  DEPENDS ${CRANELIFT_TCG_SOURCES}
+  WORKING_DIRECTORY "${CRANELIFT_TCG_DIR}"
+  COMMENT "Building Cranelift TCG tier-2 JIT backend"
+  VERBATIM
+)
+
+add_custom_target(cranelift_tcg_build ALL
+  DEPENDS "${CRANELIFT_TCG_LIB}"
+)
+
+add_library(cranelift_tcg STATIC IMPORTED GLOBAL)
+set_target_properties(cranelift_tcg PROPERTIES
+  IMPORTED_LOCATION "${CRANELIFT_TCG_LIB}"
+  INTERFACE_INCLUDE_DIRECTORIES "${CRANELIFT_TCG_INCLUDE_DIR}"
+)
+add_dependencies(cranelift_tcg cranelift_tcg_build)
+
 set(GLIB_VERSION "2.66.8")
 set(GLIB_SOURCE_DIR "${CMAKE_BINARY_DIR}/glib-src")
 set(GLIB_BUILD_DIR "${CMAKE_BINARY_DIR}/glib-build-android")
@@ -1176,6 +1232,7 @@ add_dependencies(xemu_force_keep_objs glib_ep)
 
 target_link_libraries(xemu_core PRIVATE
   dsp56300_emu_ffi
+  cranelift_tcg
   nv2a_vsh_emulator
   nv2a_vsh_cpu
   nv2a_vsh_disassembler
@@ -1312,6 +1369,7 @@ target_link_libraries(xemu PRIVATE
   xemu_core
   xemu_force_keep_objs   # OBJECT lib — see below, force-link chardev backends
   dsp56300_emu_ffi
+  cranelift_tcg
   slirp_static
   iconv_stub
   glib-2.0

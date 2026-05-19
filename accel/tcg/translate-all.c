@@ -39,6 +39,7 @@
 #include "tcg/perf.h"
 #include "tcg/insn-start-words.h"
 #include "tb-cache-hints.h"
+#include "cranelift-bridge.h"
 #ifdef XBOX
 #include "tb-code-hash.h"
 #ifndef TCG_HIGHWATER
@@ -544,6 +545,16 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
         goto buffer_overflow;
     }
     tb->tc.size = gen_code_size;
+
+    /*
+     * Cranelift tier-2 snapshot hook. Every translated TB has its
+     * post-optimization IR stashed into a per-PC cache so that the
+     * cpu_exec_loop hot path can hand it to the Cranelift worker
+     * once the block proves itself hot enough. We snapshot
+     * unconditionally because we don't know yet which TBs will be
+     * hot, and tcg_ctx->ops is only available right now.
+     */
+    cranelift_bridge_enqueue(tcg_ctx, tb);
 
     /*
      * For CF_PCREL, attribute all executions of the generated code
@@ -1163,6 +1174,9 @@ TranslationBlock *tb_gen_superblock(CPUState *cpu,
         return NULL;
     }
     tb->tc.size = gen_code_size;
+
+    /* Cranelift tier-2 snapshot hook for superblocks. */
+    cranelift_bridge_enqueue(tcg_ctx, tb);
 
     qatomic_set(&tcg_ctx->code_gen_ptr, (void *)
         ROUND_UP((uintptr_t)gen_code_buf + gen_code_size + search_size,

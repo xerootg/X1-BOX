@@ -1,0 +1,44 @@
+[package]
+name = "cranelift_tcg"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Cranelift-based tier-2 JIT backend for QEMU TCG (x86 -> ARM64)"
+publish = false
+
+# Standalone workspace so the parent rust/Cargo.toml workspace doesn't
+# claim this crate (cranelift pulls too many deps to live under QEMU's
+# carefully-curated workspace).
+[workspace]
+
+[lib]
+name = "cranelift_tcg"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Match dsp56300's cranelift version so a single instance ends up in
+# the final binary (saves ~5 MiB and avoids ABI confusion).
+cranelift-codegen = { version = "0.130", default-features = false, features = ["std", "host-arch"] }
+cranelift-frontend = "0.130"
+cranelift-jit = "0.130"
+cranelift-module = "0.130"
+cranelift-native = "0.130"
+target-lexicon = "0.13"
+libc = "0.2"
+# Lock-free queue for the tier-2 dispatcher worker thread.
+crossbeam-channel = "0.5"
+# Atomics over Arc<Pointer> for RCU-style TB code-pointer swap.
+parking_lot = "0.12"
+once_cell = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+debug = 2
+panic = "abort"

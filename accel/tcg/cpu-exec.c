@@ -48,6 +48,7 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "tb-cache-hints.h"
+#include "cranelift-bridge.h"
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -315,7 +316,13 @@ static inline void tier1_maybe_reset_budget(void)
                         g_tier1_threshold,
                         (unsigned long)g_tier1_promotions_total,
                         (unsigned long)g_tier1_promotions_dropped);
+            /* Surface tier-2 stats on the same cadence. */
+            cranelift_bridge_log_stats();
         }
+        /* Drain tier-2 results on the same cadence we reset the
+         * tier-1 budget. This is once per ~100K TB executions so the
+         * extra work is negligible. */
+        cranelift_bridge_drain();
     }
 }
 
@@ -729,6 +736,24 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
         log_cpu_exec(log_pc(cpu, itb), cpu, itb);
     }
+
+#if XEMU_HAVE_CRANELIFT
+    /*
+     * If this TB has been promoted to tier-2, dispatch to the shim
+     * (which calls Cranelift code then returns to tb_ret_addr).
+     * We DO NOT mutate itb->tc.ptr — that field keys QEMU's
+     * host-PC-to-TB search tree (tcg_tb_lookup) and breaking it
+     * causes cpu_io_recompile, watchpoint unwind, and fault recovery
+     * to fail with `cpu_abort("can't recompile, no TB found")` on
+     * the first helper that needs precise instruction state.
+     */
+    {
+        const void *shim = cranelift_bridge_lookup_shim(itb);
+        if (shim) {
+            tb_ptr = shim;
+        }
+    }
+#endif
 
     qemu_thread_jit_execute();
     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
@@ -1307,6 +1332,14 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 tb_add_jump(last_tb, tb_exit, tb);
             }
 
+            /*
+             * Tier-2 (Cranelift) swap hook: if a compiled tier-2 entry
+             * is sitting in the pending ring for this guest PC, emit an
+             * ABI shim and atomically replace tb->tc.ptr.  The very
+             * next cpu_loop_exec_tb dispatch will execute the Cranelift
+             * code instead of the tier-1 blob.
+             */
+            cranelift_bridge_try_swap(tb);
 
 #ifdef XBOX
             {
@@ -1339,6 +1372,16 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 tier1_maybe_promote(cpu, tb);
                 tier1_maybe_form_superblock(cpu, tb);
                 tier1_maybe_reset_budget();
+
+                /*
+                 * Cranelift tier-2: once a TB crosses the tier-2
+                 * exec threshold (independent of TCG tier-1), grab
+                 * its stashed IR snapshot and enqueue for compile.
+                 * maybe_compile is idempotent (uses an "enqueued"
+                 * flag on the snapshot slot) so calling it every
+                 * dispatch is cheap.
+                 */
+                cranelift_bridge_maybe_compile(tb);
 
                 if (tb->cflags & CF_INVALID) {
                     last_tb = NULL;

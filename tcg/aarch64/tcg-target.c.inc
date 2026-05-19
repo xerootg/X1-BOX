@@ -4321,6 +4321,17 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     tb_ret_addr = tcg_splitwx_to_rx(s->code_ptr);
     tcg_out_bti(s, BTI_J);
 
+#if defined(XBOX) && defined(__aarch64__) && defined(__ANDROID__) && \
+    !defined(XEMU_DISABLE_CRANELIFT)
+    /*
+     * Publish tb_ret_addr to the Cranelift tier-2 bridge.  The shim
+     * emitted per Cranelift TB jumps here after the SystemV-ABI compiled
+     * function returns, restoring the canonical TCG dispatch contract.
+     */
+    extern uintptr_t cranelift_g_tb_ret_addr;
+    cranelift_g_tb_ret_addr = (uintptr_t)tb_ret_addr;
+#endif
+
     /* Remove TCG locals stack space.  */
     tcg_out_insn(s, 3401, ADDI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,
                  FRAME_SIZE - PUSH_SIZE);

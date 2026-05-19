@@ -1,0 +1,1320 @@
+/*
+ * Cranelift tier-2 JIT bridge.
+ *
+ * Glue between QEMU's TCG translator and the Cranelift backend
+ * (rust/cranelift-tcg). On a TB-promotion event we serialise the
+ * post-optimization TCG IR into a flat array of CraneliftTcgOp records
+ * and enqueue it for compile. On dispatcher polling we receive the
+ * emitted code pointer and RCU-swap it into the TB cache.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+#include "qemu/osdep.h"
+#include "cranelift-bridge.h"
+
+#if XEMU_HAVE_CRANELIFT
+
+#include "qemu/queue.h"
+#include "qemu/log.h"
+#include "qemu/qemu-print.h"
+#include "qemu/atomic.h"
+#include "qemu/thread.h"
+
+#include "exec/translation-block.h"
+#include "exec/memop.h"
+#include "hw/core/cpu.h"
+#include "tcg/tcg.h"
+#include "tcg/tcg-ldst.h"
+#include "tcg/cranelift_bridge.h"
+#include "tb-cache-hints.h"
+
+#include <sys/mman.h>
+#include <unistd.h>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#define CL_LOG(fmt, ...) \
+    __android_log_print(ANDROID_LOG_INFO, "x1-cranelift", fmt, ##__VA_ARGS__)
+#else
+#define CL_LOG(fmt, ...) qemu_log("x1-cranelift: " fmt "\n", ##__VA_ARGS__)
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Global state                                                        */
+/* ------------------------------------------------------------------ */
+
+static void *g_cranelift_ctx;        /* CraneliftTcgContext * */
+static bool   g_cranelift_initialised;
+static bool   g_cranelift_init_failed;
+
+/*
+ * Address of the canonical TCG epilogue (tb_ret_addr).  Published by
+ * the aarch64 TCG backend at prologue-init time.  The per-TB ABI shim
+ * branches here so the SystemV-ABI Cranelift function's return value
+ * flows back through QEMU's normal exit_tb path.
+ */
+uintptr_t cranelift_g_tb_ret_addr;
+
+/*
+ * Tier-2 promotion threshold. The TCG-side exec_count saturates at
+ * 2*TB_TIER1_THRESHOLD (= 128 by default), so this must be <= 128 to
+ * trip at all. We use a low floor: any TB that survives long enough
+ * to reach tier-1 already cost us a tier-1 retranslation, so paying
+ * the Cranelift cost too is worthwhile.
+ */
+static uint32_t g_tier2_threshold = 32;
+
+/*
+ * Master switch for installing Cranelift-compiled shims into the TB
+ * cache. We translate, verify and enqueue unconditionally so we can
+ * collect telemetry on what works; the actual `tb->tc.ptr` swap is
+ * gated on this flag so a buggy compile can't hang the emulator at
+ * boot. Enable once verify-mode tells us a substantial fraction of
+ * compiles are correct.
+ *
+ * Toggleable at runtime via the X1BOX_CRANELIFT_SWAP env var or
+ * cranelift_bridge_set_swap_enabled().
+ */
+static bool g_swap_install_enabled;
+
+#define MAX_OPS_PER_TB 2048
+
+/* ------------------------------------------------------------------ */
+/* Initialisation                                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Compute the absolute value of the negative offset from TCG_AREG0
+ * (env) to CPUNegativeOffsetState.tlb.f[fast_index(mmu_idx)].  This
+ * mirrors `tlb_mask_table_ofs(s, mmu_idx)` in tcg/tcg.c -- TCG places
+ * the negative-offset state immediately before env, so the offset is
+ * a negative number whose magnitude is what we publish.  The Rust
+ * side stores u32 and negates at use time.
+ */
+static uint32_t cranelift_compute_tlb_ofs_abs(int mmu_idx)
+{
+    /* Same formula tcg.c uses; fast_index inverts the mmu_idx order
+     * so that lower mmu_idx have smaller-magnitude negative offsets. */
+    int fi = NB_MMU_MODES - 1 - mmu_idx;
+    /* Offset = offsetof(CPUNegativeOffsetState, tlb.f[fi]) -
+     *          sizeof(CPUNegativeOffsetState).
+     * This is intentionally signed-negative; we publish its absolute
+     * value so the descriptor field can stay u32. */
+    intptr_t signed_ofs = (intptr_t)offsetof(CPUNegativeOffsetState,
+                                             tlb.f[fi])
+                        - (intptr_t)sizeof(CPUNegativeOffsetState);
+    if (signed_ofs > 0) {
+        /* Shouldn't happen given the struct layout, but defend. */
+        return (uint32_t)signed_ofs;
+    }
+    return (uint32_t)(-signed_ofs);
+}
+
+/*
+ * Snapshot QEMU's softmmu helper-pointer tables and forward them into
+ * the Rust context so memory.rs can emit direct calls on TLB miss.
+ *
+ * `qemu_ld_helpers` in tcg.c is indexed by MO_SSIZE (size + sign, 16
+ * entries) and `qemu_st_helpers` by MO_SIZE (size only, 8 entries).
+ * We pad both to 16 entries -- store helpers leave the upper half
+ * NULL since there is no sign bit on stores.  The Rust side masks
+ * the MemOp accordingly when looking up an entry.
+ */
+static void cranelift_publish_helpers(void)
+{
+    uintptr_t ld[16] = {0};
+    uintptr_t st[16] = {0};
+
+    /* Load helpers -- indexed by MO_SSIZE = MO_SIZE|MO_SIGN. */
+    ld[MO_UB] = (uintptr_t)helper_ldub_mmu;
+    ld[MO_UW] = (uintptr_t)helper_lduw_mmu;
+    ld[MO_UL] = (uintptr_t)helper_ldul_mmu;
+    ld[MO_UQ] = (uintptr_t)helper_ldq_mmu;
+    ld[MO_SB] = (uintptr_t)helper_ldsb_mmu;
+    ld[MO_SW] = (uintptr_t)helper_ldsw_mmu;
+    ld[MO_SL] = (uintptr_t)helper_ldsl_mmu;
+    /* helper_ld16_mmu exists but the prototype is awkward (Int128
+     * return).  Leave the 128-bit slots NULL; tier-2 will fall back
+     * for those MemOp shapes. */
+
+    /* Store helpers -- indexed by MO_SIZE only. */
+    st[MO_8]   = (uintptr_t)helper_stb_mmu;
+    st[MO_16]  = (uintptr_t)helper_stw_mmu;
+    st[MO_32]  = (uintptr_t)helper_stl_mmu;
+    st[MO_64]  = (uintptr_t)helper_stq_mmu;
+    /* st[MO_128] left NULL by the same rationale as ld[]. */
+
+    CL_LOG("helpers: ldub=%p lduw=%p ldul=%p ldq=%p ldsb=%p ldsw=%p ldsl=%p",
+           helper_ldub_mmu, helper_lduw_mmu, helper_ldul_mmu, helper_ldq_mmu,
+           helper_ldsb_mmu, helper_ldsw_mmu, helper_ldsl_mmu);
+    CL_LOG("helpers: stb=%p stw=%p stl=%p stq=%p",
+           helper_stb_mmu, helper_stw_mmu, helper_stl_mmu, helper_stq_mmu);
+
+    cranelift_tcg_set_helpers(g_cranelift_ctx, ld, st);
+}
+
+/*
+ * Size of a TCGType in bytes (matches what tcg.c uses for spill
+ * slots).  Limited to the integer/vector widths we encounter as
+ * globals in the x86 frontend.
+ */
+static uint32_t cranelift_tcg_type_bytes(int type)
+{
+    switch (type) {
+    case TCG_TYPE_I32:  return 4;
+    case TCG_TYPE_I64:  return 8;
+    case TCG_TYPE_I128: return 16;
+    case TCG_TYPE_V64:  return 8;
+    case TCG_TYPE_V128: return 16;
+    case TCG_TYPE_V256: return 32;
+    default:            return 8; /* sensible default */
+    }
+}
+
+/*
+ * Walk tcg_ctx->temps[0..nb_globals] and pack each TEMP_GLOBAL into
+ * the flat (offset, size, name_offset) tuple stream the Rust EnvDesc
+ * consumes.  Returns the number of globals packed and (out params)
+ * the malloc'd tuple buffer, the malloc'd name pool, and the largest
+ * (offset+size) bound across globals -- the bridge uses this last
+ * value as a conservative env_size when sizeof(CPUArchState) is not
+ * directly available (target-agnostic build).
+ *
+ * Caller frees `*out_tuples` and `*out_name_pool` via g_free().
+ */
+static uint32_t cranelift_pack_globals(TCGContext *s,
+                                       uint32_t **out_tuples,
+                                       char     **out_name_pool,
+                                       uint32_t  *out_env_extent,
+                                       uint32_t  *out_pc_offset)
+{
+    *out_tuples = NULL;
+    *out_name_pool = NULL;
+    *out_env_extent = 0;
+    *out_pc_offset = 0;
+
+    if (!s || s->nb_globals <= 0) {
+        return 0;
+    }
+
+    int nb = s->nb_globals;
+
+    /*
+     * We emit ONE entry per `s->temps[0..nb_globals]` slot so the Rust
+     * side can index by raw TCG temp id without any remapping. Two
+     * kinds of entries:
+     *   - TEMP_FIXED (mem_base == NULL): the "env" pseudo-global.
+     *     Offset = `CRANELIFT_GLOBAL_OFFSET_FIXED_REG` so the
+     *     translator knows to use the function's `env_val` directly.
+     *   - TEMP_GLOBAL (mem_base != NULL): a real env-relative slot.
+     *     Offset = mem_offset.
+     */
+    size_t name_bytes = 0;
+    uint32_t kept = 0;
+    for (int i = 0; i < nb; i++) {
+        const TCGTemp *t = &s->temps[i];
+        const char *nm = t->name ? t->name : "";
+        name_bytes += strlen(nm) + 1; /* incl. NUL */
+        kept++;
+    }
+
+    if (kept == 0) {
+        return 0;
+    }
+
+    uint32_t *tuples = g_try_new(uint32_t, (size_t)kept * 3);
+    char     *pool   = g_try_malloc0(name_bytes ? name_bytes : 1);
+    if (!tuples || !pool) {
+        g_free(tuples);
+        g_free(pool);
+        return 0;
+    }
+
+    /* Sentinel for TEMP_FIXED (env). Matches Rust env::GlobalDesc
+     * special-case in `Lowering::read_temp` / `write_temp`. */
+    #define CRANELIFT_GLOBAL_OFFSET_FIXED_REG  0xFFFFFFFFu
+
+    /* Second pass: fill. */
+    size_t name_cur = 0;
+    uint32_t idx = 0;
+    uint32_t env_extent = 0;
+    uint32_t pc_off = 0;
+    for (int i = 0; i < nb && idx < kept; i++) {
+        const TCGTemp *t = &s->temps[i];
+        uint32_t offset;
+        uint32_t size = cranelift_tcg_type_bytes(t->type);
+        uint32_t name_off = (uint32_t)name_cur;
+
+        if (t->mem_base == NULL) {
+            /* Fixed-reg pseudo-global (env). The Rust side ignores
+             * `size` for these and routes reads/writes through
+             * `env_val` directly. */
+            offset = CRANELIFT_GLOBAL_OFFSET_FIXED_REG;
+        } else {
+            offset = (uint32_t)(intptr_t)t->mem_offset;
+        }
+
+        const char *nm = t->name ? t->name : "";
+        size_t nl = strlen(nm);
+        memcpy(pool + name_cur, nm, nl);
+        pool[name_cur + nl] = '\0';
+        name_cur += nl + 1;
+
+        tuples[idx * 3 + 0] = offset;
+        tuples[idx * 3 + 1] = size;
+        tuples[idx * 3 + 2] = name_off;
+        idx++;
+
+        /* Don't let the env-fixed-reg sentinel pollute env_extent. */
+        if (offset != CRANELIFT_GLOBAL_OFFSET_FIXED_REG
+            && offset + size > env_extent) {
+            env_extent = offset + size;
+        }
+
+        /* Sniff for PC.  Different frontends use different names:
+         * x86 -> "eip", ARM -> "pc", PowerPC -> "nip".  Take the
+         * first match (and skip the fixed-reg sentinel). */
+        if (pc_off == 0 &&
+            offset != CRANELIFT_GLOBAL_OFFSET_FIXED_REG &&
+            (strcmp(nm, "eip") == 0 ||
+             strcmp(nm, "pc")  == 0 ||
+             strcmp(nm, "nip") == 0)) {
+            pc_off = offset;
+        }
+    }
+
+    *out_tuples     = tuples;
+    *out_name_pool  = pool;
+    *out_env_extent = env_extent;
+    *out_pc_offset  = pc_off;
+    return idx;
+}
+
+/* Backing storage for the EnvDesc -- the Rust side copies these
+ * during cranelift_tcg_init but we keep them alive in case any later
+ * FFI surface re-reads them. */
+static uint32_t *g_env_globals_tuples;   /* 3*nb_globals u32s */
+static char     *g_env_name_pool;        /* NUL-separated names */
+
+/*
+ * Build the EnvDesc the Rust side needs.  Extracts the live globals
+ * from tcg_ctx->temps (populated by tcg_init_module before any
+ * translation runs), computes the TLB offset from the
+ * CPUNegativeOffsetState layout, and publishes QEMU's softmmu helper
+ * pointers.  If tcg_ctx is not yet ready we return without flagging
+ * a permanent failure so the next enqueue can retry.
+ */
+static void cranelift_bridge_lazy_init(void)
+{
+    if (g_cranelift_initialised || g_cranelift_init_failed) {
+        return;
+    }
+
+    TCGContext *s = tcg_ctx;
+    if (s == NULL || s->nb_globals <= 0) {
+        /* tcg_register_thread hasn't run yet or the frontend hasn't
+         * declared its globals.  Retry on the next enqueue. */
+        return;
+    }
+
+    uint32_t *tuples = NULL;
+    char     *pool   = NULL;
+    uint32_t  env_extent = 0;
+    uint32_t  pc_off = 0;
+    uint32_t  nb = cranelift_pack_globals(s, &tuples, &pool,
+                                          &env_extent, &pc_off);
+
+    /* env_size: round the largest seen (offset+size) up to the next
+     * 4 KiB boundary so the Rust side has a clearly-bounded range.
+     * If the global walk yielded nothing (e.g. on a future
+     * frontend), fall back to a conservative 16 KiB. */
+    uint32_t env_size;
+    if (env_extent > 0) {
+        env_size = (env_extent + 0xfff) & ~0xfffu;
+    } else {
+        env_size = 0x4000;
+    }
+
+    uint32_t tlb_ofs = cranelift_compute_tlb_ofs_abs(0);
+
+    /* Guest pointer size: x86-32 == 4, x86-64 == 8.  TCG knows via
+     * `s->addr_type`; mirror that. */
+    uint32_t guest_ptr_size = (s->addr_type == TCG_TYPE_I32) ? 4 : 8;
+
+    CraneliftTcgEnvDesc env = {
+        .env_size       = env_size,
+        .tlb_offset     = tlb_ofs,
+        .pc_offset      = pc_off,
+        .nb_globals     = nb,
+        .globals        = tuples,
+        .name_pool      = pool,
+        .guest_ptr_size = guest_ptr_size,
+        .host_ptr_size  = sizeof(void *),
+    };
+
+    g_cranelift_ctx = cranelift_tcg_init(&env);
+    if (!g_cranelift_ctx) {
+        g_cranelift_init_failed = true;
+        g_free(tuples);
+        g_free(pool);
+        CL_LOG("cranelift_tcg_init returned NULL; tier-2 disabled");
+        return;
+    }
+
+    /* Hand storage to the bridge globals - keep alive for the
+     * process lifetime in case the Rust side ever needs to re-scan.
+     * Rust currently copies the tuples eagerly so this is purely
+     * defensive. */
+    g_env_globals_tuples = tuples;
+    g_env_name_pool      = pool;
+
+    cranelift_tcg_set_hot_threshold(g_cranelift_ctx, g_tier2_threshold);
+    cranelift_publish_helpers();
+
+    /* Install-swap toggle. Default ON. Set X1BOX_CRANELIFT_SWAP=0 to
+     * fall back to tier-1 only (still translates + collects telemetry,
+     * but shims are not patched into tb->tc.ptr). Useful for bisecting
+     * codegen regressions. */
+    const char *swap_env = getenv("X1BOX_CRANELIFT_SWAP");
+    bool swap_on = true;
+    if (swap_env && (*swap_env == '0' || *swap_env == 'n' ||
+                     *swap_env == 'N')) {
+        swap_on = false;
+    }
+    qatomic_set(&g_swap_install_enabled, swap_on);
+
+    g_cranelift_initialised = true;
+    CL_LOG("cranelift tier-2 backend initialised: env_size=0x%x "
+           "tlb_abs_ofs=0x%x pc_offset=0x%x nb_globals=%u "
+           "guest_ptr=%u threshold=%u swap_install=%s",
+           env_size, tlb_ofs, pc_off, nb, guest_ptr_size,
+           g_tier2_threshold, swap_on ? "ON" : "OFF");
+}
+
+/* Public toggle (matches the X1BOX_CRANELIFT_SWAP env var at init). */
+void cranelift_bridge_set_swap_enabled(bool enabled)
+{
+    qatomic_set(&g_swap_install_enabled, enabled);
+}
+
+bool cranelift_bridge_is_swap_enabled(void)
+{
+    return qatomic_read(&g_swap_install_enabled);
+}
+
+/* ------------------------------------------------------------------ */
+/* TCG IR snapshot serialisation                                       */
+/* ------------------------------------------------------------------ */
+
+static int tcg_type_to_bridge(int t)
+{
+    /* Mirrors the TCGType enum + the Rust opc::TcgType decoding. */
+    switch (t) {
+    case TCG_TYPE_I32:  return 0;
+    case TCG_TYPE_I64:  return 1;
+    case TCG_TYPE_I128: return 2;
+    case TCG_TYPE_V64:  return 3;
+    case TCG_TYPE_V128: return 4;
+    case TCG_TYPE_V256: return 5;
+    default:            return 0;
+    }
+}
+
+/*
+ * Take the current tcg_ctx (which holds the post-optimization op list)
+ * and copy it into a flat CraneliftTcgOp array suitable for the FFI.
+ * Returns the number of ops written; 0 if the TB exceeds the cap or
+ * an unsupported op appears that we want to skip outright.
+ */
+static size_t cranelift_serialise_ir(TCGContext *s,
+                                     CraneliftTcgOp *out,
+                                     size_t out_cap)
+{
+    size_t n = 0;
+    static int s_debug_dumps;
+    bool do_dump = (s_debug_dumps < 3);
+    char dumpbuf[2048];
+    int dumplen = 0;
+
+    TCGOp *op;
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        if (n >= out_cap) {
+            return 0;  /* TB too big - leave on tier-1. */
+        }
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        CraneliftTcgOp *dst = &out[n++];
+        memset(dst, 0, sizeof(*dst));
+        dst->opc      = (uint16_t)op->opc;
+        dst->flags    = (uint16_t)def->flags;
+
+        unsigned nb_oargs, nb_iargs, nb_cargs;
+        if (op->opc == INDEX_op_call) {
+            /*
+             * Call ops use a different args layout: TCGOP_CALLO(op)
+             * output temps, TCGOP_CALLI(op) input temps, then two
+             * trailing constants (func pointer, info pointer). The
+             * TCGOpDef counts (0/0/3) are NOT used for calls.
+             */
+            nb_oargs = TCGOP_CALLO(op);
+            nb_iargs = TCGOP_CALLI(op);
+            nb_cargs = 2;
+            /* type field for calls is reserved; pack 0 (I32). */
+            dst->type = 0;
+        } else {
+            nb_oargs = def->nb_oargs;
+            nb_iargs = def->nb_iargs;
+            nb_cargs = def->nb_cargs;
+            dst->type = tcg_type_to_bridge(TCGOP_TYPE(op));
+        }
+
+        unsigned total = nb_oargs + nb_iargs + nb_cargs;
+        if (total > 16) {
+            /* Don't try to serialise variable-arg ops past the fixed
+             * window; tier-2 simply leaves these on tier-1. */
+            return 0;
+        }
+        dst->nb_oargs = (uint8_t)nb_oargs;
+        dst->nb_iargs = (uint8_t)nb_iargs;
+        dst->nb_cargs = (uint8_t)nb_cargs;
+
+        /*
+         * TCG stores temp-typed args as `(uintptr_t)TCGTemp*` (see
+         * `temp_arg()` in include/tcg/tcg.h). For most temps we
+         * convert back to a dense temp index so the Rust side can use
+         * it to index its globals/locals tables. For TEMP_CONST temps
+         * — which carry their constant value in `ts->val` and are
+         * what TCG uses to materialise immediates from
+         * `tcg_gen_movi_*` — we embed the raw value directly and set
+         * the matching bit in `const_mask`. The Rust translator
+         * resolves a const-marked input by emitting `iconst(val)`
+         * rather than declaring a fresh local Variable.
+         *
+         * Without this, the const-temp index falls through to the
+         * local-temp path and gets seeded with zero, silently turning
+         * every `movi target_pc -> cpu_eip` (and every `mov reg, imm`)
+         * into `dst = 0`. Tier-2 then zeros out the next-PC store,
+         * the dispatcher re-looks up the same TB by the unchanged
+         * env->eip, and the vCPU spins inside the same tier-2 shim
+         * forever.
+         *
+         * Output args are always real temps in TCG (constants are
+         * source-only), so we only check the iarg range. Constant
+         * cargs (memop, label id, offsets, function pointers, etc.)
+         * pass through unchanged.
+         */
+        uint16_t const_mask = 0;
+        for (unsigned i = 0; i < nb_oargs + nb_iargs; i++) {
+            TCGTemp *ts = (TCGTemp *)(uintptr_t)op->args[i];
+            if (i >= nb_oargs && ts->kind == TEMP_CONST) {
+                dst->args[i] = (uint64_t)ts->val;
+                const_mask |= (uint16_t)(1u << i);
+            } else {
+                dst->args[i] = (uint64_t)(ts - s->temps);
+            }
+        }
+        dst->const_mask = const_mask;
+        for (unsigned i = 0; i < nb_cargs; i++) {
+            dst->args[nb_oargs + nb_iargs + i] =
+                (uint64_t)op->args[nb_oargs + nb_iargs + i];
+        }
+
+        if (do_dump && dumplen < (int)sizeof(dumpbuf) - 96) {
+            const char *nm = def->name ? def->name : "?";
+            if (op->opc == INDEX_op_call) {
+                dumplen += snprintf(
+                    dumpbuf + dumplen, sizeof(dumpbuf) - dumplen,
+                    " [call/o%u/i%u/f%04x]", nb_oargs, nb_iargs,
+                    (unsigned)def->flags);
+            } else {
+                dumplen += snprintf(
+                    dumpbuf + dumplen, sizeof(dumpbuf) - dumplen,
+                    " [%s/o%u/i%u/c%u/t%u/f%04x]", nm,
+                    nb_oargs, nb_iargs, nb_cargs,
+                    (unsigned)TCGOP_TYPE(op),
+                    (unsigned)def->flags);
+            }
+        }
+    }
+    if (do_dump) {
+        s_debug_dumps++;
+        CL_LOG("ops_dump#%d n=%zu:%s", s_debug_dumps, n, dumpbuf);
+    }
+    return n;
+}
+
+/* ------------------------------------------------------------------ */
+/* Public C entry points (called from cpu-exec.c hot path)             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Decide whether a TB is ready for tier-2 compile. Reuses the
+ * existing tier-1/tier-2 fields on TranslationBlock.
+ */
+/*
+ * IR snapshot cache keyed by TB pointer.  We can't key by tb->pc
+ * because CF_PCREL TBs (used by Halo 2 and many other titles) never
+ * have tb->pc assigned -- it stays at the zero-initialised value, so
+ * every CF_PCREL TB would collide on slot 0.  The TranslationBlock*
+ * is always unique and stable for the lifetime of the TB.
+ */
+typedef struct IrSnapshot {
+    uintptr_t       tb_key;     /* (uintptr_t)tb */
+    size_t          n_ops;
+    CraneliftTcgOp *ops;        /* heap-allocated, sized to n_ops */
+    bool            enqueued;   /* set once we've handed it to Rust */
+} IrSnapshot;
+
+#define IR_CACHE_BITS   13
+#define IR_CACHE_SIZE   (1u << IR_CACHE_BITS)
+#define IR_CACHE_MASK   (IR_CACHE_SIZE - 1u)
+
+static IrSnapshot g_ir_cache[IR_CACHE_SIZE];
+static QemuMutex  g_ir_cache_mutex;
+static bool       g_ir_cache_mutex_inited;
+
+static inline void ir_cache_mutex_init_once(void)
+{
+    if (!g_ir_cache_mutex_inited) {
+        qemu_mutex_init(&g_ir_cache_mutex);
+        g_ir_cache_mutex_inited = true;
+    }
+}
+
+static inline uint32_t ir_cache_index(uintptr_t key)
+{
+    /* Splitmix-style hash. The TB pointer's low bits are zero-aligned
+     * (struct alignment), so xor-shift them in before masking. */
+    uint64_t h = (uint64_t)key;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return (uint32_t)h & IR_CACHE_MASK;
+}
+
+/* Store / replace an IR snapshot. Takes ownership of `ops` (we
+ * g_free any old occupant). */
+static void ir_cache_store(uintptr_t key, CraneliftTcgOp *ops, size_t n_ops)
+{
+    ir_cache_mutex_init_once();
+    uint32_t idx = ir_cache_index(key);
+    qemu_mutex_lock(&g_ir_cache_mutex);
+    IrSnapshot *slot = &g_ir_cache[idx];
+    if (slot->ops) {
+        g_free(slot->ops);
+    }
+    slot->tb_key   = key;
+    slot->n_ops    = n_ops;
+    slot->ops      = ops;
+    slot->enqueued = false;
+    qemu_mutex_unlock(&g_ir_cache_mutex);
+}
+
+/* Look up + atomically mark-as-enqueued so we only fire once per
+ * snapshot. Caller borrows `ops` for the duration of the call; the
+ * snapshot stays in the cache. */
+static bool ir_cache_take(uintptr_t key, const CraneliftTcgOp **out_ops,
+                          size_t *out_n)
+{
+    if (!g_ir_cache_mutex_inited) {
+        return false;
+    }
+    uint32_t idx = ir_cache_index(key);
+    qemu_mutex_lock(&g_ir_cache_mutex);
+    IrSnapshot *slot = &g_ir_cache[idx];
+    bool ok = false;
+    if (slot->ops && slot->tb_key == key && !slot->enqueued) {
+        *out_ops = slot->ops;
+        *out_n   = slot->n_ops;
+        slot->enqueued = true;
+        ok = true;
+    }
+    qemu_mutex_unlock(&g_ir_cache_mutex);
+    return ok;
+}
+
+bool cranelift_bridge_tb_should_promote(const TranslationBlock *tb)
+{
+    /* Already tier-2 (we set this in cranelift_bridge_try_swap once a
+     * shim is installed) or above. */
+    if (tb->tier >= 2) {
+        return false;
+    }
+    /* Hot enough? The exec_count saturates at 2 * TB_TIER1_THRESHOLD
+     * (128) so the gate is generous - any block that runs for ~half a
+     * second of guest time is a candidate. */
+    if (tb->exec_count < g_tier2_threshold) {
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Called immediately after tcg_gen_code() finishes for a hot TB.
+ * Snapshots the optimized IR and enqueues it on the Cranelift worker
+ * thread. Fire-and-forget; the polling path picks up results.
+ */
+/*
+ * Called from tb_gen_code for EVERY translated TB. Snapshots the
+ * post-optimization TCG IR and stashes it in the IR cache keyed by
+ * guest PC. The actual Cranelift compile is deferred until the block
+ * proves itself hot via cpu_exec_loop's exec_count tracking.
+ *
+ * The serialise step is cheap (~30 µs for a typical TB) compared to
+ * the tcg_gen_code work just completed, so we do it for every TB
+ * regardless of expected hotness.
+ */
+void cranelift_bridge_enqueue(TCGContext *s,
+                              TranslationBlock *tb)
+{
+    static uint64_t s_snap_count;
+    static uint64_t s_snap_failed;
+    uint64_t sc = ++s_snap_count;
+
+    CraneliftTcgOp *ops = g_try_new(CraneliftTcgOp, MAX_OPS_PER_TB);
+    if (!ops) {
+        s_snap_failed++;
+        return;
+    }
+    size_t n = cranelift_serialise_ir(s, ops, MAX_OPS_PER_TB);
+    if (n == 0) {
+        s_snap_failed++;
+        g_free(ops);
+        return;
+    }
+    /* Trim to exact size to keep memory bounded. */
+    CraneliftTcgOp *trimmed = g_try_renew(CraneliftTcgOp, ops, n);
+    if (trimmed) {
+        ops = trimmed;
+    }
+    ir_cache_store((uintptr_t)tb, ops, n);
+
+    if (sc == 1 || (sc & 0x3fff) == 0) {
+        CL_LOG("snap#%" PRIu64 " tb=%p pc=0x%" PRIx64
+               " cs_base=0x%" PRIx64 " cflags=0x%x ops=%zu failed=%" PRIu64,
+               sc, (void *)tb, (uint64_t)tb->pc,
+               (uint64_t)tb->cs_base, tb->cflags, n, s_snap_failed);
+    }
+}
+
+/*
+ * Called from the cpu_exec_loop hot path when a TB's exec_count
+ * crosses g_tier2_threshold. Looks up the previously-stashed IR
+ * snapshot and hands it to the Cranelift worker thread. Idempotent:
+ * the snapshot is marked enqueued after the first call, so repeated
+ * hot-path invocations are O(1) no-ops.
+ */
+void cranelift_bridge_maybe_compile(TranslationBlock *tb)
+{
+    if (tb->tier >= 2) {
+        return;     /* shim already installed */
+    }
+    if (tb->exec_count < g_tier2_threshold) {
+        return;
+    }
+
+    cranelift_bridge_lazy_init();
+    if (!g_cranelift_initialised) {
+        static int s_warned;
+        if (!s_warned) {
+            s_warned = 1;
+            CL_LOG("maybe_compile: lazy_init failed (tcg_ctx=%p nb_globals=%d)",
+                   (void *)tcg_ctx,
+                   tcg_ctx ? tcg_ctx->nb_globals : -1);
+        }
+        return;
+    }
+
+    const CraneliftTcgOp *ops;
+    size_t n;
+    if (!ir_cache_take((uintptr_t)tb, &ops, &n)) {
+        /* No snapshot stashed for this TB (LRU evicted, or TB
+         * recycled, or we already enqueued and the worker hasn't
+         * caught up). Skip; harmless. */
+        return;
+    }
+
+    static uint64_t s_enq_count;
+    uint64_t ec = ++s_enq_count;
+    /* Use the TB pointer as the Rust-side key too so swap can find
+     * it by the same identifier. */
+    int rc = cranelift_tcg_enqueue(g_cranelift_ctx,
+                                   (uint64_t)(uintptr_t)tb,
+                                   ops, n,
+                                   (uint32_t)tb->tc.size);
+    if (ec == 1 || (ec & 0x7f) == 0) {
+        CL_LOG("enq#%" PRIu64 " tb=%p pc=0x%" PRIx64
+               " ops=%zu rc=%d exec=%u",
+               ec, (void *)tb, (uint64_t)tb->pc, n, rc, tb->exec_count);
+    }
+}
+
+/*
+ * Single completed tier-2 entry awaiting an RCU TB-code-pointer swap.
+ * The dispatcher hands us a (tb_pc, host_code_ptr, size) tuple; we
+ * need to find the matching TranslationBlock in the qht cache and CAS
+ * `tc.ptr` over to the new code. The lookup-by-pc requires the same
+ * cs_base/flags context the original cpu-exec lookup used, which we
+ * don't have here - so the swap is opportunistic: if the next TB
+ * dispatch sees a pending swap for its pc, it picks it up.
+ *
+ * We keep a small ring buffer of pending swaps that the cpu-exec
+ * hot-path can poll via cranelift_bridge_take_pending().
+ */
+typedef struct PendingSwap {
+    uint64_t    tb_pc;
+    const void *code;
+    size_t      size;
+} PendingSwap;
+
+#define PENDING_SWAP_RING 64
+static PendingSwap pending_ring[PENDING_SWAP_RING];
+static unsigned pending_head;  /* producer */
+static unsigned pending_tail;  /* consumer */
+
+static QemuMutex pending_ring_mutex;
+static bool pending_ring_mutex_inited;
+
+static inline void pending_ring_init_once(void)
+{
+    if (!pending_ring_mutex_inited) {
+        qemu_mutex_init(&pending_ring_mutex);
+        pending_ring_mutex_inited = true;
+    }
+}
+
+void cranelift_bridge_drain(void)
+{
+    if (!g_cranelift_initialised) {
+        return;
+    }
+    pending_ring_init_once();
+    uint64_t tb_pc = 0;
+    const void *code = NULL;
+    size_t size = 0;
+    while (cranelift_tcg_poll_result(g_cranelift_ctx,
+                                     &tb_pc, &code, &size)) {
+        qemu_mutex_lock(&pending_ring_mutex);
+        unsigned next = (pending_head + 1) % PENDING_SWAP_RING;
+        if (next == pending_tail) {
+            /* Ring full - drop oldest. */
+            pending_tail = (pending_tail + 1) % PENDING_SWAP_RING;
+        }
+        pending_ring[pending_head].tb_pc = tb_pc;
+        pending_ring[pending_head].code  = code;
+        pending_ring[pending_head].size  = size;
+        pending_head = next;
+        qemu_mutex_unlock(&pending_ring_mutex);
+    }
+}
+
+/*
+ * Look up a pending swap for the given guest PC. Called from the
+ * vCPU thread when a TB is about to execute - if there's a tier-2
+ * entry ready, we'd CAS-swap tb->tc.ptr here. Currently this returns
+ * NULL because the in-process JIT code emitted by Cranelift expects
+ * a different prologue than TCG's, so calling it as-is would fault.
+ *
+ * The prologue/epilogue glue is the remaining Phase-5 work item; for
+ * now we expose the ring contents only for telemetry / verification.
+ */
+const void *cranelift_bridge_take_pending(uint64_t tb_pc, size_t *out_size)
+{
+    if (!g_cranelift_initialised || !pending_ring_mutex_inited) {
+        return NULL;
+    }
+    qemu_mutex_lock(&pending_ring_mutex);
+    for (unsigned i = pending_tail; i != pending_head;
+         i = (i + 1) % PENDING_SWAP_RING) {
+        if (pending_ring[i].tb_pc == tb_pc) {
+            const void *code = pending_ring[i].code;
+            if (out_size) {
+                *out_size = pending_ring[i].size;
+            }
+            /* Shift remaining entries left. */
+            unsigned j = i;
+            while (j != pending_head) {
+                unsigned k = (j + 1) % PENDING_SWAP_RING;
+                pending_ring[j] = pending_ring[k];
+                j = k;
+            }
+            pending_head = (pending_head + PENDING_SWAP_RING - 1)
+                           % PENDING_SWAP_RING;
+            qemu_mutex_unlock(&pending_ring_mutex);
+            return code;
+        }
+    }
+    qemu_mutex_unlock(&pending_ring_mutex);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* ABI shim arena                                                       */
+/*                                                                      */
+/* Cranelift emits SystemV-ABI functions:                               */
+/*     extern "C" fn(env: *mut CPUArchState) -> i64                     */
+/* QEMU's aarch64 TCG prologue invokes TBs via `BR x0` with env in X19  */
+/* and expects the TB to terminate with `MOV x0, retval ; B tb_ret_addr`*/
+/* The two ABIs are incompatible, so each TB gets a 12-instruction      */
+/* trampoline:                                                          */
+/*                                                                      */
+/*    MOVZ/MOVK x16, #cranelift_fn   ; 4 insns - 64-bit immediate       */
+/*    MOV  x0, x19                   ; env -> arg0 (SystemV)            */
+/*    BLR  x16                       ; call (returns next_tb in x0)     */
+/*    MOVZ/MOVK x16, #tb_ret_addr    ; 4 insns - 64-bit immediate       */
+/*    BR   x16                       ; jump to TCG epilogue             */
+/*                                                                      */
+/* = 12 * 4 = 48 bytes per shim.  An RWX-mapped arena of 1 MiB fits     */
+/* ~21k shims; tier-2 entries are LRU-bounded well under that.  We      */
+/* never need to reset the arena - when a TB is invalidated its shim    */
+/* just becomes garbage; tier-2 budgeting in the Rust side caps total   */
+/* live entries, so the arena is bounded.                               */
+/* ------------------------------------------------------------------ */
+
+#define CRANELIFT_SHIM_INSNS  12
+#define CRANELIFT_SHIM_BYTES  (CRANELIFT_SHIM_INSNS * 4)
+#define CRANELIFT_SHIM_ARENA  (1u << 20)  /* 1 MiB */
+
+static uint8_t  *g_shim_arena;
+static size_t    g_shim_used;
+static QemuMutex g_shim_mutex;
+static bool      g_shim_mutex_inited;
+
+/*
+ * Tier-2 dispatch map. Each entry binds a TranslationBlock* to its
+ * installed shim. cpu_tb_exec consults this on every dispatch and
+ * substitutes the shim for tb->tc.ptr when present. We don't mutate
+ * tb->tc.ptr itself because that would invalidate the tcg_tb_lookup
+ * search tree (see cranelift_bridge_lookup_shim docs).
+ *
+ * The cap matches the install hard-cap. The map is append-only so
+ * lookups can race against writes without locking; readers use
+ * qatomic_read on g_shim_map_count to bound iteration.
+ */
+/*
+ * tb -> shim hash table. Power-of-two size to make the modulo a cheap
+ * mask. Sized to comfortably exceed realistic hot-TB counts for a
+ * single game and bounded by the shim arena (1 MiB / 48 B per shim
+ * ≈ 21k slots), so the table can fill to ~half before lookup cost
+ * matters.
+ *
+ * Layout: open-addressing with linear probing. Empty slots have
+ * tb == NULL. Writers (try_swap) grab the mutex; readers (cpu_tb_exec)
+ * walk lock-free using qatomic_read on the slot's tb field — we only
+ * insert, never remove, so a reader either sees its hit or a NULL
+ * terminator and falls through to tier-1.
+ */
+#define CRANELIFT_SHIM_MAP_CAP   16384u  /* must be power of two */
+#define CRANELIFT_SHIM_MAP_MASK  (CRANELIFT_SHIM_MAP_CAP - 1u)
+typedef struct CraneliftShimEntry {
+    const TranslationBlock *tb;
+    void                   *shim;
+} CraneliftShimEntry;
+static CraneliftShimEntry g_shim_map[CRANELIFT_SHIM_MAP_CAP];
+static unsigned           g_shim_map_count;
+static QemuMutex          g_shim_map_mutex;
+static bool               g_shim_map_mutex_inited;
+
+static inline unsigned cranelift_shim_hash(const TranslationBlock *tb)
+{
+    /*
+     * tb pointers come from QEMU's TB allocator (cache-line aligned).
+     * Mix the upper bits down a bit so consecutive allocations don't
+     * cluster in the same bucket.
+     */
+    uintptr_t p = (uintptr_t)tb;
+    uintptr_t h = (p >> 6) ^ (p >> 17);
+    return (unsigned)(h & CRANELIFT_SHIM_MAP_MASK);
+}
+
+static void shim_arena_init_once(void)
+{
+    if (g_shim_arena) {
+        return;
+    }
+    if (!g_shim_mutex_inited) {
+        qemu_mutex_init(&g_shim_mutex);
+        g_shim_mutex_inited = true;
+    }
+    if (!g_shim_map_mutex_inited) {
+        qemu_mutex_init(&g_shim_map_mutex);
+        g_shim_map_mutex_inited = true;
+    }
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        page = 4096;
+    }
+    size_t sz = (CRANELIFT_SHIM_ARENA + (size_t)page - 1) & ~((size_t)page - 1);
+    void *p = mmap(NULL, sz,
+                   PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_ANON | MAP_PRIVATE,
+                   -1, 0);
+    if (p == MAP_FAILED) {
+        CL_LOG("shim arena mmap failed (%zu bytes): %s",
+               sz, strerror(errno));
+        return;
+    }
+    g_shim_arena = (uint8_t *)p;
+    g_shim_used  = 0;
+    CL_LOG("shim arena ready: base=%p size=%zu", g_shim_arena, sz);
+}
+
+/*
+ * AArch64 LDR (literal) 64-bit encoding helper.
+ *
+ *   LDR (literal, 64-bit): 0 1 0 1 1 0 0 0 imm19(19) Rt(5)
+ *                          base = 0x58000000
+ *
+ * Encoded imm19 = (target_offset_from_ldr) >> 2 (signed, +/-1 MiB).
+ *
+ * Why LDR-literal instead of the textbook MOVZ + 3x MOVK chain? Tier-2
+ * crashes consistently showed x16 holding only the low 32 bits of the
+ * branch target at BLR time -- i.e. MOVK lsl#32 / lsl#48 effectively
+ * silent -- even after the data writes were proven correct (read-back
+ * matched the encoded MOVZ/MOVK bytes) AND a `dsb ish; ic ivau; dsb ish;
+ * isb` ran on the writing thread. The only remaining explanation is an
+ * instruction-prefetch artefact on the freshly-mmap'd shim page where
+ * IC IVAU didn't fully drain a speculative fetch. LDR-literal fetches
+ * the address via D-cache (coherent after dc cvau), so one code insn
+ * suffices instead of four -- much less surface for the same issue.
+ */
+static inline uint32_t encode_ldr_literal_x(int rt, int32_t pc_offset_bytes)
+{
+    int32_t imm19 = pc_offset_bytes >> 2;
+    return 0x58000000u
+         | ((uint32_t)(imm19 & 0x7ffff) << 5)
+         | ((uint32_t)rt & 0x1f);
+}
+
+/* Pre-computed opaque encodings (see header comments above). */
+#define INSN_MOV_X0_X19   0xAA1303E0u  /* ORR X0, XZR, X19 */
+#define INSN_BLR_X16      0xD63F0200u
+#define INSN_BR_X16       0xD61F0200u
+#define INSN_NOP          0xD503201Fu
+
+/*
+ * Emit a single per-TB shim.  Returns a pointer (in the arena) suitable
+ * to install in tb->tc.ptr.  Returns NULL if the arena is exhausted or
+ * not initialised.
+ */
+static void *cranelift_emit_shim(uintptr_t cranelift_fn,
+                                 uintptr_t tb_ret_addr)
+{
+    shim_arena_init_once();
+    if (!g_shim_arena) {
+        return NULL;
+    }
+
+    qemu_mutex_lock(&g_shim_mutex);
+    if (g_shim_used + CRANELIFT_SHIM_BYTES > CRANELIFT_SHIM_ARENA) {
+        qemu_mutex_unlock(&g_shim_mutex);
+        CL_LOG("shim arena exhausted (used=%zu)", g_shim_used);
+        return NULL;
+    }
+    uint8_t  *base = g_shim_arena + g_shim_used;
+    uint32_t *insn = (uint32_t *)base;
+    g_shim_used += CRANELIFT_SHIM_BYTES;
+    qemu_mutex_unlock(&g_shim_mutex);
+
+    /*
+     * Shim layout (48 bytes total):
+     *
+     *   off  asm                          purpose
+     *   ---  ---------------------------  ---------------------------
+     *    0   LDR  x16, [pc + #24]         load cranelift_fn literal
+     *    4   MOV  x0,  x19                env -> SystemV arg0
+     *    8   BLR  x16                     call into Cranelift code
+     *   12   LDR  x16, [pc + #20]         load tb_ret_addr literal
+     *   16   BR   x16                     jump to TCG epilogue
+     *   20   NOP                          padding before literals
+     *   24   .quad cranelift_fn           (8 bytes)
+     *   32   .quad tb_ret_addr            (8 bytes)
+     *   40   NOP NOP                      (8 bytes tail padding)
+     *
+     * BLR's return PC (pc=8 + 4 = 12) lands on the second LDR, which
+     * loads tb_ret_addr into x16 ready for the BR. We deliberately
+     * keep the same 48-byte stride to preserve arena bookkeeping.
+     */
+    insn[0] = encode_ldr_literal_x(16, 24);
+    insn[1] = INSN_MOV_X0_X19;
+    insn[2] = INSN_BLR_X16;
+    insn[3] = encode_ldr_literal_x(16, 20);
+    insn[4] = INSN_BR_X16;
+    insn[5] = INSN_NOP;
+
+    /* Literal slots. memcpy keeps the 64-bit values endian-neutral and
+     * avoids relying on natural alignment of insn[6]/insn[8]. */
+    memcpy(&insn[6], &cranelift_fn, sizeof(cranelift_fn));
+    memcpy(&insn[8], &tb_ret_addr, sizeof(tb_ret_addr));
+    insn[10] = INSN_NOP;
+    insn[11] = INSN_NOP;
+
+    /*
+     * Belt-and-braces cache sync. __builtin___clear_cache *should* be
+     * enough, but at least one tier-2 SIGSEGV looked like x16 only had
+     * the low 32 bits set (MOVK lsl#32/lsl#48 effectively skipped),
+     * which is the classic signature of "I-cache had stale zeros from
+     * the freshly-mapped page before the writes completed". Issue an
+     * explicit DSB ISH after the data stores so the IC IVAU inside
+     * __builtin___clear_cache is ordered after our writes, regardless
+     * of how compiler-rt sequenced its own barriers.
+     */
+    __asm__ __volatile__("dsb ish" ::: "memory");
+    __builtin___clear_cache((char *)base, (char *)base + CRANELIFT_SHIM_BYTES);
+    /* Defensive: force an ISB on this thread before any caller dispatches
+     * into the shim. clear_cache *does* this internally, but adding a
+     * second ISB after the function returns guarantees that the shim's
+     * MOVZ/MOVK sequence is fetched fresh on the current core. */
+    __asm__ __volatile__("isb" ::: "memory");
+
+    /*
+     * Read back the LDR insns and the cranelift_fn literal — confirms
+     * both code and data slots survived the cache flush. Cheap (only
+     * on the first few shims) and silent on success.
+     */
+    if (g_shim_used <= 16 * CRANELIFT_SHIM_BYTES) {
+        uint32_t i0 = insn[0], i3 = insn[3];
+        uint64_t lit_fn = 0;
+        memcpy(&lit_fn, &insn[6], sizeof(lit_fn));
+        CL_LOG("shim_bytes#%zu base=%p fn=0x%016" PRIxPTR
+               " ldr_fn=0x%08x ldr_ret=0x%08x lit_fn=0x%016" PRIx64,
+               g_shim_used / CRANELIFT_SHIM_BYTES, base,
+               cranelift_fn, i0, i3, lit_fn);
+    }
+
+    return base;
+}
+
+/* ------------------------------------------------------------------ */
+/* TB swap                                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Hot-path hook: invoked just before cpu_loop_exec_tb dispatches `tb`.
+ *
+ * Looks up the pending tier-2 ring for an entry whose guest PC matches
+ * this TB.  On match, emits an ABI shim that calls the Cranelift code
+ * and lands in the canonical TCG epilogue, then atomically swaps
+ * tb->tc.ptr over to the shim.  Subsequent dispatches go through the
+ * tier-2 path.
+ *
+ * Concurrency: tb->tc.ptr is racy under MTTCG (multiple vCPUs can read
+ * it).  We use qatomic_xchg__nocheck to publish the new pointer; the
+ * old TCG code remains live in the JIT arena (we don't free), so
+ * readers that snapshot the previous pointer continue to execute the
+ * tier-1 code safely.
+ *
+ * We require cranelift_g_tb_ret_addr to be set; the bridge has no way
+ * to reconstruct it on its own.  If it's zero (e.g. running before
+ * tcg_prologue_init has completed, or on a non-aarch64 backend) we
+ * skip the swap and leave the pending entry in the ring for a later
+ * retry.
+ */
+void cranelift_bridge_try_swap(TranslationBlock *tb)
+{
+    if (!g_cranelift_initialised || !tb) {
+        return;
+    }
+    /* Master switch: refuse to install shims until explicitly
+     * enabled. Compilation, verification and telemetry still run. */
+    if (!qatomic_read(&g_swap_install_enabled)) {
+        return;
+    }
+    if (!pending_ring_mutex_inited) {
+        /* Nothing has ever been queued -> nothing to swap. */
+        return;
+    }
+
+    /* Quick lock-free check before grabbing the mutex. */
+    if (qatomic_read(&pending_head) == qatomic_read(&pending_tail)) {
+        return;
+    }
+
+    uintptr_t ret_addr = qatomic_read(&cranelift_g_tb_ret_addr);
+    if (ret_addr == 0) {
+        return;  /* prologue not yet emitted */
+    }
+
+    const void *new_code = NULL;
+    size_t      new_size = 0;
+    /* Pending entries are keyed by (uintptr_t)tb (the value we passed
+     * to cranelift_tcg_enqueue in maybe_compile). Match by that, not
+     * tb->pc -- CF_PCREL TBs all have pc=0. */
+    uint64_t    want_key = (uint64_t)(uintptr_t)tb;
+
+    qemu_mutex_lock(&pending_ring_mutex);
+    for (unsigned i = pending_tail; i != pending_head;
+         i = (i + 1) % PENDING_SWAP_RING) {
+        if (pending_ring[i].tb_pc == want_key) {
+            new_code = pending_ring[i].code;
+            new_size = pending_ring[i].size;
+            /* Shift remaining entries left (same as take_pending). */
+            unsigned j = i;
+            while (j != pending_head) {
+                unsigned k = (j + 1) % PENDING_SWAP_RING;
+                pending_ring[j] = pending_ring[k];
+                j = k;
+            }
+            pending_head = (pending_head + PENDING_SWAP_RING - 1)
+                           % PENDING_SWAP_RING;
+            break;
+        }
+    }
+    qemu_mutex_unlock(&pending_ring_mutex);
+
+    if (!new_code) {
+        return;
+    }
+
+    /*
+     * Cap lifted. The shim-arena (1 MiB / 48 B per shim = ~21k slots)
+     * and shim-map (CRANELIFT_SHIM_MAP_CAP) bound this naturally.
+     * emit_shim returns NULL and the map full-check below refuses
+     * further installs when either runs out.
+     */
+    static uint64_t s_install_count;
+    void *shim = cranelift_emit_shim((uintptr_t)new_code, ret_addr);
+    if (!shim) {
+        return;
+    }
+
+    uint64_t ic = qatomic_fetch_inc(&s_install_count) + 1;
+    CL_LOG("install#%" PRIu64 " tb=%p pc=0x%" PRIx64 " cs_base=0x%" PRIx64
+           " cflags=0x%x tier1_code=%p shim=%p ce_code=%p tb_ret=0x%" PRIxPTR,
+           ic, (void *)tb, (uint64_t)tb->pc, (uint64_t)tb->cs_base,
+           tb->cflags, tb->tc.ptr, shim, new_code, ret_addr);
+
+    /*
+     * Publish the swap.  tb->tc.ptr is `const void *`; cast through
+     * `void **` (drop the const) so __atomic_exchange_n's type check
+     * is satisfied.  We keep tb->tc.size pointing at the tier-1 code
+     * length, which is fine because nothing in the dispatch path uses
+     * tc.size to compute the entry address - it's only consulted when
+     * walking the code-region search tree, which still resolves to
+     * the tier-1 blob.
+     */
+    /*
+     * Do NOT modify tb->tc.ptr — it is the lookup key for
+     * tcg_tb_lookup(host_pc) and the search tree built at TB
+     * creation. Mutating it causes cpu_io_recompile / watchpoint
+     * unwind to fail and abort. Instead, record (tb -> shim) in a
+     * lock-free open-addressed hash table and have cpu_tb_exec
+     * consult it before dispatch.
+     */
+    qemu_mutex_lock(&g_shim_map_mutex);
+    if (g_shim_map_count < CRANELIFT_SHIM_MAP_CAP / 2) {
+        unsigned idx = cranelift_shim_hash(tb);
+        for (unsigned i = 0; i < CRANELIFT_SHIM_MAP_CAP; i++) {
+            unsigned slot = (idx + i) & CRANELIFT_SHIM_MAP_MASK;
+            if (g_shim_map[slot].tb == NULL) {
+                g_shim_map[slot].shim = shim;
+                /*
+                 * Publish tb LAST so readers see a fully-formed slot.
+                 * cranelift_bridge_lookup_shim does qatomic_read on tb
+                 * and stops at the first NULL it sees.
+                 */
+                qatomic_set(&g_shim_map[slot].tb, tb);
+                qatomic_set(&g_shim_map_count, g_shim_map_count + 1);
+                break;
+            }
+            /* Collision; keep probing. */
+        }
+    } else {
+        CL_LOG("shim map at half-full (%u entries); refusing install#%" PRIu64,
+               g_shim_map_count, ic);
+    }
+    qemu_mutex_unlock(&g_shim_map_mutex);
+    (void)new_size;
+
+    if (tb->tier < 2) {
+        tb->tier = 2;
+    }
+}
+
+const void *cranelift_bridge_lookup_shim(const TranslationBlock *tb)
+{
+    /*
+     * Hot path: O(1) average. We never remove entries, so probing
+     * stops cleanly at the first NULL slot.
+     */
+    if (qatomic_read(&g_shim_map_count) == 0) {
+        return NULL;
+    }
+    unsigned idx = cranelift_shim_hash(tb);
+    for (unsigned i = 0; i < CRANELIFT_SHIM_MAP_CAP; i++) {
+        unsigned slot = (idx + i) & CRANELIFT_SHIM_MAP_MASK;
+        const TranslationBlock *slot_tb =
+            qatomic_read(&g_shim_map[slot].tb);
+        if (slot_tb == NULL) {
+            return NULL;          /* miss */
+        }
+        if (slot_tb == tb) {
+            return g_shim_map[slot].shim;
+        }
+        /* Collision; keep probing. */
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Settings / introspection helpers                                    */
+/* ------------------------------------------------------------------ */
+
+void cranelift_bridge_set_enabled(bool enabled)
+{
+    cranelift_bridge_lazy_init();
+    if (!g_cranelift_initialised) {
+        return;
+    }
+    cranelift_tcg_set_enabled(g_cranelift_ctx, enabled ? 1 : 0);
+}
+
+bool cranelift_bridge_is_enabled(void)
+{
+    if (!g_cranelift_initialised) {
+        return false;
+    }
+    return cranelift_tcg_is_enabled(g_cranelift_ctx) != 0;
+}
+
+void cranelift_bridge_set_verify_mode(bool enabled)
+{
+    cranelift_bridge_lazy_init();
+    if (!g_cranelift_initialised) {
+        return;
+    }
+    cranelift_tcg_set_verify_mode(g_cranelift_ctx, enabled ? 1 : 0);
+}
+
+void cranelift_bridge_set_threshold(uint32_t threshold)
+{
+    g_tier2_threshold = threshold;
+    if (g_cranelift_initialised) {
+        cranelift_tcg_set_hot_threshold(g_cranelift_ctx, threshold);
+    }
+}
+
+void cranelift_bridge_log_stats(void)
+{
+    if (!g_cranelift_initialised) {
+        return;
+    }
+    CraneliftTcgStats st;
+    cranelift_tcg_get_stats(g_cranelift_ctx, &st);
+    CL_LOG("tier2 stats: enq=%" PRIu64 " ok=%" PRIu64 " err=%" PRIu64
+           " skip=%" PRIu64 " bl=%" PRIu64 " ver_ok=%" PRIu64
+           " ver_div=%" PRIu64 " act=%u q=%u",
+           st.enqueued, st.compiled_ok, st.compiled_err,
+           st.fallback_unsupported_op, st.blacklisted,
+           st.verify_ok, st.verify_divergence,
+           st.active_entries, st.worker_queue_depth);
+}
+
+void cranelift_bridge_blacklist(uint64_t pc_lo, uint64_t pc_hi)
+{
+    if (!g_cranelift_initialised) {
+        return;
+    }
+    cranelift_tcg_blacklist(g_cranelift_ctx, pc_lo, pc_hi);
+}
+
+#endif /* XEMU_HAVE_CRANELIFT */

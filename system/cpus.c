@@ -360,6 +360,11 @@ void cpu_handle_guest_debug(CPUState *cpu)
 }
 
 #ifdef CONFIG_LINUX
+#if defined(__aarch64__) && defined(__ANDROID__)
+#include <sys/ucontext.h>
+#include <sys/syscall.h>
+#include <android/log.h>
+#endif
 static void sigbus_reraise(void)
 {
     sigset_t set;
@@ -379,6 +384,31 @@ static void sigbus_reraise(void)
 
 static void sigbus_handler(int n, siginfo_t *siginfo, void *ctx)
 {
+#if defined(__aarch64__) && defined(__ANDROID__)
+    /*
+     * Tier-2 SIGBUS investigation: log si_code + si_addr + the AArch64
+     * PC/LR from ucontext so we can correlate with installed shims /
+     * compiled JIT functions on the way to abort. Without this the
+     * sigbus_reraise() path discards the original fault address.
+     */
+    {
+        uintptr_t pc = 0, lr = 0, sp = 0, fp = 0;
+        if (ctx) {
+            ucontext_t *uc = (ucontext_t *)ctx;
+            pc = uc->uc_mcontext.pc;
+            sp = uc->uc_mcontext.sp;
+            fp = uc->uc_mcontext.regs[29];
+            lr = uc->uc_mcontext.regs[30];
+        }
+        __android_log_print(
+            ANDROID_LOG_ERROR, "xemu-android",
+            "sigbus_handler code=%d addr=%p pc=0x%016zx lr=0x%016zx "
+            "sp=0x%016zx fp=0x%016zx tid=%d",
+            siginfo->si_code, siginfo->si_addr,
+            (size_t)pc, (size_t)lr, (size_t)sp, (size_t)fp,
+            (int)syscall(SYS_gettid));
+    }
+#endif
     if (siginfo->si_code != BUS_MCEERR_AO && siginfo->si_code != BUS_MCEERR_AR) {
         sigbus_reraise();
     }
