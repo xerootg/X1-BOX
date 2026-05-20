@@ -243,6 +243,18 @@ struct CPUTLBEntryFull {
     uint8_t tlb_fill_flags;
 
     /*
+     * Cached dirty_log_mask from the backing MemoryRegion at TLB-fill
+     * time, with the CODE bit stripped (CODE is handled separately by
+     * notdirty_write's tb_invalidate path). Used by the slow-path
+     * notdirty_write to skip bitmap_set_atomic calls for clients that
+     * have no consumer (e.g. VGA on a non-VGA platform, MIGRATION when
+     * global_dirty_tracking is off). Also used to parameterize the
+     * "is page now dirty enough to drop the NOTDIRTY flag" check so we
+     * don't require bits we never set.
+     */
+    uint8_t dirty_log_mask;
+
+    /*
      * Additional tlb flags for use by the slow path. If non-zero,
      * the corresponding CPUTLBEntry comparator must have TLB_FORCE_SLOW.
      */

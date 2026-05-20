@@ -1072,6 +1072,23 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         addend = 0;
     }
 
+    /*
+     * Cache the MR's effective dirty_log_mask (minus CODE — that's
+     * handled separately by notdirty_write's tb_invalidate path). For
+     * RAM MRs this is typically 0 (main RAM, no consumer) or
+     * (1<<NV2A | 1<<NV2A_TEX) (VRAM). The cached value lets the slow
+     * path skip wasted bitmap_set_atomic calls on clients that have
+     * no listener on this platform. Non-RAM MRs (MMIO) don't take the
+     * NOTDIRTY slow path so we just leave dirty_log_mask at 0.
+     */
+    if (is_ram) {
+        full->dirty_log_mask =
+            memory_region_get_dirty_log_mask(section->mr) &
+            ~(1 << DIRTY_MEMORY_CODE);
+    } else {
+        full->dirty_log_mask = 0;
+    }
+
     write_flags = read_flags;
     if (is_ram) {
         iotlb = memory_region_get_ram_addr(section->mr) + xlat;
@@ -1349,13 +1366,25 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
     }
 
     /*
-     * Set both VGA and migration bits for simplicity and to remove
-     * the notdirty callback faster.
+     * Use the cached MR dirty_log_mask instead of the old hardcoded
+     * DIRTY_CLIENTS_NOCODE. The original set bits in VGA, MIGRATION,
+     * NV2A, NV2A_TEX bitmaps for every page write — on Xbox that's two
+     * wasted bitmap_set_atomic CAS operations per write (VGA has no
+     * consumer, MIGRATION is irrelevant when global_dirty_tracking=off).
+     *
+     * The is_clean check needs to follow the same mask: the old
+     * physical_memory_is_clean required ALL FIVE client bits set
+     * before dropping the NOTDIRTY flag, so if we don't set VGA &
+     * MIGRATION the slow path would repeat forever. is_clean_for
+     * only checks bits that the cached mask says are tracked + CODE.
      */
-    physical_memory_set_dirty_range(ram_addr, size, DIRTY_CLIENTS_NOCODE);
+    uint8_t mask = full->dirty_log_mask;
+    if (mask) {
+        physical_memory_set_dirty_range(ram_addr, size, mask);
+    }
 
     /* We remove the notdirty callback only if the code has been flushed. */
-    if (!physical_memory_is_clean(ram_addr)) {
+    if (!physical_memory_is_clean_for(ram_addr, mask)) {
         trace_memory_notdirty_set_dirty(mem_vaddr);
         tlb_set_dirty(cpu, mem_vaddr);
     }

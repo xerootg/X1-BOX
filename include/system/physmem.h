@@ -18,6 +18,25 @@ bool physical_memory_get_dirty_flag(ram_addr_t addr, unsigned client);
 
 bool physical_memory_is_clean(ram_addr_t addr);
 
+/*
+ * Like physical_memory_is_clean() but only considers the clients in
+ * @check_mask plus DIRTY_MEMORY_CODE (which is special-cased — code
+ * dirty bit is always relevant when TCG is on).
+ *
+ * Returns true if the page is "clean" relative to those clients (i.e.
+ * any expected bit is unset, meaning some consumer hasn't yet seen the
+ * write). Returns false only when all expected bits are set, which is
+ * the signal to drop the NOTDIRTY/slow-path flag on the TLB entry.
+ *
+ * Use this when calling code knows the actual dirty_log_mask of the
+ * backing MR (e.g. from CPUTLBEntryFull.dirty_log_mask) and doesn't
+ * want to require bits from clients that have no consumer on this
+ * platform — the old physical_memory_is_clean() requires ALL five
+ * bits, which forces the slow path to repeat on every write whenever
+ * any client has no listener.
+ */
+bool physical_memory_is_clean_for(ram_addr_t addr, uint8_t check_mask);
+
 uint8_t physical_memory_range_includes_clean(ram_addr_t start,
                                              ram_addr_t length,
                                              uint8_t mask);
