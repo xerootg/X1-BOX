@@ -67,14 +67,16 @@ Pass `target="ui"` to inspect the launcher process instead.
 
 ---
 
-## Tool catalogue (50 total)
+## Tool catalogue (52 total)
 
 ### Lifecycle
 
 | Tool | Notes |
 |---|---|
 | `list_devices()` | `adb devices`. |
-| `launch_app(rom="")` | Empty arg = open launcher. With a path or URI, sends `action.VIEW` to `LauncherActivity`, which boots straight into emulation when core files are set up. |
+| `list_games()` | Reads `gamesFolderUri` from `x1box_prefs.xml` (debug build, via `run-as`), maps the SAF tree URI to a filesystem path, and enumerates `.iso/.xiso/.cso/.cci`. Output: `<title>\t<path>` per line. |
+| `launch_game(name)` | Case-insensitive substring match against discovered titles, falling back to filenames. Hands the resolved path to `LauncherActivity` — same code path as the in-app library tile tap. Returns candidates on ambiguity. |
+| `launch_app(rom="")` | Low-level: empty = open launcher, otherwise sends `action.VIEW` with the given path or `content://` URI. Prefer `launch_game()` for title boots. |
 | `stop_app()` | Force-stops both processes. Call before editing prefs so reads-on-boot pick up changes. |
 | `screenshot(save_path)` | Pulls a PNG. |
 

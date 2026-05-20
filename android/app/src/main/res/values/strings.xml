@@ -151,6 +151,16 @@
   <string name="settings_resolution_scale_2x">2x (960p)</string>
   <string name="settings_resolution_scale_3x">3x (1440p)</string>
 
+  <string name="settings_output_scale">Output Resolution (display image size)</string>
+  <string name="settings_output_scale_auto">Match Internal</string>
+  <string name="settings_output_scale_2x">2x (960p)</string>
+  <string name="settings_output_scale_3x">3x (1440p)</string>
+  <string name="settings_output_scale_4x">4x (1920p)</string>
+  <string name="settings_upscaler">Upscaler</string>
+  <string name="settings_upscaler_auto">Auto</string>
+  <string name="settings_upscaler_bilinear">Bilinear (fast)</string>
+  <string name="settings_upscaler_sharp">Sharp (bicubic)</string>
+
   <string name="settings_section_performance">Performance</string>
   <string name="settings_tcg_thread">CPU Threading Mode</string>
   <string name="settings_tcg_thread_multi">Multi-thread</string>

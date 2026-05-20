@@ -17,6 +17,8 @@ object PerGameSettingsManager {
     "setting_filtering",
     "setting_vsync",
     "setting_surface_scale",
+    "setting_output_scale",
+    "setting_upscaler",
     "setting_display_mode",
     OrientationPreferences.PREF_GAME_ORIENTATION,
     "setting_system_memory_mib",

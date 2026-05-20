@@ -134,6 +134,10 @@ extern "C" void xemu_set_submit_frames(int count);
 extern "C" int xemu_get_submit_frames(void);
 extern "C" void xemu_set_tier1_threshold(int value);
 extern "C" int xemu_get_tier1_threshold(void);
+extern "C" void xemu_set_output_scale(int value);
+extern "C" int xemu_get_output_scale(void);
+extern "C" void xemu_set_upscaler(int value);
+extern "C" int xemu_get_upscaler(void);
 extern "C" bool runstate_is_running(void);
 extern "C" void xemu_android_pause_emulation(void);
 extern "C" void xemu_android_resume_emulation(void);
@@ -948,7 +952,11 @@ static SetupFiles SyncSetupFiles() {
   }
 
   out.config_path = base + "/xemu.toml";
-  int tbSize = GetPrefInt(env, activity, "tcg_tb_size", 256);
+  /* Default TB cache was 256 MB but Cranelift tier-2 keeps its own code
+   * cache, so 256 MB of TCG TB heap is oversized — drops to 128 MB without
+   * measurable hit-rate impact on Halo 2 / SS2. See burst-investigation
+   * write-up. Existing installs keep whatever value they already have. */
+  int tbSize = GetPrefInt(env, activity, "tcg_tb_size", 128);
 
   DisplaySettings ds;
   ds.surface_scale = GetPrefInt(
@@ -1034,6 +1042,28 @@ static SetupFiles SyncSetupFiles() {
   xemu_set_tier1_threshold(tier1_threshold);
   __android_log_print(ANDROID_LOG_INFO, "xemu-android",
                       "tier1 threshold: %d", tier1_threshold);
+
+  /* output_scale + upscaler decouple the final display image resolution
+   * from the internal render scale. Read both prefs; 0 (auto) is the
+   * default so the legacy "display image = surface_scale × native" path
+   * stays in effect when the user has not opted in. */
+  int output_scale = GetPrefInt(env, activity, "setting_output_scale",
+                                GetPrefInt(env, activity, "output_scale", 0));
+  if (output_scale < 0) output_scale = 0;
+  if (output_scale > 4) output_scale = 4;
+  xemu_set_output_scale(output_scale);
+  __android_log_print(ANDROID_LOG_INFO, "xemu-android",
+                      "output scale: %d (0=match surface_scale)",
+                      output_scale);
+
+  int upscaler = GetPrefInt(env, activity, "setting_upscaler",
+                            GetPrefInt(env, activity, "upscaler", 0));
+  if (upscaler < 0) upscaler = 0;
+  if (upscaler > 2) upscaler = 2;
+  xemu_set_upscaler(upscaler);
+  __android_log_print(ANDROID_LOG_INFO, "xemu-android",
+                      "upscaler: %d (0=auto, 1=bilinear, 2=sharp)",
+                      upscaler);
 
   std::string rendererPref = GetPrefString(env, activity, "setting_renderer");
   if (rendererPref.empty()) {

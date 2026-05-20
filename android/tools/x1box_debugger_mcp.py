@@ -21,13 +21,16 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import socket
 import struct
 import subprocess
 import tempfile
 import time
+import xml.etree.ElementTree as _ET
 import xml.sax.saxutils as _saxutil
 from pathlib import Path
+from urllib.parse import unquote as _urlunquote
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("x1box-debugger")
@@ -143,6 +146,89 @@ def _resolve_apk(variant: str) -> Path | None:
     return max(apks, key=lambda p: p.stat().st_mtime)
 
 
+# Supported disc-image extensions — mirrors GameLibraryActivity.gameExts.
+GAME_EXTS = (".iso", ".xiso", ".cso", ".cci")
+
+
+def _read_prefs() -> dict[str, str] | None:
+    """Return <string> entries from x1box_prefs.xml. Needs the debug build
+    (run-as). Returns None if unreadable.
+    """
+    if not _is_debuggable():
+        return None
+    r = subprocess.run(
+        ["adb", "exec-out", f"run-as {PKG} cat {PREFS_XML}"],
+        capture_output=True, check=False,
+    )
+    if r.returncode != 0 or not r.stdout:
+        return None
+    try:
+        root = _ET.fromstring(r.stdout.decode("utf-8", errors="replace"))
+    except _ET.ParseError:
+        return None
+    out: dict[str, str] = {}
+    for child in root:
+        name = child.get("name")
+        if not name:
+            continue
+        if child.tag == "string":
+            out[name] = child.text or ""
+        else:
+            v = child.get("value")
+            if v is not None:
+                out[name] = v
+    return out
+
+
+def _games_folder_fs_path() -> str | None:
+    """Translate the saved gamesFolderUri SAF tree URI to a filesystem path.
+    Mirrors FrontendLaunchHelper.treeUriToFilesystemPath in Kotlin so the
+    discovery and launch paths agree on the same root.
+    """
+    prefs = _read_prefs()
+    if not prefs:
+        return None
+    uri = prefs.get("gamesFolderUri")
+    if not uri:
+        return None
+    m = re.search(r"/tree/([^/?#]+)", uri)
+    if not m:
+        return None
+    doc_id = _urlunquote(m.group(1))
+    if ":" in doc_id:
+        volume, relative = doc_id.split(":", 1)
+    else:
+        volume, relative = doc_id, ""
+    vol = volume.lower()
+    if vol == "primary":
+        base = "/storage/emulated/0"
+    elif vol == "home":
+        base = "/storage/emulated/0/Documents"
+    elif volume:
+        base = f"/storage/{volume}"
+    else:
+        return None
+    return base if not relative else f"{base}/{relative.strip('/')}"
+
+
+def _scan_games(folder: str) -> list[str]:
+    """Enumerate disc images under `folder` via adb shell `find`. Returns
+    absolute device paths sorted case-insensitively.
+    """
+    exts = " -o ".join(f"-iname '*{e}'" for e in GAME_EXTS)
+    out = _sh(
+        f"find {shlex.quote(folder)} -maxdepth 6 -type f \\( {exts} \\) 2>/dev/null"
+    )
+    files = [l.strip() for l in out.splitlines() if l.strip()]
+    return sorted(files, key=str.lower)
+
+
+def _game_title_from_path(path: str) -> str:
+    name = path.rsplit("/", 1)[-1]
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    return re.sub(r"[._]+", " ", stem).strip() or name
+
+
 # ---------------------------------------------------------------------------
 # Device / lifecycle
 # ---------------------------------------------------------------------------
@@ -161,6 +247,10 @@ def launch_app(rom: str = "") -> str:
     rom: absolute device path (`/sdcard/Games/foo.iso`) or a content://
          URI the app already has read permission for. Leave empty to just
          open the launcher UI.
+
+    Prefer `launch_game(name)` for title boots — it discovers what's
+    installed via `list_games()` and avoids path-guessing. Use this tool
+    when you already have an exact path or content:// URI.
     """
     if not _device(): return "No device connected."
     if rom:
@@ -175,6 +265,70 @@ def launch_app(rom: str = "") -> str:
     else:
         out = _sh(f"am start -n {LAUNCHER_ACTIVITY}")
     return out or "Launch sent."
+
+@mcp.tool()
+def list_games() -> str:
+    """List Xbox titles inside the user-selected Games folder.
+
+    Reads `gamesFolderUri` from x1box_prefs.xml (requires the debug build —
+    we go through run-as), translates the SAF tree URI to a filesystem path
+    using the same mapping the app uses (`primary:` → /storage/emulated/0,
+    other volumes → /storage/<volume>), and enumerates supported disc
+    images (.iso/.xiso/.cso/.cci) up to 6 directories deep.
+
+    Output format: one game per line as `<title>\\t<path>`, prefixed by a
+    `Games folder:` header. Pass the title to `launch_game(name)` or the
+    path to `launch_app(rom=...)`.
+    """
+    if not _device(): return "No device connected."
+    folder = _games_folder_fs_path()
+    if not folder:
+        if not _is_debuggable():
+            return ("Cannot list games without run-as. Install the debug "
+                    "build (./gradlew assembleDebug && install_apk('debug')).")
+        return ("No games folder configured. Open the X1 BOX app and pick "
+                "a Games folder via the Setup Wizard or Library, then retry.")
+    files = _scan_games(folder)
+    if not files:
+        return f"Games folder: {folder}\n(no supported disc images found)"
+    rows = [f"{_game_title_from_path(p)}\t{p}" for p in files]
+    return f"Games folder: {folder}\n" + "\n".join(rows)
+
+@mcp.tool()
+def launch_game(name: str) -> str:
+    """Launch a title by name (case-insensitive substring match).
+
+    Resolves `name` against the discovered games folder (see list_games),
+    matching first on the derived title and falling back to the filename.
+    On a unique match, hands the path to LauncherActivity — same path the
+    in-app library tile tap uses. On ambiguity, returns up to 10 candidate
+    paths so you can refine the query.
+    """
+    if not _device(): return "No device connected."
+    needle = name.strip().lower()
+    if not needle:
+        return "Provide a name substring to match against."
+    folder = _games_folder_fs_path()
+    if not folder:
+        if not _is_debuggable():
+            return ("Cannot resolve games without run-as. Install the debug "
+                    "build, or pass an exact path to launch_app(rom=...).")
+        return ("No games folder configured. Open the X1 BOX app and pick "
+                "a Games folder, then retry.")
+    files = _scan_games(folder)
+    if not files:
+        return f"No game files found under {folder}."
+
+    title_hits = [p for p in files if needle in _game_title_from_path(p).lower()]
+    matches = title_hits or [p for p in files if needle in p.rsplit("/", 1)[-1].lower()]
+    if not matches:
+        return (f"No game matched '{name}'. Run list_games() to see "
+                f"available titles.")
+    if len(matches) > 1:
+        lines = "\n".join(f"  {_game_title_from_path(p)}\t{p}" for p in matches[:10])
+        suffix = "" if len(matches) <= 10 else f"\n  ... ({len(matches) - 10} more)"
+        return f"Ambiguous match for '{name}' ({len(matches)} hits):\n{lines}{suffix}"
+    return launch_app(matches[0])
 
 @mcp.tool()
 def stop_app() -> str:

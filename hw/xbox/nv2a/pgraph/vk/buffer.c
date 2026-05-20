@@ -212,7 +212,23 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
                  mb.image_pool_max,
                  mb.surface_image_pool_max);
 
+    /* Xbox had 64 MB total UMA; no game stages more than 1× VRAM in flight
+     * because the guest can't address that much. On Mali UMA (Android) the
+     * persistent host-visible staging pair was the largest persistent
+     * allocation we couldn't justify — 2× vram_size = 128 MB × 2 buffers =
+     * 256 MB of zram-eligible anon memory. Cap at vram_size = 64 MB × 2
+     * = 128 MB total. Saves ~128 MB of RSS pressure and is still a
+     * full-frame worth of staging, which the existing code paths never
+     * exceed. See memory note [project-xbox-uma-buffer-sizing].
+     *
+     * Desktop hosts keep the 2× headroom — they pay zero memory pressure
+     * for it and benefit from the larger window when batched uploads are
+     * fat (e.g. surface_scale=3 + bindless textures). */
+#ifdef __ANDROID__
+    size_t staging_size = vram_size;
+#else
     size_t staging_size = vram_size * 2;
+#endif
     if (staging_size < (32 * mib)) {
         staging_size = 32 * mib;
     }

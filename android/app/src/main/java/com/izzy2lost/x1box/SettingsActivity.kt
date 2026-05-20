@@ -303,6 +303,8 @@ class SettingsActivity : AppCompatActivity() {
     val btn1x             = findViewById<MaterialButton>(R.id.btn_scale_1x)
     val btn2x             = findViewById<MaterialButton>(R.id.btn_scale_2x)
     val btn3x             = findViewById<MaterialButton>(R.id.btn_scale_3x)
+    val toggleOutputScale = findViewById<MaterialButtonToggleGroup>(R.id.toggle_output_scale)
+    val toggleUpscaler    = findViewById<MaterialButtonToggleGroup>(R.id.toggle_upscaler)
     val toggleDisplayMode = findViewById<MaterialButtonToggleGroup>(R.id.toggle_display_mode)
     val toggleSystemMemory = findViewById<MaterialButtonToggleGroup>(R.id.toggle_system_memory)
     val toggleThread      = findViewById<MaterialButtonToggleGroup>(R.id.toggle_tcg_thread)
@@ -381,6 +383,21 @@ class SettingsActivity : AppCompatActivity() {
       2    -> toggleScale.check(R.id.btn_scale_2x)
       3    -> toggleScale.check(R.id.btn_scale_3x)
       else -> toggleScale.check(R.id.btn_scale_1x)
+    }
+
+    val outputScale = prefs.getInt("setting_output_scale", 0)
+    when (outputScale) {
+      2    -> toggleOutputScale.check(R.id.btn_output_scale_2x)
+      3    -> toggleOutputScale.check(R.id.btn_output_scale_3x)
+      4    -> toggleOutputScale.check(R.id.btn_output_scale_4x)
+      else -> toggleOutputScale.check(R.id.btn_output_scale_auto)
+    }
+
+    val upscaler = prefs.getInt("setting_upscaler", 0)
+    when (upscaler) {
+      1    -> toggleUpscaler.check(R.id.btn_upscaler_bilinear)
+      2    -> toggleUpscaler.check(R.id.btn_upscaler_sharp)
+      else -> toggleUpscaler.check(R.id.btn_upscaler_auto)
     }
 
     val displayMode = prefs.getInt("setting_display_mode", 0)
@@ -493,6 +510,17 @@ class SettingsActivity : AppCompatActivity() {
         R.id.btn_scale_3x -> 3
         else              -> 1
       }
+      val selectedOutputScale = when (toggleOutputScale.checkedButtonId) {
+        R.id.btn_output_scale_2x -> 2
+        R.id.btn_output_scale_3x -> 3
+        R.id.btn_output_scale_4x -> 4
+        else                     -> 0
+      }
+      val selectedUpscaler = when (toggleUpscaler.checkedButtonId) {
+        R.id.btn_upscaler_bilinear -> 1
+        R.id.btn_upscaler_sharp    -> 2
+        else                       -> 0
+      }
       val selectedThread = when (toggleThread.checkedButtonId) {
         R.id.btn_thread_single -> "single"
         else                   -> "multi"
@@ -520,6 +548,8 @@ class SettingsActivity : AppCompatActivity() {
       val edit = prefs.edit()
         .putInt("setting_display_mode", selectedDisplayMode)
         .putInt("setting_surface_scale", selectedScale)
+        .putInt("setting_output_scale", selectedOutputScale)
+        .putInt("setting_upscaler", selectedUpscaler)
         .putInt("setting_frame_rate_limit", 60)
         .putInt("setting_system_memory_mib", selectedSystemMemoryMiB)
         .putString(OrientationPreferences.PREF_UI_ORIENTATION, selectedUiOrientation.prefValue)
@@ -639,9 +669,11 @@ class SettingsActivity : AppCompatActivity() {
     if (!prefs.contains("setting_tcg_thread")) editor.putString("setting_tcg_thread", "multi")
     if (!prefs.contains("setting_audio_driver")) editor.putString("setting_audio_driver", "openslES")
     if (!prefs.contains("setting_surface_scale")) editor.putInt("setting_surface_scale", 1)
+    if (!prefs.contains("setting_output_scale")) editor.putInt("setting_output_scale", 0)
+    if (!prefs.contains("setting_upscaler")) editor.putInt("setting_upscaler", 0)
     if (!prefs.contains("setting_display_mode")) editor.putInt("setting_display_mode", 0)
     if (!prefs.contains("setting_system_memory_mib")) editor.putInt("setting_system_memory_mib", 64)
-    if (!prefs.contains("tcg_tb_size")) editor.putInt("tcg_tb_size", 256)
+    if (!prefs.contains("tcg_tb_size")) editor.putInt("tcg_tb_size", 128)
 
     editor.putBoolean(PREF_SETTINGS_MIGRATED_V2, true).apply()
   }

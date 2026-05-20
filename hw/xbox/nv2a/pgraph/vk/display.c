@@ -30,6 +30,89 @@
 
 extern bool xemu_get_frame_skip(void);
 
+/*
+ * Output-scale knob, independent of surface_scale (the internal render
+ * factor).  surface_scale governs how big each Vulkan render target is —
+ * scales as O(N^2) in memory.  output_scale only governs the size of the
+ * final display image (the AHB texture handed to GLES for composite to
+ * the swapchain).  Decoupling them lets us keep internal RTs small
+ * (so the burst-fault memory pressure from Mali UMA stays in budget,
+ * see project_xbox_uma_buffer_sizing memory) while doing a higher-quality
+ * upscale at the very last stage with FSR1 EASU.
+ *
+ * Semantics:
+ *   0  => clamp to surface_scale (legacy behaviour; display image at the
+ *         internal render res, no upscale).
+ *   N  => display image is sized at N × Xbox native res.  If N >
+ *         surface_scale, the display fragment shader performs the
+ *         upscale.  Selected by g_xemu_upscaler:
+ *           0 (auto)     => sharp when N > surface_scale, else linear
+ *           1 (bilinear) => always linear sampler
+ *           2 (sharp)    => Catmull-Rom 4-tap bicubic via 9 bilinear
+ *                          samples — drop-in slot for a future FSR1 EASU
+ *                          port (same call-site, just swap the function).
+ */
+static int g_xemu_output_scale = 0;
+static int g_xemu_upscaler = 0;
+
+void xemu_set_output_scale(int value)
+{
+    if (value < 0) value = 0;
+    if (value > 4) value = 4;
+    g_xemu_output_scale = value;
+}
+
+int xemu_get_output_scale(void)
+{
+    return g_xemu_output_scale;
+}
+
+void xemu_set_upscaler(int value)
+{
+    if (value < 0) value = 0;
+    if (value > 2) value = 2;
+    g_xemu_upscaler = value;
+}
+
+int xemu_get_upscaler(void)
+{
+    return g_xemu_upscaler;
+}
+
+/*
+ * Resolve the effective output scale given the current surface_scale.
+ * Returns at least 1; never less than surface_scale (downsampling at the
+ * display stage just costs memory without benefit — clamp it).
+ */
+static int effective_output_scale(int surface_scale)
+{
+    int s = g_xemu_output_scale;
+    if (s <= 0) {
+        return surface_scale > 0 ? surface_scale : 1;
+    }
+    if (surface_scale > 0 && s < surface_scale) {
+        return surface_scale;
+    }
+    return s;
+}
+
+/*
+ * Resolve the upscaler. AUTO picks FSR1 when we're actually upscaling
+ * (output > surface), otherwise bilinear so we don't waste cycles when
+ * the sampler is doing a 1:1 read.
+ */
+enum { XEMU_UPSCALER_AUTO = 0, XEMU_UPSCALER_BILINEAR = 1, XEMU_UPSCALER_FSR1 = 2 };
+
+static int effective_upscaler(int surface_scale, int output_scale)
+{
+    int u = g_xemu_upscaler;
+    if (u == XEMU_UPSCALER_AUTO) {
+        return (output_scale > surface_scale) ? XEMU_UPSCALER_FSR1
+                                              : XEMU_UPSCALER_BILINEAR;
+    }
+    return u;
+}
+
 #if HAVE_EXTERNAL_MEMORY
 #ifdef __ANDROID__
 #include <android/hardware_buffer.h>
@@ -321,6 +404,25 @@ static void upload_pvideo_image(PGRAPHState *pg, PvideoState state)
     pgraph_vk_end_single_time_commands(pg, cmd);
 }
 
+/*
+ * Mitchell-Netravali (B=C=1/3) 4-tap bicubic upscale.
+ *
+ * Variant of the cubic family with reduced overshoot at sharp edges
+ * compared to Catmull-Rom (B=0, C=0.5). On low-res emulator content
+ * (sharp text, point-sampled textures, high-contrast UI) Catmull-Rom
+ * shows visible halo/ringing artifacts; Mitchell sits between
+ * Catmull-Rom and bilinear — noticeably sharper than bilinear, ~44%
+ * less peak overshoot than Catmull-Rom. Recommended by Mitchell &
+ * Netravali (1988) as the "no excessive ringing" cubic.
+ *
+ * Implementation: 9 bilinear-sample optimization (3x3 grid of bilinear
+ * lookups where the middle column/row collapse taps 1 and 2 into one
+ * weighted bilinear). Same shader structure as the Catmull-Rom variant
+ * with just the weight polynomials changed.
+ *
+ * Slot is positioned so a future FSR1 EASU port drops in here without
+ * touching the call site — same signature (sampler, uv) -> vec4.
+ */
 static const char *display_frag_glsl =
     "#version 450\n"
     "layout(binding = 0) uniform sampler2D tex;\n"
@@ -336,15 +438,66 @@ static const char *display_frag_glsl =
     "    bool pvideo_color_key_enable;\n"
     "    vec3 pvideo_color_key;\n"
     "    float blend_factor;\n"
+    "    int  upscale_mode;\n"
     "};\n"
     "layout(location = 0) out vec4 out_Color;\n"
+    "\n"
+    "/* upscale_mode: 0=bilinear, 1=Mitchell-Netravali (sharp). */\n"
+    "vec4 sample_upscaled(sampler2D src, vec2 uv)\n"
+    "{\n"
+    "    if (upscale_mode == 0) {\n"
+    "        return texture(src, uv);\n"
+    "    }\n"
+    "    vec2 tex_size = vec2(textureSize(src, 0));\n"
+    "    vec2 sample_pos = uv * tex_size;\n"
+    "    vec2 tex_pos1 = floor(sample_pos - 0.5) + 0.5;\n"
+    "    vec2 f = sample_pos - tex_pos1;\n"
+    "\n"
+    "    /* Mitchell-Netravali (B=C=1/3) weights, derived analytically.\n"
+    "     * Sum to 1 by construction; peak overshoot ~0.035 at f=0.5\n"
+    "     * (vs. Catmull-Rom's 0.0625, both at the side taps). */\n"
+    "    vec2 f2 = f * f;\n"
+    "    vec2 f3 = f2 * f;\n"
+    "    vec2 w0 = (1.0  - 9.0 * f + 15.0 * f2 -  7.0 * f3) / 18.0;\n"
+    "    vec2 w1 = (16.0           - 36.0 * f2 + 21.0 * f3) / 18.0;\n"
+    "    vec2 w2 = (1.0  + 9.0 * f + 27.0 * f2 - 21.0 * f3) / 18.0;\n"
+    "    vec2 w3 = (              -  6.0 * f2 +  7.0 * f3) / 18.0;\n"
+    "\n"
+    "    /* Collapse taps 1 and 2 into a single bilinear lookup. */\n"
+    "    vec2 w12 = w1 + w2;\n"
+    "    vec2 offset12 = w2 / w12;\n"
+    "\n"
+    "    vec2 tex_pos0  = (tex_pos1 - 1.0) / tex_size;\n"
+    "    vec2 tex_pos3  = (tex_pos1 + 2.0) / tex_size;\n"
+    "    vec2 tex_pos12 = (tex_pos1 + offset12) / tex_size;\n"
+    "\n"
+    "    vec4 result = vec4(0.0);\n"
+    "    result += texture(src, vec2(tex_pos0.x,  tex_pos0.y))  * (w0.x  * w0.y);\n"
+    "    result += texture(src, vec2(tex_pos12.x, tex_pos0.y))  * (w12.x * w0.y);\n"
+    "    result += texture(src, vec2(tex_pos3.x,  tex_pos0.y))  * (w3.x  * w0.y);\n"
+    "\n"
+    "    result += texture(src, vec2(tex_pos0.x,  tex_pos12.y)) * (w0.x  * w12.y);\n"
+    "    result += texture(src, vec2(tex_pos12.x, tex_pos12.y)) * (w12.x * w12.y);\n"
+    "    result += texture(src, vec2(tex_pos3.x,  tex_pos12.y)) * (w3.x  * w12.y);\n"
+    "\n"
+    "    result += texture(src, vec2(tex_pos0.x,  tex_pos3.y))  * (w0.x  * w3.y);\n"
+    "    result += texture(src, vec2(tex_pos12.x, tex_pos3.y))  * (w12.x * w3.y);\n"
+    "    result += texture(src, vec2(tex_pos3.x,  tex_pos3.y))  * (w3.x  * w3.y);\n"
+    "    return result;\n"
+    "}\n"
+    "\n"
     "void main()\n"
     "{\n"
     "    vec2 tex_coord = gl_FragCoord.xy/display_size;\n"
-    "    float rel = display_size.y/textureSize(tex, 0).y/line_offset;\n"
+    /* The original `rel` baked display_size/textureSize into line_offset,
+     * which only worked because display_size was always the same scale as
+     * the source surface. Now that the display image lives at output_scale
+     * (>= surface_scale), the source/output ratio is normalized by the
+     * sampler — `rel` should only carry the VGA line_offset. */
+    "    float rel = 1.0/line_offset;\n"
     "    tex_coord.y = 1 + rel*(tex_coord.y - 1);\n"
     "    tex_coord.y = 1 - tex_coord.y;\n"
-    "    out_Color.rgba = texture(tex, tex_coord);\n"
+    "    out_Color.rgba = sample_upscaled(tex, tex_coord);\n"
     "    if (pvideo_enable) {\n"
     "        vec2 screen_coord = vec2(gl_FragCoord.x, display_size.y - gl_FragCoord.y) * pvideo_scale.z;\n"
     "        vec4 output_region = vec4(pvideo_pos.xy, pvideo_pos.xy + pvideo_pos.zw);\n"
@@ -1450,12 +1603,27 @@ static void update_uniforms(PGRAPHState *pg, SurfaceBinding *surface)
                   pvideo->in_t / 8.f);
         uniform4f(l, uniform_index(l, "pvideo_pos"), pvideo->out_x,
                   pvideo->out_y, pvideo->out_width, pvideo->out_height);
+        /* The shader normalizes gl_FragCoord into native VGA coords via
+         * `screen_coord = gl_FragCoord * pvideo_scale.z` so it can clip
+         * against pvideo_pos (which is in native coords). gl_FragCoord
+         * spans [0, output_scale × native], so divide by output_scale
+         * (not surface_scale — display image is sized at out_scale). */
+        int out_scale = effective_output_scale((int)pg->surface_scale_factor);
+        if (out_scale < 1) out_scale = 1;
         uniform4f(l, uniform_index(l, "pvideo_scale"), pvideo->scale_x,
-                  pvideo->scale_y, 1.0f / pg->surface_scale_factor, 1.0);
+                  pvideo->scale_y, 1.0f / (float)out_scale, 1.0);
     }
 
     uniform1f(l, uniform_index(l, "blend_factor"),
               r->display.blend_active ? 0.5f : 0.0f);
+
+    /* Pick upscaler based on whether we're actually upscaling. AUTO degrades
+     * to BILINEAR for 1:1, so we don't pay 9-tap Catmull-Rom for noop reads. */
+    int surface_scale = (int)pg->surface_scale_factor;
+    int out_scale = effective_output_scale(surface_scale);
+    int upscaler = effective_upscaler(surface_scale, out_scale);
+    int shader_mode = (upscaler == XEMU_UPSCALER_BILINEAR) ? 0 : 1;
+    uniform1i(l, uniform_index(l, "upscale_mode"), shader_mode);
 }
 
 static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
@@ -1727,7 +1895,14 @@ void pgraph_vk_render_display(PGRAPHState *pg)
         height *= 2;
     }
 
-    pgraph_apply_scaling_factor(pg, &width, &height);
+    /* Width/height start at Xbox native VGA res. The display image lives
+     * at output_scale × native — independent of surface_scale, which only
+     * sizes the internal render targets. When effective_output_scale ==
+     * surface_scale the fragment shader does a 1:1 copy from source. */
+    int surface_scale = (int)pg->surface_scale_factor;
+    int out_scale = effective_output_scale(surface_scale);
+    width *= out_scale;
+    height *= out_scale;
 
     PGRAPHVkDisplayState *disp = &r->display;
     if (!disp->images[0].image || disp->width != width || disp->height != height) {
