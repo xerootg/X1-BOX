@@ -203,6 +203,7 @@ impl Translator {
             }
         }
 
+
         let name = format!("tb_{tb_pc:016x}");
         let host_ptr_ty = self.host_ptr_ty;
 
@@ -661,11 +662,47 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 Ok(())
             }
             GotoTb => {
-                // Treat goto_tb as exit-to-dispatcher with a hint that
-                // the TB at carg(0) is the likely successor. Cranelift
-                // can't chain TBs directly so we just exit.
-                let v = self.builder.ins().iconst(types::I64, 0);
-                self.builder.ins().return_(&[v]);
+                /* TB chaining for Cranelift. Tier-1 TCG patches goto_tb
+                 * into a direct jump to the next TB's host code, so a
+                 * hot loop body has zero dispatcher round-trip per
+                 * iteration. Cranelift TBs can't be patched post-hoc,
+                 * so we instead call cranelift_chain_continue (in
+                 * accel/tcg/cpu-exec.c) which loops dispatching
+                 * successive TBs (shim or tier-1) until it hits an
+                 * interrupt or a non-zero exit reason. The chain
+                 * helper's address is passed in via EnvDesc at init.
+                 * Without this, every Cranelift TB ending in goto_tb
+                 * returned 0 and forced the dispatcher to look up the
+                 * next TB by env->eip — fine for cold paths but for
+                 * audio-mix / video-decode / animation inner loops it
+                 * added enough per-iteration variance to cause
+                 * audible chop and visible stutter.
+                 * env->eip is already updated to the destination by
+                 * the frontend before this op runs.  If the helper
+                 * address wasn't set up, fall back to a plain
+                 * return-to-dispatcher. */
+                let chain_fn = self.env.chain_continue_fn;
+                if chain_fn != 0 {
+                    let mut sig =
+                        Signature::new(CallConv::SystemV);
+                    sig.params.push(AbiParam::new(self.host_ptr_ty));
+                    sig.returns.push(AbiParam::new(types::I64));
+                    let sig_ref = self.builder.import_signature(sig);
+                    let addr = self
+                        .builder
+                        .ins()
+                        .iconst(self.host_ptr_ty, chain_fn as i64);
+                    let inst = self.builder.ins().call_indirect(
+                        sig_ref,
+                        addr,
+                        &[self.env_val],
+                    );
+                    let ret = self.builder.inst_results(inst)[0];
+                    self.builder.ins().return_(&[ret]);
+                } else {
+                    let v = self.builder.ins().iconst(types::I64, 0);
+                    self.builder.ins().return_(&[v]);
+                }
                 self.block_terminated = true;
                 Ok(())
             }

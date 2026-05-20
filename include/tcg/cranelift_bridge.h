@@ -107,6 +107,13 @@ typedef struct CraneliftTcgEnvDesc {
     uint32_t guest_ptr_size;
     /* Host pointer width: 4 or 8. */
     uint32_t host_ptr_size;
+    /* Address of cranelift_chain_continue helper (cpu-exec.c). The
+     * GotoTb lowering calls this at every chain site to dispatch
+     * successive TBs without going through the dispatcher loop, which
+     * was the source of audio/cutscene chop once lower_call was on.
+     * Pass 0 to disable chain dispatch (lowering falls back to a plain
+     * return-to-dispatcher). */
+    uintptr_t chain_continue_fn;
 } CraneliftTcgEnvDesc;
 
 /* ------------------------------------------------------------------ */

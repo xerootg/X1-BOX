@@ -716,6 +716,65 @@ static vaddr log_pc(CPUState *cpu, const TranslationBlock *tb)
     }
 }
 
+#if XEMU_HAVE_CRANELIFT
+/*
+ * Cranelift TB chain helper. Called by Cranelift-compiled TBs at every
+ * goto_tb site instead of returning to the dispatcher loop. Loops
+ * dispatching successive TBs (with shim lookup) until either an exit
+ * reason is hit or an interrupt is pending — that keeps inner game
+ * loops (audio mixing, video decode, animation) running without the
+ * dispatcher round-trip per iteration that was causing audio/cutscene
+ * chop after lower_call was enabled.
+ *
+ * Recursion guard: a Cranelift TB calls this helper, the helper does
+ * tb_exec on the next TB, that TB might also be Cranelift and call
+ * this helper again. The TLS flag prevents nested chains from looping
+ * — only the outermost helper iterates; nested calls return 0 to fall
+ * back into the outer loop.
+ */
+static __thread bool cranelift_in_chain;
+
+uintptr_t cranelift_chain_continue(CPUArchState *env)
+{
+    if (cranelift_in_chain) {
+        return 0;
+    }
+    CPUState *cpu = env_cpu(env);
+    cranelift_in_chain = true;
+    uintptr_t ret = 0;
+    while (true) {
+        if (qatomic_read(&cpu->exit_request)) {
+            break;
+        }
+        if (cpu->interrupt_request) {
+            break;
+        }
+        TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
+        s.cflags = curr_cflags(cpu);
+        if (s.cflags & CF_INVALID) {
+            break;
+        }
+        TranslationBlock *tb = tb_lookup(cpu, s);
+        if (!tb) {
+            break;
+        }
+        const void *code = cranelift_bridge_lookup_shim(tb);
+        if (!code) {
+            code = tb->tc.ptr;
+        }
+        cpu->neg.can_do_io = false;
+        uintptr_t r = tcg_qemu_tb_exec(cpu_env(cpu), code);
+        cpu->neg.can_do_io = true;
+        if (r & TB_EXIT_MASK) {
+            ret = r;
+            break;
+        }
+    }
+    cranelift_in_chain = false;
+    return ret;
+}
+#endif
+
 /* Execute a TB, and fix up the CPU state afterwards if necessary */
 /*
  * Disable CFI checks.

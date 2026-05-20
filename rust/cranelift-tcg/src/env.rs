@@ -22,6 +22,13 @@ pub struct EnvDesc {
     pub guest_ptr_size: u32,
     pub host_ptr_size: u32,
     pub globals: Vec<GlobalDesc>,
+    /// Address of `cranelift_chain_continue` in libxemu (accel/tcg/
+    /// cpu-exec.c). Cranelift's GotoTb lowering calls this so chained
+    /// TBs (audio mixing, video decode, animation loops) dispatch
+    /// inline without a dispatcher round-trip per iteration. 0 means
+    /// chain dispatch is disabled and we fall back to return-to-
+    /// dispatcher.
+    pub chain_continue_fn: u64,
 }
 
 impl EnvDesc {
@@ -41,6 +48,7 @@ impl EnvDesc {
             guest_ptr_size: 4,
             host_ptr_size: 8,
             globals: Vec::new(),
+            chain_continue_fn: 0,
         }
     }
 
@@ -60,6 +68,7 @@ impl EnvDesc {
         name_pool: *const c_char,
         guest_ptr_size: u32,
         host_ptr_size: u32,
+        chain_continue_fn: u64,
     ) -> Self {
         let mut out = Vec::with_capacity(nb_globals as usize);
         if !globals.is_null() && nb_globals > 0 {
@@ -90,6 +99,7 @@ impl EnvDesc {
             guest_ptr_size,
             host_ptr_size,
             globals: out,
+            chain_continue_fn,
         }
     }
 }

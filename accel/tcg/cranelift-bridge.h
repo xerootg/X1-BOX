@@ -79,6 +79,15 @@ const void *cranelift_bridge_lookup_shim(const TranslationBlock *tb);
  */
 extern uintptr_t cranelift_g_tb_ret_addr;
 
+/*
+ * Chain dispatch helper called by Cranelift-compiled TBs at goto_tb
+ * sites. Defined in accel/tcg/cpu-exec.c where tb_lookup is visible.
+ * The address is published to the Rust side via the env descriptor so
+ * the lowering can emit a call to it without needing extern symbol
+ * resolution at JIT time.
+ */
+uintptr_t cranelift_chain_continue(CPUArchState *env);
+
 /* Runtime toggle + tuning knobs. */
 void cranelift_bridge_set_enabled(bool enabled);
 bool cranelift_bridge_is_enabled(void);

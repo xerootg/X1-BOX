@@ -342,14 +342,15 @@ static void cranelift_bridge_lazy_init(void)
     uint32_t guest_ptr_size = (s->addr_type == TCG_TYPE_I32) ? 4 : 8;
 
     CraneliftTcgEnvDesc env = {
-        .env_size       = env_size,
-        .tlb_offset     = tlb_ofs,
-        .pc_offset      = pc_off,
-        .nb_globals     = nb,
-        .globals        = tuples,
-        .name_pool      = pool,
-        .guest_ptr_size = guest_ptr_size,
-        .host_ptr_size  = sizeof(void *),
+        .env_size          = env_size,
+        .tlb_offset        = tlb_ofs,
+        .pc_offset         = pc_off,
+        .nb_globals        = nb,
+        .globals           = tuples,
+        .name_pool         = pool,
+        .guest_ptr_size    = guest_ptr_size,
+        .host_ptr_size     = sizeof(void *),
+        .chain_continue_fn = (uintptr_t)&cranelift_chain_continue,
     };
 
     g_cranelift_ctx = cranelift_tcg_init(&env);

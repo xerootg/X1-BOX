@@ -32,6 +32,7 @@ pub struct CraneliftTcgEnvDesc {
     pub name_pool: *const c_char,
     pub guest_ptr_size: u32,
     pub host_ptr_size: u32,
+    pub chain_continue_fn: usize,
 }
 
 /// Mirror of `CraneliftTcgStats` in the C header.
@@ -113,6 +114,7 @@ pub unsafe extern "C" fn cranelift_tcg_init(
                 e.name_pool,
                 e.guest_ptr_size,
                 e.host_ptr_size,
+                e.chain_continue_fn as u64,
             )
         }
     };
