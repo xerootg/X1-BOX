@@ -1485,6 +1485,72 @@ static void voice_process(MCPXAPUState *d,
     assert(ea_value >= 0.0f);
     assert(ea_value <= 1.0f);
 
+    /*
+     * Silent-voice fast-path #1: envelope amplitude is below a
+     * conservative inaudibility floor. -72 dB (~1/4096) is comfortably
+     * below typical game audio's quietest ambient layer. Halo 2 keeps
+     * many voices "active" in their release tail, all running the
+     * full voice_resample → libsamplerate → LPF → mix chain to
+     * contribute samples that round to zero. State machine state is
+     * already advanced via voice_step_envelope above.
+     */
+    if (ea_value < 1.0f / 4096.0f) {
+        return;
+    }
+
+    /*
+     * Read mixbin volumes early (the values are static reg reads, no
+     * side effects). This lets us short-circuit before voice_resample
+     * — the dominant cost in this function — when the voice is fully
+     * attenuated by the guest's per-bin volume settings even though
+     * its envelope is non-zero (common for sound effects that have
+     * been positioned far away in 3D or hidden behind a wall).
+     */
+    uint16_t vol[8];
+    vol[0] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA,
+                            NV_PAVS_VOICE_TAR_VOLA_VOLUME0);
+    vol[1] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA,
+                            NV_PAVS_VOICE_TAR_VOLA_VOLUME1);
+    vol[2] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB,
+                            NV_PAVS_VOICE_TAR_VOLB_VOLUME2);
+    vol[3] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB,
+                            NV_PAVS_VOICE_TAR_VOLB_VOLUME3);
+    vol[4] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLC,
+                            NV_PAVS_VOICE_TAR_VOLC_VOLUME4);
+    vol[5] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLC,
+                            NV_PAVS_VOICE_TAR_VOLC_VOLUME5);
+
+    vol[6] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLC,
+                            NV_PAVS_VOICE_TAR_VOLC_VOLUME6_B11_8) << 8;
+    vol[6] |= voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB,
+                             NV_PAVS_VOICE_TAR_VOLB_VOLUME6_B7_4) << 4;
+    vol[6] |= voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA,
+                             NV_PAVS_VOICE_TAR_VOLA_VOLUME6_B3_0);
+    vol[7] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLC,
+                            NV_PAVS_VOICE_TAR_VOLC_VOLUME7_B11_8) << 8;
+    vol[7] |= voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB,
+                             NV_PAVS_VOICE_TAR_VOLB_VOLUME7_B7_4) << 4;
+    vol[7] |= voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA,
+                             NV_PAVS_VOICE_TAR_VOLA_VOLUME7_B3_0);
+
+    uint16_t max_vol = 0;
+    for (int i = 0; i < 8; i++) {
+        if (vol[i] > max_vol) max_vol = vol[i];
+    }
+
+    /*
+     * Silent-voice fast-path #2: envelope × max-volume product is
+     * below the audibility threshold. `vol[]` values are NV-format
+     * attenuation registers (interpreted by attenuate() later); a
+     * zero literally means "muted on every mixbin". We approximate
+     * the threshold as `ea_value * (max_vol/65535) < 1/4096`, i.e.
+     * the post-attenuation amplitude is below -72 dB.
+     */
+    if (max_vol == 0 ||
+        ea_value * ((float)max_vol / 65535.0f) < 1.0f / 4096.0f) {
+        return;
+    }
+
     float samples[NUM_SAMPLES_PER_FRAME][2] = { 0 };
 
     bool multipass = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
@@ -1542,32 +1608,7 @@ static void voice_process(MCPXAPUState *d,
         bin[3] = d->vp.hrtf_submix[3];
     }
 
-    uint16_t vol[8];
-    vol[0] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA,
-                            NV_PAVS_VOICE_TAR_VOLA_VOLUME0);
-    vol[1] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA,
-                            NV_PAVS_VOICE_TAR_VOLA_VOLUME1);
-    vol[2] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB,
-                            NV_PAVS_VOICE_TAR_VOLB_VOLUME2);
-    vol[3] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB,
-                            NV_PAVS_VOICE_TAR_VOLB_VOLUME3);
-    vol[4] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLC,
-                            NV_PAVS_VOICE_TAR_VOLC_VOLUME4);
-    vol[5] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLC,
-                            NV_PAVS_VOICE_TAR_VOLC_VOLUME5);
-
-    vol[6] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLC,
-                            NV_PAVS_VOICE_TAR_VOLC_VOLUME6_B11_8) << 8;
-    vol[6] |= voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB,
-                             NV_PAVS_VOICE_TAR_VOLB_VOLUME6_B7_4) << 4;
-    vol[6] |= voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA,
-                             NV_PAVS_VOICE_TAR_VOLA_VOLUME6_B3_0);
-    vol[7] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLC,
-                            NV_PAVS_VOICE_TAR_VOLC_VOLUME7_B11_8) << 8;
-    vol[7] |= voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB,
-                             NV_PAVS_VOICE_TAR_VOLB_VOLUME7_B7_4) << 4;
-    vol[7] |= voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA,
-                             NV_PAVS_VOICE_TAR_VOLA_VOLUME7_B3_0);
+    /* vol[] was already read above for the silent-voice fast-path check. */
 
     // FIXME: If phase negations means to flip the signal upside down
     //        we should modify volume of bin6 and bin7 here.
