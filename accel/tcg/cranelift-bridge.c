@@ -1170,6 +1170,10 @@ void cranelift_bridge_try_swap(TranslationBlock *tb)
      * and shim-map (CRANELIFT_SHIM_MAP_CAP) bound this naturally.
      * emit_shim returns NULL and the map full-check below refuses
      * further installs when either runs out.
+     *
+     * 2026-05-19 bisect override: optionally cap installs via
+     * X1BOX_CRANELIFT_MAX_INSTALLS env var so we can binary-search
+     * which tier-2 TB is panicking the Xbox kernel.
      */
     static uint64_t s_install_count;
     void *shim = cranelift_emit_shim((uintptr_t)new_code, ret_addr);

@@ -4,17 +4,24 @@
 //! These offsets MUST match `include/exec/tlb-common.h`. The
 //! `tlb_fast_path_layout_check` C-side build assertion catches drift.
 
+/* CPUTLBEntry layout (see include/exec/tlb-common.h):
+ *   struct { uintptr_t addr_read, addr_write, addr_code, addend; };
+ * uintptr_t == host pointer width. Cranelift is gated to aarch64
+ * Android (64-bit host), so each field is 8 bytes and the next field
+ * starts 8 bytes later. The C-side QEMU_BUILD_BUG_ONs in
+ * accel/tcg/cputlb.c:109-114 pin the addr_{read,write,code} positions
+ * to MMU_{DATA_LOAD,DATA_STORE,INST_FETCH} * sizeof(uintptr_t). */
 /// Offset of `addr_read` inside a CPUTLBEntry.
 pub const TLB_ENTRY_ADDR_READ: u32 = 0;
 /// Offset of `addr_write` inside a CPUTLBEntry.
-pub const TLB_ENTRY_ADDR_WRITE: u32 = 4;
+pub const TLB_ENTRY_ADDR_WRITE: u32 = 8;
 /// Offset of `addr_code` inside a CPUTLBEntry.
-pub const TLB_ENTRY_ADDR_CODE: u32 = 8;
+pub const TLB_ENTRY_ADDR_CODE: u32 = 16;
 /// Offset of `addend` (host pointer to guest mem) inside a CPUTLBEntry.
-/// Native pointer size on host - we always emit the load with a host
-/// pointer width.
-pub const TLB_ENTRY_ADDEND: u32 = 16;
-/// Size of a single CPUTLBEntry in bytes.
+/// Was previously 16, which silently read `addr_code` and used it as
+/// the addend — guaranteed wild host_ptr on every fast-path hit.
+pub const TLB_ENTRY_ADDEND: u32 = 24;
+/// Size of a single CPUTLBEntry in bytes (1 << CPU_TLB_ENTRY_BITS).
 pub const TLB_ENTRY_SIZE: u32 = 32;
 
 /// Bits that mark a TLB entry as needing the slow path.

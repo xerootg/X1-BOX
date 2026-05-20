@@ -88,14 +88,21 @@ static void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         qatomic_set(&d->regs[addr], val);
         qemu_cond_broadcast(&d->cond);
         break;
-    case NV_PAPU_FEMEMDATA:
+    case NV_PAPU_FEMEMDATA: {
         /* 'magic write'
          * This value is expected to be written to FEMEMADDR on completion of
          * something to do with notifies. Just do it now :/ */
-        stl_le_phys(&address_space_memory, d->regs[NV_PAPU_FEMEMADDR], val);
+        hwaddr femem_addr = d->regs[NV_PAPU_FEMEMADDR];
+        if (likely(femem_addr + 4 <= d->ram_size)) {
+            stl_le_p(d->ram_ptr + femem_addr, val);
+            memory_region_set_dirty(d->ram, femem_addr, 4);
+        } else {
+            stl_le_phys(&address_space_memory, femem_addr, val);
+        }
         // fprintf(stderr, "MAGIC WRITE\n");
         qatomic_set(&d->regs[addr], val);
         break;
+    }
     default:
         if (addr < 0x20000) {
             qatomic_set(&d->regs[addr], val);

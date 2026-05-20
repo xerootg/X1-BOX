@@ -35,7 +35,10 @@ use cranelift_codegen::isa::CallConv;
 
 use crate::ir::DecodedOp;
 use crate::opc::TcgType;
-use crate::tlb::{memop_flags, MemOpSize, TARGET_PAGE_MASK, TLB_ENTRY_ADDEND};
+use crate::tlb::{
+    memop_flags, MemOpSize, TARGET_PAGE_MASK, TLB_ENTRY_ADDEND, TLB_ENTRY_ADDR_READ,
+    TLB_ENTRY_ADDR_WRITE,
+};
 use crate::translator::{Lowering, TransError};
 
 fn type_for_size(size: MemOpSize) -> Type {
@@ -76,17 +79,10 @@ fn decode_memop(raw: u32) -> Memop {
     }
 }
 
-/// Offsets within `CPUTLBEntry` (from include/exec/tlb-common.h).
-///
-/// Layout for 64-bit host:
-///   0:  addr_read   (uintptr_t)
-///   8:  addr_write  (uintptr_t)
-///   16: addr_code   (uintptr_t)
-///   24: addend      (uintptr_t)
-const TLB_ENTRY_ADDR_READ: i32 = 0;
-const TLB_ENTRY_ADDR_WRITE: i32 = 8;
-#[allow(dead_code)]
-const TLB_ENTRY_ADDR_CODE: i32 = 16;
+/* TLB entry field offsets come from crate::tlb (the single source of
+ * truth). Earlier hand-redefined constants drifted from tlb.rs and
+ * loaded `addr_code` as the addend — which is exactly the "subtly
+ * wrong addresses" bug noted in the previous lower_load comment. */
 const TLB_ENTRY_ADDEND_64: i32 = TLB_ENTRY_ADDEND as i32;
 
 /// `CPUTLBDescFast` layout (include/exec/tlb-common.h):
@@ -128,12 +124,21 @@ fn emit_tlb_fastpath(
     let env = l.env_val;
     let host_ptr_ty = l.host_ptr_ty;
 
-    // Compute env-relative offset of CPUTLBDescFast.f[mmu_idx]. The
-    // C side publishes `tlb_offset` as the absolute value of the
-    // negative offset to .f[NB_MMU_MODES-1-0]. For mmu_idx 0 we
-    // subtract; for higher idx we move forward by the stride.
+    // Compute env-relative offset of CPUTLBDescFast.f[fi] where
+    // fi = NB_MMU_MODES - 1 - mmu_idx (see mmuidx_to_fast_index in
+    // include/hw/core/cpu.h:625). The C side publishes the absolute
+    // value of the negative offset to f[NB_MMU_MODES-1] (i.e. mmu_idx=0,
+    // closest to env, smallest magnitude). Higher mmu_idx values map
+    // to f[NB_MMU_MODES-1-k] which sits k*STRIDE bytes EARLIER in the
+    // struct — so f_off moves MORE negative as mmu_idx increases.
+    //
+    // Previous code added the stride instead of subtracting, so any
+    // mmu_idx != 0 loaded mask/table from the wrong field of env and
+    // the fast-path host_ptr came out wild — that's the SIGSEGV we hit
+    // on the first enablement attempt (Xbox runs in ring 0 with
+    // MMU_KNOSMAP_IDX = 2 so practically every access has mmu_idx > 0).
     let base_neg = -(l.env.tlb_offset as i32);
-    let f_off = base_neg + (mmu_idx as i32) * TLB_DESC_FAST_STRIDE;
+    let f_off = base_neg - (mmu_idx as i32) * TLB_DESC_FAST_STRIDE;
 
     // Load mask and table. They live consecutively, so we issue two
     // loads from the same base; Cranelift's regalloc will coalesce.
@@ -162,7 +167,11 @@ fn emit_tlb_fastpath(
     let entry = l.builder.ins().iadd(table, idx_bytes);
 
     // Compare tag.
-    let tag_off = if write { TLB_ENTRY_ADDR_WRITE } else { TLB_ENTRY_ADDR_READ };
+    let tag_off = if write {
+        TLB_ENTRY_ADDR_WRITE as i32
+    } else {
+        TLB_ENTRY_ADDR_READ as i32
+    };
     let tag = l
         .builder
         .ins()
@@ -219,36 +228,39 @@ fn st_helper_sig(val_ty: Type) -> Signature {
 }
 
 pub(crate) fn lower_load(
-    _l: &mut Lowering<'_, '_>,
-    _op: &DecodedOp,
-    _is_pair: bool,
+    l: &mut Lowering<'_, '_>,
+    op: &DecodedOp,
+    is_pair: bool,
 ) -> Result<(), TransError> {
-    // Bail on every guest memory load. The TLB fast-path + helper
-    // slow-path produced subtly wrong addresses (retaddr=0 + missing
-    // unwind info crashed the helper). Until we have a verified
-    // slow-path we just refuse to compile TBs that touch guest mem.
-    Err(TransError::UnsupportedOp(crate::opc::Opc::QemuLd as u16))
-    /* old body kept below, dead code:
-    let addr_temp = op.iarg(0);
-    let guest_addr = l.read_temp(addr_temp, TcgType::I64)?;
-    let memop_raw = op.carg(0) as u32;
-    let memop = decode_memop(memop_raw);
-
-    let helper_ptr = l
-        .helpers
-        .ld_helper(memop.memop)
-        .ok_or(TransError::UnsupportedOp(crate::opc::Opc::QemuLd as u16))?;
-    */
+    lower_load_with_helper(l, op, is_pair)
 }
 
-#[allow(dead_code)]
 fn lower_load_with_helper(
     l: &mut Lowering<'_, '_>,
     op: &DecodedOp,
     is_pair: bool,
 ) -> Result<(), TransError> {
-    let addr_temp = op.iarg(0);
-    let guest_addr = l.read_temp(addr_temp, TcgType::I64)?;
+    /* MUST use read_iarg, NOT read_temp(op.iarg(0), ...). When TCG
+     * folds the address into a TEMP_CONST (common for constant-address
+     * loads from BIOS data, IDT, etc.), the const value sits in args[0]
+     * and read_temp would interpret it as a temp index — seeding a
+     * fresh local Variable with 0. */
+    let guest_addr_raw = l.read_iarg(op, 0, TcgType::I64)?;
+    /* For x86-32 guest, TCG stores TEMP_CONST.val as int64_t and
+     * sign-extends a 32-bit address whose top bit is set (kernel
+     * addresses like 0x80000000+) into 0xffffffff_xxxxxxxx. The
+     * softmmu helper does `(uint32_t)addr` so the value LOOKS right
+     * inside the helper, but QEMU's TLB index calc and downstream
+     * dirty/IO logic use the full uintptr_t, mapping into wrong host
+     * memory and quietly corrupting env state. Mask to guest pointer
+     * width so the helper sees a clean zero-extended address. */
+    let guest_addr = if l.env.guest_ptr_size == 4 {
+        l.builder
+            .ins()
+            .band_imm(guest_addr_raw, 0xFFFF_FFFFu32 as i64)
+    } else {
+        guest_addr_raw
+    };
     let memop_raw = op.carg(0) as u32;
     let memop = decode_memop(memop_raw);
 
@@ -352,25 +364,30 @@ fn lower_load_with_helper(
 }
 
 pub(crate) fn lower_store(
-    _l: &mut Lowering<'_, '_>,
-    _op: &DecodedOp,
-    _is_pair: bool,
+    l: &mut Lowering<'_, '_>,
+    op: &DecodedOp,
+    is_pair: bool,
 ) -> Result<(), TransError> {
-    // Same rationale as lower_load: bail to tier-1 on any guest store
-    // until the slow-path helper ABI is verified end-to-end.
-    Err(TransError::UnsupportedOp(crate::opc::Opc::QemuSt as u16))
+    lower_store_with_helper(l, op, is_pair)
 }
 
-#[allow(dead_code)]
 fn lower_store_with_helper(
     l: &mut Lowering<'_, '_>,
     op: &DecodedOp,
     is_pair: bool,
 ) -> Result<(), TransError> {
-    let val_temp = op.iarg(0);
-    let addr_temp = if is_pair { op.iarg(2) } else { op.iarg(1) };
-    let val = l.read_temp(val_temp, op.ty)?;
-    let guest_addr = l.read_temp(addr_temp, TcgType::I64)?;
+    /* See lower_load_with_helper for why read_iarg is mandatory AND
+     * why the guest address must be masked to guest_ptr_size. */
+    let val = l.read_iarg(op, 0, op.ty)?;
+    let addr_pos = if is_pair { 2 } else { 1 };
+    let guest_addr_raw = l.read_iarg(op, addr_pos, TcgType::I64)?;
+    let guest_addr = if l.env.guest_ptr_size == 4 {
+        l.builder
+            .ins()
+            .band_imm(guest_addr_raw, 0xFFFF_FFFFu32 as i64)
+    } else {
+        guest_addr_raw
+    };
     let memop_raw = op.carg(0) as u32;
     let memop = decode_memop(memop_raw);
 

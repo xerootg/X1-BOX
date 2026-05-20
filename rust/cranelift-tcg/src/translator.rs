@@ -160,6 +160,49 @@ impl Translator {
          * tree intact, so this filter is no longer needed.
          */
 
+        /*
+         * STI-shadow filter (re-added 2026-05-19): the STI-shadow
+         * semantics issue described at the top of this function is
+         * still real. With lower_load/lower_store enabled the Xbox
+         * kernel post-STI TB compiles in tier-2 (which doesn't chain),
+         * the interrupt-inhibit shadow stretches across the dispatcher
+         * loop forever, and kernel polling loops like the wait-for-bit
+         * pattern at 0x8004edd3 never get interrupted.
+         *
+         * Detect via writes to env+offsetof(CPUX86State, hflags). x86
+         * doesn't declare hflags as a TCG global (translate.c only
+         * declares regs, eip, cc_op/dst/src/src2, df), so we derive
+         * its offset from cc_op which IS a global and sits exactly 8
+         * bytes earlier in the struct (see target/i386/cpu.h
+         * lines 1850 through 1866). Earlier the filter pattern-matched
+         * the AND immediate 0xFFFFFFF7 but TCG rewrites that to andc
+         * with 0x8 so the constant-match missed it. Offset-based
+         * detection is robust.
+         */
+        let hflags_offset: Option<u32> = self
+            .env
+            .globals
+            .iter()
+            .find(|g| g.name == "cc_op")
+            .map(|g| g.offset + 8);
+        if let Some(hf_off) = hflags_offset {
+            for op in &snap.ops {
+                use crate::opc::{Op, Opc};
+                if !matches!(
+                    op.op,
+                    Op::Known(Opc::St | Opc::St32 | Opc::St16 | Opc::St8)
+                ) {
+                    continue;
+                }
+                if op.nb_cargs == 0 {
+                    continue;
+                }
+                if (op.carg(0) as u32) == hf_off {
+                    return Err(TransError::UnsupportedOp(op.op.raw()));
+                }
+            }
+        }
+
         let name = format!("tb_{tb_pc:016x}");
         let host_ptr_ty = self.host_ptr_ty;
 

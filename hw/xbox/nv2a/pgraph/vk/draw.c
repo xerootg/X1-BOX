@@ -5626,6 +5626,18 @@ static void sync_vertex_ram_buffer(PGRAPHState *pg)
         DirtyMemoryBlocks *blocks =
             qatomic_rcu_read(&ram_list.dirty_memory[DIRTY_MEMORY_NV2A]);
 
+        /* tlb_reset_dirty walks the entire CPU TLB (all MMU modes + victim
+         * TLB) per call, independent of the requested range length, so N
+         * per-range physical_memory_dirty_bits_cleared() calls = N full TLB
+         * walks (~10% of one core / draw on Halo 2 menus). Pass 1 clears
+         * bitmap bits and tracks the union of dirty ranges; pass 2 issues
+         * one TLB reset over that union, then memcpies the data. The window
+         * between bitmap-clear and TLB-reset where a vCPU write could be
+         * missed is no worse than the existing per-range pattern. */
+        bool dirty_flags[ARRAY_SIZE(merged)] = {0};
+        hwaddr cleared_lo = (hwaddr)-1;
+        hwaddr cleared_hi = 0;
+
         for (int i = 0; i < num_syncs; i++) {
             hwaddr addr = merged[i].addr;
             VkDeviceSize size = merged[i].size;
@@ -5648,13 +5660,32 @@ static void sync_vertex_ram_buffer(PGRAPHState *pg)
             }
 
             if (dirty) {
-                NV2A_VK_DPRINTF("Memory dirty. Synchronizing...");
-                physical_memory_dirty_bits_cleared(start, size);
-                vw->dirty_count++;
-                vw->bytes_copied += size;
-                pgraph_vk_update_vertex_ram_buffer(pg, addr,
-                                                   d->vram_ptr + addr, size);
+                dirty_flags[i] = true;
+                if (start < cleared_lo) {
+                    cleared_lo = start;
+                }
+                if (start + size > cleared_hi) {
+                    cleared_hi = start + size;
+                }
             }
+        }
+
+        if (cleared_hi > cleared_lo) {
+            physical_memory_dirty_bits_cleared(cleared_lo,
+                                               cleared_hi - cleared_lo);
+        }
+
+        for (int i = 0; i < num_syncs; i++) {
+            if (!dirty_flags[i]) {
+                continue;
+            }
+            hwaddr addr = merged[i].addr;
+            VkDeviceSize size = merged[i].size;
+            NV2A_VK_DPRINTF("Memory dirty. Synchronizing...");
+            vw->dirty_count++;
+            vw->bytes_copied += size;
+            pgraph_vk_update_vertex_ram_buffer(pg, addr,
+                                               d->vram_ptr + addr, size);
         }
     }
 

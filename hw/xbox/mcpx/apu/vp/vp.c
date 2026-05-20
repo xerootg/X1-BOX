@@ -67,6 +67,43 @@ static inline uint8_t mcpx_ram_ldub(MCPXAPUState *d, hwaddr addr)
     return ldub_phys(&address_space_memory, addr);
 }
 
+/* Write fast-paths. Mirror the load helpers above so voice register RMW and
+ * notifier writes avoid address_space_st*_internal -> invalidate_and_set_dirty,
+ * which dominated the voice worker profile via physical_memory_all_dirty's
+ * bitmap walk. Same pattern as scatter_gather_rw() in dsp/gp_ep.c:
+ * direct host store plus memory_region_set_dirty (which uses
+ * DIRTY_CLIENTS_NOCODE and skips the range-clean scan + TB invalidation).
+ */
+static inline void mcpx_ram_stl_le(MCPXAPUState *d, hwaddr addr, uint32_t val)
+{
+    if (likely(addr + 4 <= d->ram_size)) {
+        stl_le_p(d->ram_ptr + addr, val);
+        memory_region_set_dirty(d->ram, addr, 4);
+        return;
+    }
+    stl_le_phys(&address_space_memory, addr, val);
+}
+
+static inline void mcpx_ram_stw_le(MCPXAPUState *d, hwaddr addr, uint16_t val)
+{
+    if (likely(addr + 2 <= d->ram_size)) {
+        stw_le_p(d->ram_ptr + addr, val);
+        memory_region_set_dirty(d->ram, addr, 2);
+        return;
+    }
+    stw_le_phys(&address_space_memory, addr, val);
+}
+
+static inline void mcpx_ram_stb(MCPXAPUState *d, hwaddr addr, uint8_t val)
+{
+    if (likely(addr + 1 <= d->ram_size)) {
+        *(d->ram_ptr + addr) = val;
+        memory_region_set_dirty(d->ram, addr, 1);
+        return;
+    }
+    stb_phys(&address_space_memory, addr, val);
+}
+
 static const struct {
     hwaddr top, current, next;
 } voice_list_regs[] = {
@@ -85,11 +122,11 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 
     // FIXME: Check notify enable
     // FIXME: Set NV1BA0_NOTIFICATION_STATUS_IN_PROGRESS when appropriate
-    stb_phys(&address_space_memory, notify_offset, status);
+    mcpx_ram_stb(d, notify_offset, status);
 
     // FIXME: Refactor this out of here
     // FIXME: Actually provied current envelope state
-    stb_phys(&address_space_memory, notify_offset - 1, 1);
+    mcpx_ram_stb(d, notify_offset - 1, 1);
 
     qatomic_or(&d->regs[NV_PAPU_ISTS],
               NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
@@ -155,8 +192,8 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
     hwaddr voice = d->regs[NV_PAPU_VPVADDR]
                     + voice_handle * NV_PAVS_SIZE;
     uint32_t v = mcpx_ram_ldl_le(d, voice + offset) & ~mask;
-    stl_le_phys(&address_space_memory, voice + offset,
-                v | ((val << ctz32(mask)) & mask));
+    mcpx_ram_stl_le(d, voice + offset,
+                    v | ((val << ctz32(mask)) & mask));
 }
 
 static void voice_off(MCPXAPUState *d, uint16_t v)
@@ -487,9 +524,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         // handle range (or that is also wrong)
         hwaddr sge_address =
             d->regs[NV_PAPU_VPSGEADDR] + d->vp.inbuf_sge_handle * 8;
-        stl_le_phys(&address_space_memory, sge_address,
-                    argument &
-                        NV1BA0_PIO_SET_CURRENT_INBUF_SGE_OFFSET_PARAMETER);
+        mcpx_ram_stl_le(d, sge_address,
+                        argument &
+                            NV1BA0_PIO_SET_CURRENT_INBUF_SGE_OFFSET_PARAMETER);
         DPRINTF("Wrote inbuf SGE[0x%X] = 0x%08X\n", d->vp.inbuf_sge_handle,
                 argument & NV1BA0_PIO_SET_CURRENT_INBUF_SGE_OFFSET_PARAMETER);
         break;
@@ -523,9 +560,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         // But how does it know which outbuf is being written?!
         hwaddr sge_address =
             d->regs[NV_PAPU_VPSGEADDR] + d->vp.outbuf_sge_handle * 8;
-        stl_le_phys(&address_space_memory, sge_address,
-                    argument &
-                        NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET_PARAMETER);
+        mcpx_ram_stl_le(d, sge_address,
+                        argument &
+                            NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET_PARAMETER);
         DPRINTF("Wrote outbuf SGE[0x%X] = 0x%08X\n", d->vp.outbuf_sge_handle,
                 argument & NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET_PARAMETER);
         break;
@@ -574,7 +611,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR]
                       + (d->vp.ssl_base_page * 8)
                       + (method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET);
-        stl_le_phys(&address_space_memory, addr, argument);
+        mcpx_ram_stl_le(d, addr, argument);
         DPRINTF("  ssl_segment[%x + %x].%s = %x\n",
             d->vp.ssl_base_page,
             (method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET)/8,

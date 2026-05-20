@@ -19,6 +19,7 @@
 
 #include "renderer.h"
 #include "debug.h"
+#include "hw/xbox/nv2a/debug.h"
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -50,10 +51,21 @@ void nv2a_dbg_request_emulator_quit(void)
     qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
 }
 
+/* Runtime gate: even though the driver advertises VK_EXT_debug_utils, no
+ * consumer is attached unless the user triggers a diagnostic frame capture.
+ * Emitting markers anyway burned ~half of pgraph.vk.render's CPU on Android
+ * via the per-call vasprintf -> malloc/printf/free cycle (see profile in
+ * project_halo2_audio_sync_bottleneck investigation thread). diag_frame_active
+ * flips only at frame boundaries, so it's stable within any command-buffer
+ * building sequence, and debug_skipped_depth keeps begin/end balanced across
+ * frame edges. */
 void pgraph_vk_insert_debug_marker(PGRAPHVkState *r, VkCommandBuffer cmd,
                                    float color[4], const char *format, ...)
 {
     if (!r->debug_utils_extension_enabled) {
+        return;
+    }
+    if (likely(!nv2a_dbg_diag_frame_active())) {
         return;
     }
 
@@ -80,6 +92,10 @@ void pgraph_vk_begin_debug_marker(PGRAPHVkState *r, VkCommandBuffer cmd,
     if (!r->debug_utils_extension_enabled) {
         return;
     }
+    if (likely(!nv2a_dbg_diag_frame_active())) {
+        r->debug_skipped_depth += 1;
+        return;
+    }
 
     char *buf = NULL;
 
@@ -104,6 +120,10 @@ void pgraph_vk_begin_debug_marker(PGRAPHVkState *r, VkCommandBuffer cmd,
 void pgraph_vk_end_debug_marker(PGRAPHVkState *r, VkCommandBuffer cmd)
 {
     if (!r->debug_utils_extension_enabled) {
+        return;
+    }
+    if (r->debug_skipped_depth > 0) {
+        r->debug_skipped_depth -= 1;
         return;
     }
 

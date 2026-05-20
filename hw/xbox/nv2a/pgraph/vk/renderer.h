@@ -969,6 +969,7 @@ typedef struct PGRAPHVkState {
     VkInstance instance;
     VkDebugUtilsMessengerEXT debug_messenger;
     int debug_depth;
+    int debug_skipped_depth;
 
     bool debug_utils_extension_enabled;
     bool custom_border_color_extension_enabled;
