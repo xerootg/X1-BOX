@@ -114,6 +114,14 @@ typedef struct CraneliftTcgEnvDesc {
      * Pass 0 to disable chain dispatch (lowering falls back to a plain
      * return-to-dispatcher). */
     uintptr_t chain_continue_fn;
+    /* Address of `helper_lookup_tb_ptr` (accel/tcg/cpu-exec.c). The
+     * frontend always emits this helper immediately before `goto_ptr`
+     * (see tcg_gen_lookup_and_goto_ptr). Tier-2 lowering of goto_ptr
+     * routes back through cranelift_chain_continue, which re-does the
+     * lookup itself by env->eip -- so the helper call is dead work in
+     * tier-2 TBs. The translator pattern-matches against this address
+     * to elide the redundant call. Pass 0 to disable the elision. */
+    uintptr_t lookup_tb_ptr_fn;
 } CraneliftTcgEnvDesc;
 
 /* ------------------------------------------------------------------ */
@@ -235,6 +243,14 @@ void cranelift_tcg_get_stats(const CraneliftTcgContext *ctx,
 
 /* Reset all counters (for benchmarking). */
 void cranelift_tcg_reset_stats(CraneliftTcgContext *ctx);
+
+/*
+ * Drop all cached tier-2 entries. Called from the QEMU bridge after a
+ * tb_flush, where every previously-cached TranslationBlock pointer has
+ * just been freed back to the allocator and will alias new, unrelated
+ * TBs. The worker keeps running and will accept new enqueues.
+ */
+void cranelift_tcg_reset_entries(CraneliftTcgContext *ctx);
 
 #ifdef __cplusplus
 } /* extern "C" */

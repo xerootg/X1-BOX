@@ -183,6 +183,17 @@ impl JitContext {
         self.entries.read().get(&pc).cloned()
     }
 
+    /// Drop every cached tier-2 entry. Called from the C bridge on a
+    /// QEMU `tb_flush` because all keys (TranslationBlock pointers) are
+    /// about to alias completely different guest TBs.
+    pub fn reset_entries(&self) {
+        let mut entries = self.entries.write();
+        let mut lru = self.lru.lock();
+        entries.clear();
+        lru.clear();
+        self.stats.active_entries.store(0, Ordering::Relaxed);
+    }
+
     pub fn shutdown(&self) {
         if let Some(dispatcher) = self.dispatcher.lock().take() {
             dispatcher.shutdown();

@@ -742,7 +742,23 @@ uintptr_t cranelift_chain_continue(CPUArchState *env)
     CPUState *cpu = env_cpu(env);
     cranelift_in_chain = true;
     uintptr_t ret = 0;
-    while (true) {
+    /*
+     * Iteration cap. Without this, an inner game loop translated as a
+     * chain of tier-2 TBs with no interrupt/exit reason can run for
+     * thousands of dispatches in a single helper call. That holds BQL
+     * the whole time and skips the dispatcher's tier-1 promotion,
+     * jump-link, and clock-align bookkeeping. The audio render and
+     * pgraph_vk threads can't reliably preempt the vCPU, which
+     * manifests as bursty frame timing -- a flurry of work, then a
+     * pause while other threads catch up.
+     *
+     * 64 chains is enough to amortise the dispatcher round-trip but
+     * short enough that the rest of the system gets a regular
+     * heartbeat.
+     */
+    const unsigned CHAIN_MAX = 64;
+    unsigned iters = 0;
+    while (iters++ < CHAIN_MAX) {
         if (qatomic_read(&cpu->exit_request)) {
             break;
         }

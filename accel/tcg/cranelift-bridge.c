@@ -56,13 +56,20 @@ static bool   g_cranelift_init_failed;
 uintptr_t cranelift_g_tb_ret_addr;
 
 /*
+ * Forward decl. The symbol is defined in accel/tcg/cpu-exec.c via the
+ * HELPER(lookup_tb_ptr) macro; we only need its address to publish via
+ * EnvDesc, so any prototype with the right linkage suffices.
+ */
+extern const void *helper_lookup_tb_ptr(CPUArchState *env);
+
+/*
  * Tier-2 promotion threshold. The TCG-side exec_count saturates at
  * 2*TB_TIER1_THRESHOLD (= 128 by default), so this must be <= 128 to
  * trip at all. We use a low floor: any TB that survives long enough
  * to reach tier-1 already cost us a tier-1 retranslation, so paying
  * the Cranelift cost too is worthwhile.
  */
-static uint32_t g_tier2_threshold = 32;
+uint32_t cranelift_bridge_g_tier2_threshold = 32;
 
 /*
  * Master switch for installing Cranelift-compiled shims into the TB
@@ -351,6 +358,7 @@ static void cranelift_bridge_lazy_init(void)
         .guest_ptr_size    = guest_ptr_size,
         .host_ptr_size     = sizeof(void *),
         .chain_continue_fn = (uintptr_t)&cranelift_chain_continue,
+        .lookup_tb_ptr_fn  = (uintptr_t)&helper_lookup_tb_ptr,
     };
 
     g_cranelift_ctx = cranelift_tcg_init(&env);
@@ -369,7 +377,7 @@ static void cranelift_bridge_lazy_init(void)
     g_env_globals_tuples = tuples;
     g_env_name_pool      = pool;
 
-    cranelift_tcg_set_hot_threshold(g_cranelift_ctx, g_tier2_threshold);
+    cranelift_tcg_set_hot_threshold(g_cranelift_ctx, cranelift_bridge_g_tier2_threshold);
     cranelift_publish_helpers();
 
     /* Install-swap toggle. Default ON. Set X1BOX_CRANELIFT_SWAP=0 to
@@ -389,7 +397,7 @@ static void cranelift_bridge_lazy_init(void)
            "tlb_abs_ofs=0x%x pc_offset=0x%x nb_globals=%u "
            "guest_ptr=%u threshold=%u swap_install=%s",
            env_size, tlb_ofs, pc_off, nb, guest_ptr_size,
-           g_tier2_threshold, swap_on ? "ON" : "OFF");
+           cranelift_bridge_g_tier2_threshold, swap_on ? "ON" : "OFF");
 }
 
 /* Public toggle (matches the X1BOX_CRANELIFT_SWAP env var at init). */
@@ -643,7 +651,7 @@ bool cranelift_bridge_tb_should_promote(const TranslationBlock *tb)
     /* Hot enough? The exec_count saturates at 2 * TB_TIER1_THRESHOLD
      * (128) so the gate is generous - any block that runs for ~half a
      * second of guest time is a candidate. */
-    if (tb->exec_count < g_tier2_threshold) {
+    if (tb->exec_count < cranelift_bridge_g_tier2_threshold) {
         return false;
     }
     return true;
@@ -699,19 +707,14 @@ void cranelift_bridge_enqueue(TCGContext *s,
 
 /*
  * Called from the cpu_exec_loop hot path when a TB's exec_count
- * crosses g_tier2_threshold. Looks up the previously-stashed IR
+ * crosses cranelift_bridge_g_tier2_threshold. Looks up the previously-stashed IR
  * snapshot and hands it to the Cranelift worker thread. Idempotent:
  * the snapshot is marked enqueued after the first call, so repeated
  * hot-path invocations are O(1) no-ops.
  */
-void cranelift_bridge_maybe_compile(TranslationBlock *tb)
+void cranelift_bridge_maybe_compile_slow(TranslationBlock *tb)
 {
-    if (tb->tier >= 2) {
-        return;     /* shim already installed */
-    }
-    if (tb->exec_count < g_tier2_threshold) {
-        return;
-    }
+    /* Inline wrapper has already gated on tb->tier and exec_count. */
 
     cranelift_bridge_lazy_init();
     if (!g_cranelift_initialised) {
@@ -769,8 +772,8 @@ typedef struct PendingSwap {
 
 #define PENDING_SWAP_RING 64
 static PendingSwap pending_ring[PENDING_SWAP_RING];
-static unsigned pending_head;  /* producer */
-static unsigned pending_tail;  /* consumer */
+unsigned cranelift_bridge_g_pending_head;  /* producer */
+unsigned cranelift_bridge_g_pending_tail;  /* consumer */
 
 static QemuMutex pending_ring_mutex;
 static bool pending_ring_mutex_inited;
@@ -795,15 +798,15 @@ void cranelift_bridge_drain(void)
     while (cranelift_tcg_poll_result(g_cranelift_ctx,
                                      &tb_pc, &code, &size)) {
         qemu_mutex_lock(&pending_ring_mutex);
-        unsigned next = (pending_head + 1) % PENDING_SWAP_RING;
-        if (next == pending_tail) {
+        unsigned next = (cranelift_bridge_g_pending_head + 1) % PENDING_SWAP_RING;
+        if (next == cranelift_bridge_g_pending_tail) {
             /* Ring full - drop oldest. */
-            pending_tail = (pending_tail + 1) % PENDING_SWAP_RING;
+            cranelift_bridge_g_pending_tail = (cranelift_bridge_g_pending_tail + 1) % PENDING_SWAP_RING;
         }
-        pending_ring[pending_head].tb_pc = tb_pc;
-        pending_ring[pending_head].code  = code;
-        pending_ring[pending_head].size  = size;
-        pending_head = next;
+        pending_ring[cranelift_bridge_g_pending_head].tb_pc = tb_pc;
+        pending_ring[cranelift_bridge_g_pending_head].code  = code;
+        pending_ring[cranelift_bridge_g_pending_head].size  = size;
+        cranelift_bridge_g_pending_head = next;
         qemu_mutex_unlock(&pending_ring_mutex);
     }
 }
@@ -824,7 +827,7 @@ const void *cranelift_bridge_take_pending(uint64_t tb_pc, size_t *out_size)
         return NULL;
     }
     qemu_mutex_lock(&pending_ring_mutex);
-    for (unsigned i = pending_tail; i != pending_head;
+    for (unsigned i = cranelift_bridge_g_pending_tail; i != cranelift_bridge_g_pending_head;
          i = (i + 1) % PENDING_SWAP_RING) {
         if (pending_ring[i].tb_pc == tb_pc) {
             const void *code = pending_ring[i].code;
@@ -833,12 +836,12 @@ const void *cranelift_bridge_take_pending(uint64_t tb_pc, size_t *out_size)
             }
             /* Shift remaining entries left. */
             unsigned j = i;
-            while (j != pending_head) {
+            while (j != cranelift_bridge_g_pending_head) {
                 unsigned k = (j + 1) % PENDING_SWAP_RING;
                 pending_ring[j] = pending_ring[k];
                 j = k;
             }
-            pending_head = (pending_head + PENDING_SWAP_RING - 1)
+            cranelift_bridge_g_pending_head = (cranelift_bridge_g_pending_head + PENDING_SWAP_RING - 1)
                            % PENDING_SWAP_RING;
             qemu_mutex_unlock(&pending_ring_mutex);
             return code;
@@ -1110,23 +1113,22 @@ static void *cranelift_emit_shim(uintptr_t cranelift_fn,
  * skip the swap and leave the pending entry in the ring for a later
  * retry.
  */
-void cranelift_bridge_try_swap(TranslationBlock *tb)
+void cranelift_bridge_try_swap_slow(TranslationBlock *tb)
 {
+    /*
+     * The inline wrapper has already verified tb->tier < 2 and that
+     * the pending ring isn't empty. We still need the
+     * initialised / swap-enabled / mutex-inited checks because all
+     * three can be false while the ring shows non-empty (e.g. between
+     * drain producing and init flipping the master switch off).
+     */
     if (!g_cranelift_initialised || !tb) {
         return;
     }
-    /* Master switch: refuse to install shims until explicitly
-     * enabled. Compilation, verification and telemetry still run. */
     if (!qatomic_read(&g_swap_install_enabled)) {
         return;
     }
     if (!pending_ring_mutex_inited) {
-        /* Nothing has ever been queued -> nothing to swap. */
-        return;
-    }
-
-    /* Quick lock-free check before grabbing the mutex. */
-    if (qatomic_read(&pending_head) == qatomic_read(&pending_tail)) {
         return;
     }
 
@@ -1143,19 +1145,19 @@ void cranelift_bridge_try_swap(TranslationBlock *tb)
     uint64_t    want_key = (uint64_t)(uintptr_t)tb;
 
     qemu_mutex_lock(&pending_ring_mutex);
-    for (unsigned i = pending_tail; i != pending_head;
+    for (unsigned i = cranelift_bridge_g_pending_tail; i != cranelift_bridge_g_pending_head;
          i = (i + 1) % PENDING_SWAP_RING) {
         if (pending_ring[i].tb_pc == want_key) {
             new_code = pending_ring[i].code;
             new_size = pending_ring[i].size;
             /* Shift remaining entries left (same as take_pending). */
             unsigned j = i;
-            while (j != pending_head) {
+            while (j != cranelift_bridge_g_pending_head) {
                 unsigned k = (j + 1) % PENDING_SWAP_RING;
                 pending_ring[j] = pending_ring[k];
                 j = k;
             }
-            pending_head = (pending_head + PENDING_SWAP_RING - 1)
+            cranelift_bridge_g_pending_head = (cranelift_bridge_g_pending_head + PENDING_SWAP_RING - 1)
                            % PENDING_SWAP_RING;
             break;
         }
@@ -1292,7 +1294,7 @@ void cranelift_bridge_set_verify_mode(bool enabled)
 
 void cranelift_bridge_set_threshold(uint32_t threshold)
 {
-    g_tier2_threshold = threshold;
+    cranelift_bridge_g_tier2_threshold = threshold;
     if (g_cranelift_initialised) {
         cranelift_tcg_set_hot_threshold(g_cranelift_ctx, threshold);
     }
@@ -1320,6 +1322,60 @@ void cranelift_bridge_blacklist(uint64_t pc_lo, uint64_t pc_hi)
         return;
     }
     cranelift_tcg_blacklist(g_cranelift_ctx, pc_lo, pc_hi);
+}
+
+/*
+ * Drop every tier-2 binding after a tb_flush. The TB allocator has just
+ * been reset by tcg_region_reset_all(), so every (TranslationBlock *)
+ * we have cached in the shim map is about to alias a completely
+ * different guest TB. Keeping those entries live causes cpu_tb_exec to
+ * dispatch the new TB into Cranelift code compiled for the old PC --
+ * the SS2 boot kernel-halt symptom.
+ *
+ * Caller (tb_flush) holds cpu_in_serial_context, so we don't need to
+ * fence against vCPU readers of g_shim_map. We still grab the writer
+ * mutexes for consistency with the install path.
+ */
+void cranelift_bridge_on_tb_flush(void)
+{
+    if (!g_cranelift_initialised) {
+        return;
+    }
+
+    /* Drain the pending-swap ring. Code pointers in there reference
+     * Cranelift entries whose TBs have just evaporated. */
+    if (pending_ring_mutex_inited) {
+        qemu_mutex_lock(&pending_ring_mutex);
+        cranelift_bridge_g_pending_head = 0;
+        cranelift_bridge_g_pending_tail = 0;
+        qemu_mutex_unlock(&pending_ring_mutex);
+    }
+
+    /* Zero the shim map. Open-addressing with linear probing means
+     * partial deletion would truncate probe chains; tb_flush wipes
+     * everything, so we just clear the whole table in one shot. */
+    if (g_shim_map_mutex_inited) {
+        qemu_mutex_lock(&g_shim_map_mutex);
+        memset(g_shim_map, 0, sizeof(g_shim_map));
+        qatomic_set(&g_shim_map_count, 0);
+        qemu_mutex_unlock(&g_shim_map_mutex);
+    }
+
+    /* Recycle the shim arena. Shim bytes are RWX-mmapped; we don't
+     * unmap, just reset the bump pointer so future installs reuse the
+     * same pages. Any in-flight execution of an old shim has already
+     * been serialised out by tb_flush's exclusive-context requirement. */
+    if (g_shim_mutex_inited) {
+        qemu_mutex_lock(&g_shim_mutex);
+        g_shim_used = 0;
+        qemu_mutex_unlock(&g_shim_mutex);
+    }
+
+    /* Clear the Rust-side entry cache (HashMap keyed by tb pointer)
+     * so re-translation isn't short-circuited by stale lookups. */
+    cranelift_tcg_reset_entries(g_cranelift_ctx);
+
+    CL_LOG("on_tb_flush: shim map + pending ring + arena + rust entries reset");
 }
 
 #endif /* XEMU_HAVE_CRANELIFT */

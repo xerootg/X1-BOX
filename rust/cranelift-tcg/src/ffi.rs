@@ -33,6 +33,7 @@ pub struct CraneliftTcgEnvDesc {
     pub guest_ptr_size: u32,
     pub host_ptr_size: u32,
     pub chain_continue_fn: usize,
+    pub lookup_tb_ptr_fn: usize,
 }
 
 /// Mirror of `CraneliftTcgStats` in the C header.
@@ -115,6 +116,7 @@ pub unsafe extern "C" fn cranelift_tcg_init(
                 e.guest_ptr_size,
                 e.host_ptr_size,
                 e.chain_continue_fn as u64,
+                e.lookup_tb_ptr_fn as u64,
             )
         }
     };
@@ -376,6 +378,13 @@ pub unsafe extern "C" fn cranelift_tcg_get_stats(
 pub unsafe extern "C" fn cranelift_tcg_reset_stats(handle: *mut c_void) {
     if let Some(ctx) = ctx_from_handle(handle) {
         ctx.stats.reset();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cranelift_tcg_reset_entries(handle: *mut c_void) {
+    if let Some(ctx) = ctx_from_handle(handle) {
+        ctx.reset_entries();
     }
 }
 

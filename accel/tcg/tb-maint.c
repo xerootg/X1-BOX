@@ -38,6 +38,7 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "tb-cache-hints.h"
+#include "cranelift-bridge.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/page-protection.h"
 #define runstate_is_running()  true
@@ -797,6 +798,14 @@ void tb_flush__exclusive_or_serial(void)
     tb_remove_all();
 
     tcg_region_reset_all();
+    /*
+     * The TB allocator just handed every TranslationBlock* back to the
+     * pool; any tier-2 shim keyed by those pointers would now dispatch
+     * the next user of that slot into Cranelift code compiled for the
+     * dead TB's IR. Drop the shim map / pending ring / Rust entry cache
+     * before any vCPU resumes.
+     */
+    cranelift_bridge_on_tb_flush();
     /* XXX: flush processor icache at this point if cache flush is expensive */
     qatomic_inc(&tb_ctx.tb_flush_count);
 

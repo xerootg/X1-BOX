@@ -21,6 +21,15 @@
 
 #if XEMU_HAVE_CRANELIFT
 
+/*
+ * Published by cranelift-bridge.c. The dispatch hot path consults
+ * these directly so we can short-circuit the bridge call when there's
+ * nothing for it to do, which is by far the common case.
+ */
+extern uint32_t cranelift_bridge_g_tier2_threshold;
+extern unsigned cranelift_bridge_g_pending_head;
+extern unsigned cranelift_bridge_g_pending_tail;
+
 /* Decide whether this TB has crossed the tier-2 threshold. */
 bool cranelift_bridge_tb_should_promote(const TranslationBlock *tb);
 
@@ -36,8 +45,24 @@ void cranelift_bridge_enqueue(TCGContext *s, TranslationBlock *tb);
  * Hot-path hook: if this TB has crossed the tier-2 exec threshold,
  * look up its stashed IR snapshot and hand it to the Cranelift worker.
  * Idempotent; safe to call from cpu_exec_loop on every dispatch.
+ *
+ * The inline wrapper below short-circuits the common case (TB not yet
+ * hot or already tier-2) without paying function-call overhead. The
+ * out-of-line slow path runs only when both gates would pass.
  */
-void cranelift_bridge_maybe_compile(TranslationBlock *tb);
+void cranelift_bridge_maybe_compile_slow(TranslationBlock *tb);
+
+static inline void cranelift_bridge_maybe_compile(TranslationBlock *tb)
+{
+    if (tb->tier >= 2) {
+        return;
+    }
+    if (tb->exec_count <
+        qatomic_read(&cranelift_bridge_g_tier2_threshold)) {
+        return;
+    }
+    cranelift_bridge_maybe_compile_slow(tb);
+}
 
 /* Drain completed compiles and RCU-swap them into the TB cache. */
 void cranelift_bridge_drain(void);
@@ -46,10 +71,40 @@ void cranelift_bridge_drain(void);
  * Hot-path hook: if a tier-2 compile result is pending for this TB's
  * guest PC, emit an ABI shim (SystemV -> TCG-prologue) and CAS-swap
  * tb->tc.ptr to point at the shim.  Subsequent dispatches execute the
- * Cranelift-compiled code.  Safe to call on every TB dispatch; the
- * common case (no pending swap) is a single ring read + compare.
+ * Cranelift-compiled code.  Safe to call on every TB dispatch.
+ *
+ * The inline wrapper short-circuits when the pending ring is empty or
+ * the TB is already tier-2. The slow path is reached only when work
+ * may exist; with steady-state workloads the ring is empty 99%+ of
+ * the time, so the fast path is a couple of cache-warm atomic reads.
  */
-void cranelift_bridge_try_swap(TranslationBlock *tb);
+void cranelift_bridge_try_swap_slow(TranslationBlock *tb);
+
+static inline void cranelift_bridge_try_swap(TranslationBlock *tb)
+{
+    if (tb->tier >= 2) {
+        return;
+    }
+    if (qatomic_read(&cranelift_bridge_g_pending_head) ==
+        qatomic_read(&cranelift_bridge_g_pending_tail)) {
+        return;
+    }
+    cranelift_bridge_try_swap_slow(tb);
+}
+
+/*
+ * Drop every cached tier-2 binding. MUST be called from
+ * tb_flush__exclusive_or_serial() right after tcg_region_reset_all()
+ * because that resets the TB allocator and the same TranslationBlock*
+ * pointers get handed out for entirely different guest PCs. Without
+ * this, the shim map keyed by TB pointer dispatches the new TBs into
+ * stale Cranelift code -> guest #PF -> kernel cli/hlt.
+ *
+ * Caller must hold cpu_in_serial_context (which tb_flush already
+ * asserts), so this is allowed to take internal mutexes and zero the
+ * shim map without coordinating with vCPU readers.
+ */
+void cranelift_bridge_on_tb_flush(void);
 
 /*
  * Return the installed tier-2 shim address for `tb`, or NULL if this
@@ -142,6 +197,7 @@ static inline void cranelift_bridge_blacklist(uint64_t lo, uint64_t hi)
 static inline void cranelift_bridge_log_stats(void) {}
 static inline void cranelift_bridge_set_swap_enabled(bool e) { (void)e; }
 static inline bool cranelift_bridge_is_swap_enabled(void) { return false; }
+static inline void cranelift_bridge_on_tb_flush(void) {}
 
 #endif /* XEMU_HAVE_CRANELIFT */
 

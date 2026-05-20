@@ -519,7 +519,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
     }
 
     fn lower_block(&mut self, ops: &[DecodedOp]) -> Result<(), TransError> {
-        for op in ops {
+        for (i, op) in ops.iter().enumerate() {
             if self.block_terminated {
                 // Spawn a fresh block to land in. We do NOT seal it here
                 // because future SetLabel ops may also need to jump in
@@ -549,6 +549,33 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 )
             {
                 // Not-present ops with no special handling are no-ops.
+                continue;
+            }
+            /*
+             * Pattern elision: `Call helper_lookup_tb_ptr → GotoPtr`.
+             *
+             * The x86 frontend's tcg_gen_lookup_and_goto_ptr emits this
+             * pair every time. Our GotoPtr lowering ignores the input
+             * (the host code pointer returned by the helper) and re-
+             * does the lookup via cranelift_chain_continue. That makes
+             * the helper call dead work in tier-2.
+             *
+             * Optimizer data-deps keep these two adjacent: goto_ptr
+             * reads the call's output, so reordering would break SSA.
+             * Skip the call. Its output temp is never read because
+             * GotoPtr's input is intentionally unused; if anything
+             * downstream tried to read it (it doesn't, GotoPtr ends
+             * the block) it would seed zero, also harmless.
+             *
+             * Saves one full TB lookup per chained dispatch -- helper
+             * + chain_continue was doing the QHT walk twice.
+             */
+            if matches!(op.op, Op::Known(Opc::Call))
+                && self.env.lookup_tb_ptr_fn != 0
+                && op.carg(0) == self.env.lookup_tb_ptr_fn
+                && i + 1 < ops.len()
+                && matches!(ops[i + 1].op, Op::Known(Opc::GotoPtr))
+            {
                 continue;
             }
             self.lower_op(op)?;
@@ -707,9 +734,51 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 Ok(())
             }
             GotoPtr => {
-                // We can't compile computed branches in tier-2; the
-                // dispatcher needs the helper. Punt back to tier-1.
-                Err(TransError::UnsupportedOp(opc as u16))
+                /* Computed branch (x86 `ret`, indirect `jmp`, etc.).
+                 *
+                 * The frontend has already updated env->eip to the
+                 * destination guest PC and computed a host code pointer
+                 * via `helper_lookup_tb_ptr` (whose result is goto_ptr's
+                 * input arg). We can't tail-call that pointer directly
+                 * because tier-1 TBs use the TCG-prologue ABI (env in
+                 * X19) and we're in a SystemV function (env in X0).
+                 *
+                 * Functionally identical to goto_tb's chain fallback:
+                 * return into cranelift_chain_continue, which re-looks
+                 * up the next TB by env->eip and dispatches it (with
+                 * shim substitution if it's also tier-2). The duplicate
+                 * lookup is cheap relative to the cost of bouncing the
+                 * entire TB back to tier-1 every dispatch.
+                 *
+                 * The input arg (host code pointer) is intentionally
+                 * unused; Cranelift's DCE drops the dead load. The
+                 * helper_lookup_tb_ptr call that produced it still
+                 * executes for its side effects.
+                 */
+                let chain_fn = self.env.chain_continue_fn;
+                if chain_fn != 0 {
+                    let mut sig =
+                        Signature::new(CallConv::SystemV);
+                    sig.params.push(AbiParam::new(self.host_ptr_ty));
+                    sig.returns.push(AbiParam::new(types::I64));
+                    let sig_ref = self.builder.import_signature(sig);
+                    let addr = self
+                        .builder
+                        .ins()
+                        .iconst(self.host_ptr_ty, chain_fn as i64);
+                    let inst = self.builder.ins().call_indirect(
+                        sig_ref,
+                        addr,
+                        &[self.env_val],
+                    );
+                    let ret = self.builder.inst_results(inst)[0];
+                    self.builder.ins().return_(&[ret]);
+                } else {
+                    let v = self.builder.ins().iconst(types::I64, 0);
+                    self.builder.ins().return_(&[v]);
+                }
+                self.block_terminated = true;
+                Ok(())
             }
             QemuLd | QemuLd2 => crate::memory::lower_load(self, op, opc == QemuLd2),
             QemuSt | QemuSt2 => crate::memory::lower_store(self, op, opc == QemuSt2),

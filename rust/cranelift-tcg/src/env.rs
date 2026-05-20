@@ -29,6 +29,14 @@ pub struct EnvDesc {
     /// chain dispatch is disabled and we fall back to return-to-
     /// dispatcher.
     pub chain_continue_fn: u64,
+    /// Address of `helper_lookup_tb_ptr`. The x86 frontend always emits
+    /// this helper call immediately before `goto_ptr` (see
+    /// tcg_gen_lookup_and_goto_ptr), but in tier-2 our goto_ptr
+    /// lowering re-does the TB lookup via the chain helper, so the
+    /// helper call is dead work. The translator pattern-matches the
+    /// Call carg(0) against this address to elide it. 0 disables the
+    /// elision (Call still emits, doubling the lookup cost per TB).
+    pub lookup_tb_ptr_fn: u64,
 }
 
 impl EnvDesc {
@@ -49,6 +57,7 @@ impl EnvDesc {
             host_ptr_size: 8,
             globals: Vec::new(),
             chain_continue_fn: 0,
+            lookup_tb_ptr_fn: 0,
         }
     }
 
@@ -69,6 +78,7 @@ impl EnvDesc {
         guest_ptr_size: u32,
         host_ptr_size: u32,
         chain_continue_fn: u64,
+        lookup_tb_ptr_fn: u64,
     ) -> Self {
         let mut out = Vec::with_capacity(nb_globals as usize);
         if !globals.is_null() && nb_globals > 0 {
@@ -100,6 +110,7 @@ impl EnvDesc {
             host_ptr_size,
             globals: out,
             chain_continue_fn,
+            lookup_tb_ptr_fn,
         }
     }
 }
