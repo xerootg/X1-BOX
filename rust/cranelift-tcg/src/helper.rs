@@ -22,13 +22,16 @@ use crate::ir::DecodedOp;
 use crate::opc::TcgType;
 use crate::translator::{Lowering, TransError};
 
-pub(crate) fn lower_call(_l: &mut Lowering<'_, '_>, _op: &DecodedOp) -> Result<(), TransError> {
-    // Helper calls are gated until the args/oi/retaddr layout is
-    // verified end-to-end. Bail to tier-1.
-    Err(TransError::UnsupportedOp(crate::opc::Opc::Call as u16))
+/* Lower a TCG helper call. carg(0) is the function pointer directly
+ * (see tcg/tcg-internal.h:tcg_call_func), so no TCGHelperInfo deref
+ * is needed. Args are read as i64 — almost every QEMU helper takes
+ * pointer (env, reg ptrs) or integer args. AAPCS64 reads w-register
+ * for uint32_t args, ignoring sign-extended upper halves, so the
+ * sign-ext trap that bit qemu_ld doesn't apply here. */
+pub(crate) fn lower_call(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), TransError> {
+    lower_call_impl(l, op)
 }
 
-#[allow(dead_code)]
 fn lower_call_impl(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), TransError> {
     // Helper function pointer is the first cargs entry. Some op
     // generators put a struct pointer here whose first field is the
