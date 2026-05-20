@@ -22,16 +22,30 @@ use crate::ir::DecodedOp;
 use crate::opc::TcgType;
 use crate::translator::{Lowering, TransError};
 
-/* Lower a TCG helper call. carg(0) is the function pointer directly
- * (see tcg/tcg-internal.h:tcg_call_func), so no TCGHelperInfo deref
- * is needed. Args are read as i64 — almost every QEMU helper takes
- * pointer (env, reg ptrs) or integer args. AAPCS64 reads w-register
- * for uint32_t args, ignoring sign-extended upper halves, so the
- * sign-ext trap that bit qemu_ld doesn't apply here. */
-pub(crate) fn lower_call(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), TransError> {
-    lower_call_impl(l, op)
+/* TCG helper-call lowering. lower_call_impl works mechanically (carg(0)
+ * is the func ptr per tcg_call_func, all args fit AAPCS64 integer
+ * regs) and lifts Cranelift compile success from 45% to 55%, plus
+ * Halo 2 title-screen FPS 7 -> 13 peak. BUT the generic helper-call
+ * lowering introduces audio choppiness and cutscene video stutter —
+ * timing-sensitive helpers (cc_compute_all, segment loads, MMX/SSE
+ * math) likely don't tolerate being called from a Cranelift TB the
+ * way they do from tier-1, even though the ABI marshalling itself is
+ * correct. Possible culprits to investigate before re-enabling:
+ *   - Helpers that mutate env state in ways Cranelift's globals
+ *     plumbing doesn't reload on the next op (Cranelift loads/stores
+ *     globals through env memory, so cross-call freshness should be
+ *     fine, but verify)
+ *   - Helpers expecting TCG_AREG0 (x19) to hold env via some inline
+ *     asm or hidden contract
+ *   - Helpers that longjmp via cpu_loop_exit_restore and skip our
+ *     Cranelift epilogue, leaving guest state mid-update
+ * For now bail to tier-1; the qemu_ld/qemu_st wins from the prior
+ * commit are preserved. */
+pub(crate) fn lower_call(_l: &mut Lowering<'_, '_>, _op: &DecodedOp) -> Result<(), TransError> {
+    Err(TransError::UnsupportedOp(crate::opc::Opc::Call as u16))
 }
 
+#[allow(dead_code)]
 fn lower_call_impl(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), TransError> {
     // Helper function pointer is the first cargs entry. Some op
     // generators put a struct pointer here whose first field is the
