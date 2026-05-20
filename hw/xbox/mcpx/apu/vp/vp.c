@@ -223,22 +223,7 @@ static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
         d->vp.voice_locked[v / 64] &= ~mask;
     }
     qemu_spin_unlock(&d->vp.voice_spinlocks[v]);
-    /*
-     * The only waiters on d->cond are (a) the apu_frame_thread
-     * (parked when XCNTMODE is off — register changes wake it; voice
-     * lock state doesn't gate it) and (b) callers in
-     * voice_get_samples waiting for is_voice_locked(v) to become
-     * false. Lock-acquire never advances either condition: the apu
-     * thread doesn't care, and the voice-waiters are explicitly
-     * blocked on the UNLOCK transition. Broadcasting on lock=true
-     * just wakes every futex and sends them straight back to sleep.
-     * In gameplay (Halo 2 combat) that broadcast accounts for ~3% of
-     * total CPU. Only signal on the transition that can actually
-     * release a waiter.
-     */
-    if (!lock) {
-        qemu_cond_broadcast(&d->cond);
-    }
+    qemu_cond_broadcast(&d->cond);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)

@@ -1087,40 +1087,6 @@ bool physical_memory_is_clean(ram_addr_t addr)
     return !(nv2a && nv2a_tex && vga && code && migration);
 }
 
-bool physical_memory_is_clean_for(ram_addr_t addr, uint8_t check_mask)
-{
-    /*
-     * CODE bit is always part of the check on TCG hosts — its set state
-     * is what tracks "no TB cached, future writes can skip notdirty_write
-     * for this reason". The caller passes in NOCODE-style masks (the
-     * dirty_log_mask cached on the TLB entry has CODE stripped), so OR
-     * it back in here.
-     */
-    uint8_t mask = check_mask | (1 << DIRTY_MEMORY_CODE);
-
-    if ((mask & (1 << DIRTY_MEMORY_NV2A)) &&
-        !physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_NV2A)) {
-        return true;
-    }
-    if ((mask & (1 << DIRTY_MEMORY_NV2A_TEX)) &&
-        !physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_NV2A_TEX)) {
-        return true;
-    }
-    if ((mask & (1 << DIRTY_MEMORY_VGA)) &&
-        !physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_VGA)) {
-        return true;
-    }
-    if ((mask & (1 << DIRTY_MEMORY_MIGRATION)) &&
-        !physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_MIGRATION)) {
-        return true;
-    }
-    if ((mask & (1 << DIRTY_MEMORY_CODE)) &&
-        !physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_CODE)) {
-        return true;
-    }
-    return false;
-}
-
 static bool physical_memory_all_dirty(ram_addr_t start, ram_addr_t length,
                                       unsigned client)
 {
