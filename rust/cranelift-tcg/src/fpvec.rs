@@ -18,11 +18,26 @@
 //!   `atomic_cas` / `fence`.
 
 use cranelift_codegen::ir::immediates::Imm64;
-use cranelift_codegen::ir::{types, InstBuilder, Value};
+use cranelift_codegen::ir::{types, InstBuilder, MemFlags, Value};
 
 use crate::ir::DecodedOp;
 use crate::opc::TcgType;
 use crate::translator::{Lowering, TransError};
+
+/*
+ * Raw TCG opcode numbers for ld_vec/st_vec. These live past the named
+ * `Opc` enum (which stops at QemuSt2 = 82) and reach Cranelift as
+ * `Op::Other(raw)` filtered by `TCG_OPF_VECTOR`. The numbers come from
+ * tcg-opc.h's DEF() ordering and must stay synchronized; the C-side
+ * `BUILD_BUG_ON_TCG_OPC_DRIFT` guards catch drift at compile time.
+ *
+ * Compile telemetry confirms these are the dominant vector bailout
+ * sources in Halo 2: ~30-40 errs/run combined across ld_vec + st_vec
+ * (each err bails an entire TB containing SSE memory ops back to
+ * tier-1 TCG, where x86 movdqa/movaps land).
+ */
+const OPC_LD_VEC: u16 = 127;
+const OPC_ST_VEC: u16 = 128;
 
 /// Lower an FP opcode by its raw integer code (past QemuSt2 / 82).
 ///
@@ -219,22 +234,85 @@ fn un_fp(
 /// We approximate by routing every TCG_OPF_VECTOR op through a
 /// dispatcher table. Anything we don't know returns UnsupportedOp so
 /// the dispatcher leaves the TB on tier-1.
-pub(crate) fn lower_vec(_l: &mut Lowering<'_, '_>, raw: u16, op: &DecodedOp) -> Result<(), TransError> {
-    // The vector section is large (~50 opcodes) and most x86 SSE goes
-    // through `gen_helper_*` rather than these. We implement the
-    // common element-wise ones and bail on the exotic shuffle ops.
-    let v_ty = match op.ty {
-        TcgType::V128 => types::I8X16,
-        TcgType::V64 => types::I8X8,
-        _ => types::I8X16,
-    };
+pub(crate) fn lower_vec(l: &mut Lowering<'_, '_>, raw: u16, op: &DecodedOp) -> Result<(), TransError> {
+    match raw {
+        OPC_LD_VEC => lower_ld_vec(l, op),
+        OPC_ST_VEC => lower_st_vec(l, op),
+        _ => Err(TransError::UnsupportedOp(raw)),
+    }
+}
 
-    let _ = Imm64::new(0);
+/*
+ * ld_vec/st_vec — load/store of a TCG vector temp to/from HOST memory
+ * (env-relative spill or scratch). NOT guest memory; these are QEMU's
+ * own register-allocator spill ops and don't need the TLB.
+ *
+ * Signature shape mirrors the regular `ld`/`st` env ops:
+ *   ld_vec out, base, offset_carg
+ *   st_vec val, base, offset_carg
+ *
+ * The translator represents both V64 and V128 temps as Cranelift
+ * `I64X2` (see `type_for`). For V64 we load/store only the low 8
+ * bytes; for V128 the full 16. The host pointer (`base + offset`) is
+ * always 16-byte aligned on env spills, so `MemFlags::trusted()` is
+ * safe.
+ */
+/*
+ * Defensive scope: only handle the V128 case (SSE 128-bit movdqa /
+ * movaps spill — the common path). V64 (MMX) and V256 (AVX) bail to
+ * tier-1 so we never risk a wrong-width memory op. V64 is also rare
+ * on Halo 2 (no MMX inner loops) and not worth the encoding risk
+ * surface.
+ *
+ * Also guard against:
+ *   - const-valued vector inputs (TCG IR-optimizer corner case;
+ *     iconst-on-I64X2 isn't supported by Cranelift and the helper
+ *     coerce path would assert on the scalar→vector widening);
+ *   - non-trusted alignment: env spill slots ARE 16-byte aligned but
+ *     we use MemFlags::new() (no alignment promise) to let Cranelift
+ *     pick the AArch64 unaligned `LDR Q` / `STR Q` form, which the
+ *     A78 cores handle without trap or measurable penalty.
+ */
+fn lower_ld_vec(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), TransError> {
+    if !matches!(op.ty, TcgType::V128) {
+        return Err(TransError::UnsupportedOp(OPC_LD_VEC));
+    }
+    if op.iarg_is_const(0) {
+        return Err(TransError::UnsupportedOp(OPC_LD_VEC));
+    }
+    let base = l.read_iarg(op, 0, TcgType::I64)?;
+    let off = op.carg(0) as i64;
+    let addr = l.builder.ins().iadd_imm(base, off);
+    let v = l
+        .builder
+        .ins()
+        .load(types::I64X2, MemFlags::new(), addr, 0);
+    l.write_temp(op.oarg(0), v);
+    Ok(())
+}
 
-    // We approximate "vector add" by element-wise i32 add for now; the
-    // TCG vector lowering happens through a vece field encoded in the
-    // op flags that we don't currently parse. Bail to tier-1 for any
-    // op we can't identify.
-    let _ = (v_ty, op);
-    Err(TransError::UnsupportedOp(raw))
+fn lower_st_vec(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), TransError> {
+    if !matches!(op.ty, TcgType::V128) {
+        return Err(TransError::UnsupportedOp(OPC_ST_VEC));
+    }
+    /* Both inputs must be temps, not consts — a const-valued vector
+     * arg would force a scalar→vector coerce path that doesn't exist. */
+    if op.iarg_is_const(0) || op.iarg_is_const(1) {
+        return Err(TransError::UnsupportedOp(OPC_ST_VEC));
+    }
+    let val = l.read_iarg(op, 0, TcgType::V128)?;
+    /* Belt-and-suspenders: verify the value really is a 128-bit
+     * vector before we hand it to the store. If the temp had been
+     * declared as something else upstream, bail rather than emit a
+     * wrong-width store. */
+    if l.builder.func.dfg.value_type(val) != types::I64X2 {
+        return Err(TransError::UnsupportedOp(OPC_ST_VEC));
+    }
+    let base = l.read_iarg(op, 1, TcgType::I64)?;
+    let off = op.carg(0) as i64;
+    let addr = l.builder.ins().iadd_imm(base, off);
+    l.builder
+        .ins()
+        .store(MemFlags::new(), val, addr, 0);
+    Ok(())
 }

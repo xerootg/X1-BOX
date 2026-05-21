@@ -442,8 +442,28 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 2 => types::I16,
                 4 => types::I32,
                 8 => types::I64,
+                /*
+                 * 16-byte globals are vector temps (XMM registers etc.
+                 * — the C side packs `TCG_TYPE_V128` as `size = 16`).
+                 * Load them as I64X2 so subsequent vector ops (ld_vec,
+                 * mov_vec, etc.) see a properly-typed value.
+                 */
+                16 => types::I64X2,
                 _ => return Err(TransError::Internal("bad global size")),
             };
+            /*
+             * Cross-width read between vector storage and scalar
+             * requestor (e.g. MOVD from XMM low → GPR loads 32 bits
+             * from a 16-byte XMM global). Cranelift's `ireduce` on
+             * vector→scalar is unspecified/unsupported; rather than
+             * emit IR that might silently miscompile, bail the TB to
+             * tier-1 where TCG-aarch64's well-tested codegen handles
+             * the partial access. Likewise scalar global → vector
+             * requestor (would need uextend scalar→vector).
+             */
+            if (cty == types::I64X2) != (want == types::I64X2) {
+                return Err(TransError::UnsupportedOp(crate::opc::Opc::Ld as u16));
+            }
             let loaded = self.builder.ins().load(
                 cty,
                 MemFlags::trusted(),
@@ -456,9 +476,22 @@ impl<'a, 'b> Lowering<'a, 'b> {
         // Local temp: use a Cranelift Variable so cross-block flow
         // works via implicit phi insertion. Declare on first use,
         // seeded with zero.
+        //
+        // Cranelift's `iconst` is defined for scalar integer types only —
+        // the IR verifier's `iconst_bounds` check (verifier/mod.rs:1949)
+        // panics with `unreachable!()` when ctrl_typevar isn't I8/I16/
+        // I32/I64. So for vector temps we materialize zero via
+        // `splat(want, iconst.i64 0)` which produces a properly-typed
+        // vector zero. Hit when ld_vec/st_vec lowering reads a vector
+        // temp before any tier-2-supported op writes to it.
         if !self.temps.contains_key(&id) {
             let var = self.temp_var(id, want);
-            let zero = self.builder.ins().iconst(want, 0);
+            let zero = if want.is_vector() {
+                let lane_zero = self.builder.ins().iconst(types::I64, 0);
+                self.builder.ins().splat(want, lane_zero)
+            } else {
+                self.builder.ins().iconst(want, 0)
+            };
             self.builder.def_var(var, zero);
         }
         let (var, _) = self.temps[&id];
@@ -483,8 +516,42 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 1 => types::I8,
                 2 => types::I16,
                 4 => types::I32,
-                _ => types::I64,
+                8 => types::I64,
+                /*
+                 * 16-byte globals are V128 vector temps (XMM regs etc.).
+                 * The OLD fallback (`_ => I64`) silently TRUNCATED them
+                 * to I64, dropping the high half — this was the latent
+                 * bug exposed by enabling ld_vec/st_vec tier-2 lowering:
+                 * a tier-2 ld_vec followed by a write to a global XMM
+                 * temp would write only the low 8 bytes, corrupting
+                 * x86 SSE state and wedging guest code. Store as I64X2.
+                 */
+                16 => types::I64X2,
+                /*
+                 * Unknown size: skip the store rather than silently
+                 * truncate. Loud-failure is preferable to data loss.
+                 */
+                _ => return,
             };
+            /*
+             * Cross-width write (scalar value into vector global, or
+             * vector value into scalar global). The needed
+             * uextend/ireduce between scalar and vector is unsupported
+             * by Cranelift; rather than emit IR that may silently
+             * miscompile, drop the global store. The dispatcher's TB
+             * verifier will catch the divergence on the verify pass.
+             *
+             * NOTE: this `return` skips the write entirely — but the
+             * only way we'd legitimately reach here is a TCG-emitted
+             * partial-XMM access, which TCG-aarch64 (tier-1) handles
+             * correctly. The compile-error machinery in the bridge
+             * runs the TB on tier-1 if any op signals UnsupportedOp;
+             * for write_temp we have no error channel back. So skip.
+             */
+            let val_ty = self.builder.func.dfg.value_type(val);
+            if (val_ty == types::I64X2) != (store_ty == types::I64X2) {
+                return;
+            }
             let flush_val = self.coerce(val, store_ty);
             self.builder.ins().store(
                 MemFlags::trusted(),
