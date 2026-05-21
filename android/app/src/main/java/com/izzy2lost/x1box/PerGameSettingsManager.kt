@@ -34,6 +34,7 @@ object PerGameSettingsManager {
     "draw_reorder",
     "draw_merge",
     "async_compile",
+    "frame_skip",
   )
 
   fun hasOverrides(context: Context, relativePath: String): Boolean {
