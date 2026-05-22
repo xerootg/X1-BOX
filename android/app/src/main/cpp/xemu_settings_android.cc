@@ -304,6 +304,12 @@ bool xemu_settings_load(void)
      * lands. Set X1BOX_HLE=0 to disable, or per-family
      * X1BOX_HLE_YIELD=0 / _KF=0. */
     setenv("X1BOX_HLE", "1", 0);
+    /* SSE scalar inline emit: default ON. Requires fp_jit=true (the
+     * inline gate also checks g_use_fp_jit). Worth ~1.55% TCG on Halo 2
+     * with hard FPU enabled. Set X1BOX_SSE_INLINE=0 to fall back to the
+     * helper path, or per-op X1BOX_SSE_INLINE_{ADD,SUB,MUL,DIV,SQRT,COMI}
+     * for bisection. See project_sse_scalar_inline_gated.md. */
+    setenv("X1BOX_SSE_INLINE", "1", 0);
 
     const char *path = xemu_settings_get_path();
     if (!path || *path == '\0') {
