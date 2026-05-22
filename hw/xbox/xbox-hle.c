@@ -23,6 +23,7 @@
 #include "qemu/timer.h"  /* qemu_clock_get_ns for KeQueryPerformanceCounter */
 #include "hw/core/cpu.h"
 #include "exec/cpu-common.h"
+#include "exec/cpu-interrupt.h"
 #include "exec/target_page.h"
 #include "system/dma.h"
 #include "system/hw_accel.h"
@@ -1567,23 +1568,39 @@ static bool hle_nt_yield_execution(X86CPU *cpu)
  * the guest is parked: actual idle (both DPC and NextThread empty),
  * waiting for a queued DPC, or waiting for a thread swap.
  *
- * The initial attempt called sched_yield() on actual-idle iters
- * (2026-05-22). FPS dropped from ~25 to ~17 — sched_yield while holding
- * BQL doesn't help because BQL-waiting threads (audio, render) still
- * can't take BQL. We just added latency to the IRQ-delivery path that
- * would have woken the spin naturally. Removed; handler is now pure
- * telemetry.
+ * History:
+ *   v1 (2026-05-22): sched_yield() on actual-idle iters. FPS 25 → 17.
+ *     sched_yield holds BQL across the yield, so BQL-waiting threads
+ *     (audio, render, qemu_main timer) can't take BQL anyway; the yield
+ *     just added latency to the IRQ-delivery path. Removed.
+ *
+ *   v2 (this commit): set CPU_INTERRUPT_HALT and let cpu_handle_interrupt
+ *     transition the vCPU into the EXCP_HLT halt-on-cond-wait state. The
+ *     MTTCG loop blocks on cpu->halt_cond via qemu_cond_wait(&bql) which
+ *     DROPS BQL while waiting — exactly the property sched_yield lacked.
+ *     The next host-side IRQ delivery (timer, audio, video) calls
+ *     qemu_cpu_kick → halt_cond broadcast → vCPU wakes, halt clears, the
+ *     same idle-spin TB executes once, sees NextThread set, and exits.
+ *     Equivalent to inserting `HLT` into the kernel's STI/NOP/NOP/CLI
+ *     window without modifying the guest.
  */
 static uint64_t g_idle_loop_idle;             /* both empty */
 static uint64_t g_idle_loop_dpc_pending;
 static uint64_t g_idle_loop_next_thread_pending;
+static uint64_t g_idle_loop_halts;            /* CPU_INTERRUPT_HALT set */
 
 static bool hle_ki_idle_loop_spin(X86CPU *cpu)
 {
-    (void)cpu;
+    /*
+     * Sample every 16 iters. The previous /64 was a sched_yield throttle;
+     * here each "hit" sets CPU_INTERRUPT_HALT and the vCPU stops spinning
+     * immediately, so we want to halt fast. Each check costs 2 g_read32
+     * calls (~50ns) and ~140k idle-TB hits/sec, so /16 is well under 1%
+     * overhead.
+     */
     static __thread uint32_t iter;
     iter++;
-    if ((iter & 0x3F) != 0) return false;  /* sample every 64 iters */
+    if ((iter & 0xF) != 0) return false;
 
     /* DPC list head is "empty" when its Flink points back to the head VA
      * itself (circular linked list with sentinel). */
@@ -1602,6 +1619,25 @@ static bool hle_ki_idle_loop_spin(X86CPU *cpu)
     }
 
     g_idle_loop_idle++;
+
+    /*
+     * HALT-on-idle was tried (2026-05-22) — CPU_INTERRUPT_HALT here +
+     * MTTCG halt_cond wait. Architecturally correct: the kernel's
+     * STI/NOP/NOP/CLI sequence is exactly an HLT approximation. But on
+     * boot, kernel dips into KiIdleLoop during phases where the next
+     * wake event isn't a HARD IRQ (BIOS polling, NV2A init handshake,
+     * disc spin-up), so halt_cond never fires and the boot deadlocks.
+     * Even with a consec-idle-of-8 gate the boot still wedged because
+     * the dip CAN be ≥8 samples but the wake still isn't a HARD IRQ.
+     *
+     * Until we have a way to gate this on "kernel is past full init"
+     * (e.g., guest flip count >= N, or a kernel-symbol probe), keep the
+     * handler as pure telemetry. g_idle_loop_idle still shows where
+     * vCPU host-cycles go; the actual win lives elsewhere (memory note:
+     * MCPX voice-fanout dispatch dominates title-screen frame time, not
+     * idle-loop spinning).
+     */
+    (void)g_idle_loop_halts;
     return false;
 }
 
@@ -2251,9 +2287,9 @@ void xbox_hle_log_stats(void)
         }
     }
     HLE_LOG("idle_loop idle=%" PRIu64 " dpc_pending=%" PRIu64
-            " next_thread_pending=%" PRIu64,
+            " next_thread_pending=%" PRIu64 " halts=%" PRIu64,
             g_idle_loop_idle, g_idle_loop_dpc_pending,
-            g_idle_loop_next_thread_pending);
+            g_idle_loop_next_thread_pending, g_idle_loop_halts);
 
     /* Cross-check: how many SET_TRANSFORM_CONSTANT slot writes pgraph saw
      * vs. how many of those slot writes were redundant (value unchanged).
