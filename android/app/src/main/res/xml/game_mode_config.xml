@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  GameModeManager opt-in for x1-box.
+
+  Pixel's sched_pixel governor + cgroup uclamp policy penalize sustained
+  high-CPU workloads from non-game apps via PMU-counter-driven throttle
+  (cpu7 scaling_max collapses 2914 → ~1400 MHz). Setting appCategory="game"
+  in AndroidManifest is half the fix — declaring this config so
+  `cmd game mode performance com.izzy2lost.x1box` actually engages is the
+  other half. See project_pixel_sched_underclock for the full story.
+
+  supportsPerformanceGameMode / supportsBatteryGameMode advertise to
+  GameModeManager that we'll behave correctly under those modes. We
+  decline downscaling and FPS-override because xemu manages its own
+  resolution + frame pacing.
+-->
+<game-mode-config
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:supportsPerformanceGameMode="true"
+    android:supportsBatteryGameMode="true"
+    android:allowGameDownscaling="false"
+    android:allowGameFpsOverride="false" />

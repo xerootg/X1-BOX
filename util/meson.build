@@ -20,6 +20,9 @@ if host_os != 'windows'
   endif
   util_ss.add(files('oslib-posix.c'), freebsd_dep)
   util_ss.add(files('qemu-thread-posix.c'))
+  util_ss.add(files('sched-android.c'))
+  util_ss.add(files('adpf-android.c'))
+  util_ss.add(files('android-paths.c'))
   util_ss.add(files('memfd.c'))
   util_ss.add(files('drm.c'))
 else

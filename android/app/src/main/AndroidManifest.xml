@@ -7,7 +7,18 @@
     android:roundIcon="@mipmap/ic_launcher_round"
     android:allowBackup="true"
     android:supportsRtl="true"
+    android:appCategory="game"
+    android:isGame="true"
     android:theme="@style/Theme.Xemu">
+
+    <!-- GameModeManager opt-in.  Without this resource, only "standard"
+         and "custom" modes are selectable.  Declaring it advertises that
+         we handle "performance" and "battery" modes, which lets users (and
+         per-device Pixel/Asus defaults) get the corresponding system-wide
+         perf hints.  See res/xml/game_mode_config.xml. -->
+    <meta-data
+      android:name="android.game_mode_config"
+      android:resource="@xml/game_mode_config" />
 
     <activity
       android:name=".LauncherActivity"
