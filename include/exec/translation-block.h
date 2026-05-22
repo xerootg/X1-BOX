@@ -176,7 +176,17 @@ struct TranslationBlock {
      * of that global at exit is dead.
      */
     uint8_t  cc_defines_first;
-    uint8_t  tier_pad[1];   /* Alignment padding */
+    /*
+     * 1 when this TB has an entry in the Cranelift pending_ring (set by
+     * cranelift_bridge_drain when a compile result lands; cleared by
+     * cranelift_bridge_try_swap_slow when it consumes the entry).
+     * cranelift_bridge_try_swap (inline) short-circuits when this is 0,
+     * avoiding the mutex + ring scan for the vast majority of TBs that
+     * are NOT currently pending. Without this, dropping the tier-2
+     * threshold to 8 kept the ring perpetually non-empty and pushed
+     * every TB dispatch through the slow path's mutex.
+     */
+    uint8_t  cranelift_pending;
     uint32_t chain_count[2]; /* How many times each exit was taken */
     SuperblockInfo *superblock; /* Non-NULL if this is a merged superblock */
 #endif

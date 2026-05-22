@@ -54,18 +54,20 @@ fn lower_call_impl(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), Trans
         .ins()
         .iconst(host_ptr_ty, helper_ptr as i64);
 
-    // Marshal inputs - read every iarg as an i64 (zero-extended where
-    // narrower).
+    // Marshal inputs - read every iarg as an i64.
+    //
+    // read_iarg now routes through `coerce` which handles float types
+    // correctly (bitcast → extend → bitcast), so requesting TcgType::I64
+    // gives back an I64-typed value even when the underlying temp was
+    // declared as F32/F64. The old manual `uextend(I64, v)` fallback
+    // here was the second site of the `VerifierFailed=22` bucket: when
+    // an SSE-helper arg temp was first written by an FP op, v came back
+    // as F32 and uextend rejected it. Now coerce handles that path, and
+    // we just trust the return type.
     let mut args = Vec::with_capacity(op.nb_iargs as usize);
     for i in 0..op.nb_iargs {
         let v = l.read_iarg(op, i as usize, TcgType::I64)?;
-        let v_ty = l.builder.func.dfg.value_type(v);
-        let v64 = if v_ty != types::I64 {
-            l.builder.ins().uextend(types::I64, v)
-        } else {
-            v
-        };
-        args.push(v64);
+        args.push(v);
     }
 
     let inst = l.builder.ins().call_indirect(sig_ref, addr, &args);

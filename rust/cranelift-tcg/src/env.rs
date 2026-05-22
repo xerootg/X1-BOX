@@ -37,6 +37,12 @@ pub struct EnvDesc {
     /// Call carg(0) against this address to elide it. 0 disables the
     /// elision (Call still emits, doubling the lookup cost per TB).
     pub lookup_tb_ptr_fn: u64,
+    /// Address of `cranelift_helper_flcr(uint32_t mxcsr)` — the C-side
+    /// MXCSR->FPCR translator. Tier-1 aarch64 inlines this as an MSR
+    /// FPCR sequence; Cranelift IR has no MSR primitive so we emit a
+    /// call_indirect here instead. 0 means flcr is unsupported and
+    /// the lowering returns UnsupportedOp.
+    pub flcr_fn: u64,
 }
 
 impl EnvDesc {
@@ -58,6 +64,7 @@ impl EnvDesc {
             globals: Vec::new(),
             chain_continue_fn: 0,
             lookup_tb_ptr_fn: 0,
+            flcr_fn: 0,
         }
     }
 
@@ -79,6 +86,7 @@ impl EnvDesc {
         host_ptr_size: u32,
         chain_continue_fn: u64,
         lookup_tb_ptr_fn: u64,
+        flcr_fn: u64,
     ) -> Self {
         let mut out = Vec::with_capacity(nb_globals as usize);
         if !globals.is_null() && nb_globals > 0 {
@@ -111,6 +119,7 @@ impl EnvDesc {
             globals: out,
             chain_continue_fn,
             lookup_tb_ptr_fn,
+            flcr_fn,
         }
     }
 }

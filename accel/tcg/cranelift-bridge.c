@@ -68,8 +68,16 @@ extern const void *helper_lookup_tb_ptr(CPUArchState *env);
  * trip at all. We use a low floor: any TB that survives long enough
  * to reach tier-1 already cost us a tier-1 retranslation, so paying
  * the Cranelift cost too is worthwhile.
+ *
+ * 2026-05-20: lowered default 32 → 8 after profiling showed
+ * helper_lookup_tb_ptr + qht_lookup_custom + tb_lookup_cmp at ~17.5%
+ * of CPU 0/TCG on Halo 2 in-game. The pattern-elision at
+ * translator.rs:640 already removes that helper from tier-2 TBs, so
+ * the remaining cost is dominated by tier-1 TBs that haven't crossed
+ * the threshold. Dropping to 8 promotes more TBs into tier-2 sooner.
+ * Override at runtime via X1BOX_CRANELIFT_THRESHOLD.
  */
-uint32_t cranelift_bridge_g_tier2_threshold = 32;
+uint32_t cranelift_bridge_g_tier2_threshold = 8;
 
 /*
  * Master switch for installing Cranelift-compiled shims into the TB
@@ -89,6 +97,43 @@ static bool g_swap_install_enabled;
 /* ------------------------------------------------------------------ */
 /* Initialisation                                                      */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Cranelift-side flcr (INDEX_op_flcr) implementation.
+ *
+ * The x86 frontend emits flcr from FLDCW/FNCLEX/etc. handlers; tier-1
+ * (tcg/aarch64/tcg-target.c.inc:3603) lowers it inline to:
+ *   - extract MXCSR rounding bits [14:13]
+ *   - swap the bit order (MXCSR encoding != FPCR encoding)
+ *   - shift into FPCR position [23:22]
+ *   - msr fpcr, x_tmp
+ *
+ * Cranelift IR has no MSR primitive, so tier-2 calls into this helper
+ * instead. ~3% of total Halo 2 TBs were bailing on flcr because the
+ * fpvec.rs match table had no entry for raw opcode 83. Tracking down
+ * the per-opcode err breakdown via dispatcher.rs is what surfaced it.
+ *
+ * Inline asm restricts this to aarch64; on other hosts the call is
+ * a no-op (matches the BISECT_FP_FLCR=0 tier-1 path).
+ */
+__attribute__((visibility("default")))
+void cranelift_helper_flcr(uint32_t mxcsr)
+{
+#if defined(__aarch64__)
+    /* MXCSR RC at bits [14:13]: 00=RN, 01=RD(-inf), 10=RU(+inf), 11=RZ
+     * FPCR  RC at bits [23:22]: 00=RN, 01=RU(+inf), 10=RD(-inf), 11=RZ
+     * Swap bits 0 and 1 of the RC field. RN and RZ are unchanged; RD
+     * and RU swap places. */
+    uint64_t rc = (mxcsr >> 13) & 0x3u;
+    uint64_t fpcr_rc = ((rc & 0x1u) << 1) | ((rc & 0x2u) >> 1);
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr = (fpcr & ~(0x3ull << 22)) | (fpcr_rc << 22);
+    __asm__ volatile("msr fpcr, %0" :: "r"(fpcr));
+#else
+    (void)mxcsr;
+#endif
+}
 
 /*
  * Compute the absolute value of the negative offset from TCG_AREG0
@@ -359,6 +404,7 @@ static void cranelift_bridge_lazy_init(void)
         .host_ptr_size     = sizeof(void *),
         .chain_continue_fn = (uintptr_t)&cranelift_chain_continue,
         .lookup_tb_ptr_fn  = (uintptr_t)&helper_lookup_tb_ptr,
+        .flcr_fn           = (uintptr_t)&cranelift_helper_flcr,
     };
 
     g_cranelift_ctx = cranelift_tcg_init(&env);
@@ -377,6 +423,18 @@ static void cranelift_bridge_lazy_init(void)
     g_env_globals_tuples = tuples;
     g_env_name_pool      = pool;
 
+    /* Threshold override: X1BOX_CRANELIFT_THRESHOLD=<N> (1..128). Lets
+     * us A/B different promotion rates without rebuilding. Out-of-range
+     * values are clamped silently; anything non-numeric leaves the
+     * compile-time default in place. */
+    const char *thr_env = getenv("X1BOX_CRANELIFT_THRESHOLD");
+    if (thr_env && *thr_env) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(thr_env, &end, 10);
+        if (end && *end == '\0' && parsed >= 1 && parsed <= 128) {
+            cranelift_bridge_g_tier2_threshold = (uint32_t)parsed;
+        }
+    }
     cranelift_tcg_set_hot_threshold(g_cranelift_ctx, cranelift_bridge_g_tier2_threshold);
     cranelift_publish_helpers();
 
@@ -391,6 +449,10 @@ static void cranelift_bridge_lazy_init(void)
         swap_on = false;
     }
     qatomic_set(&g_swap_install_enabled, swap_on);
+
+    /* Per-chain quantum tuning: reads X1BOX_CHAIN_MAX + X1BOX_CHAIN_JITTER.
+     * Defined in accel/tcg/cpu-exec.c next to cranelift_chain_continue. */
+    cranelift_chain_init_quantum();
 
     g_cranelift_initialised = true;
     CL_LOG("cranelift tier-2 backend initialised: env_size=0x%x "
@@ -808,6 +870,20 @@ void cranelift_bridge_drain(void)
         pending_ring[cranelift_bridge_g_pending_head].size  = size;
         cranelift_bridge_g_pending_head = next;
         qemu_mutex_unlock(&pending_ring_mutex);
+
+        /*
+         * Flag the TB so the inline wrapper's fast-path can short-circuit
+         * for every OTHER TB that happens to dispatch while this entry is
+         * pending. tb_pc here is the (uintptr_t)tb key that
+         * maybe_compile_slow used at enqueue time, so the cast is safe.
+         * Use qatomic_set so concurrent readers in the wrapper observe a
+         * fully-ordered store. The vCPU clears this bit in
+         * cranelift_bridge_try_swap_slow when it consumes the entry.
+         */
+        TranslationBlock *pending_tb = (TranslationBlock *)(uintptr_t)tb_pc;
+        if (pending_tb) {
+            qatomic_set(&pending_tb->cranelift_pending, 1);
+        }
     }
 }
 
@@ -1164,6 +1240,14 @@ void cranelift_bridge_try_swap_slow(TranslationBlock *tb)
     }
     qemu_mutex_unlock(&pending_ring_mutex);
 
+    /*
+     * Always clear the pending bit. If the entry wasn't in the ring
+     * (lost race with another vCPU that consumed it, or ring overflow
+     * dropped it), we still don't want to keep re-entering the slow path
+     * for this TB; the next compile completion will set it again.
+     */
+    qatomic_set(&tb->cranelift_pending, 0);
+
     if (!new_code) {
         return;
     }
@@ -1314,6 +1398,23 @@ void cranelift_bridge_log_stats(void)
            st.fallback_unsupported_op, st.blacklisted,
            st.verify_ok, st.verify_divergence,
            st.active_entries, st.worker_queue_depth);
+
+    /* Per-chain dispatch telemetry: lets us see whether the quantum is
+     * doing useful work (avg iters/run) versus livelocking (high spins)
+     * and how many distinct guest threads our fingerprint detected. */
+    uint64_t runs = 0, iters = 0, spins = 0, irq_exits = 0;
+    uint32_t thread_count = 0, jitter = 0;
+    unsigned chain_max = 0;
+    cranelift_chain_get_stats(&runs, &iters, &spins, &irq_exits,
+                              &thread_count, &chain_max, &jitter);
+    uint64_t avg_iters_x100 = runs ? (iters * 100 / runs) : 0;
+    CL_LOG("chain stats: runs=%" PRIu64 " iters=%" PRIu64
+           " avg=%" PRIu64 ".%02" PRIu64
+           " spins=%" PRIu64 " irq_exits=%" PRIu64
+           " base=%u jitter=0x%x threads=%u",
+           runs, iters,
+           avg_iters_x100 / 100, avg_iters_x100 % 100,
+           spins, irq_exits, chain_max, jitter, thread_count);
 }
 
 void cranelift_bridge_blacklist(uint64_t pc_lo, uint64_t pc_hi)

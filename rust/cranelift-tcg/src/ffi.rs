@@ -34,6 +34,7 @@ pub struct CraneliftTcgEnvDesc {
     pub host_ptr_size: u32,
     pub chain_continue_fn: usize,
     pub lookup_tb_ptr_fn: usize,
+    pub flcr_fn: usize,
 }
 
 /// Mirror of `CraneliftTcgStats` in the C header.
@@ -117,6 +118,7 @@ pub unsafe extern "C" fn cranelift_tcg_init(
                 e.host_ptr_size,
                 e.chain_continue_fn as u64,
                 e.lookup_tb_ptr_fn as u64,
+                e.flcr_fn as u64,
             )
         }
     };

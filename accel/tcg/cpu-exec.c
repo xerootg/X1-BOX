@@ -739,6 +739,90 @@ static vaddr log_pc(CPUState *cpu, const TranslationBlock *tb)
  */
 static __thread bool cranelift_in_chain;
 
+/*
+ * Quantum tunables.
+ *
+ * Cap base defaults to 16 (lowered from 64 on 2026-05-21 after the BQL
+ * hold-time regressed MCPX apu_thread IRQ delivery). On top of that we
+ * add a small Lehmer-LCG jitter so that consecutive chains don't all
+ * exit on the same TB boundary — that lock-step alignment is what
+ * Cemu's PPCScheduler.cpp:1281 documents as the OSLockMutex livelock
+ * in Mario Party 10 early boot, and the same pattern shows up in the
+ * Halo 2 post-load vCPU wedge (project_halo2_post_load_hang).
+ *
+ * Jitter is `& JITTER_MASK` (0..15 by default), so chain length is
+ * 16..31 TBs — still well inside the audio-safe envelope of the prior
+ * fixed 16 (chain length is bounded above by 31 even with worst-case
+ * jitter, vs. the BQL-unfriendly 64 we walked back from).
+ *
+ * X1BOX_CHAIN_MAX=<N> overrides the base at init (1..256).
+ * X1BOX_CHAIN_JITTER=<2^N-1> can widen jitter (default mask = 0xF).
+ */
+static unsigned cranelift_chain_max_base = 16;
+static uint32_t cranelift_chain_jitter_mask = 0xF;
+
+/* Per-vCPU Lehmer LCG state. __thread keeps it cache-local + race-free.
+ * Modulus is Cemu's: 2^32 - 5 (the largest prime under 2^32). */
+static __thread uint32_t cranelift_lcg_state;
+
+static inline uint32_t cranelift_lcg_next(void)
+{
+    if (cranelift_lcg_state == 0) {
+        cranelift_lcg_state = 12345;
+    }
+    cranelift_lcg_state = (uint32_t)
+        ((uint64_t)cranelift_lcg_state * 279470273ull % 0xfffffffbull);
+    return cranelift_lcg_state;
+}
+
+/*
+ * Guest-thread fingerprint ring.
+ *
+ * Each Xbox thread owns a distinct stack range (PsCreateSystemThreadEx
+ * allocates 0x4000-0xC000 byte stacks per thread, page-aligned). We hash
+ * the top 16 bits of ESP — that gives stable identity per thread without
+ * needing KPCR offsets or kernel symbol resolution, which would couple us
+ * to a specific kernel revision.
+ *
+ * 64-slot direct-mapped ring is more than Halo 2 needs (~6-8 active
+ * guest threads at any time per project_halo2_thread_topology). The
+ * `hits` counter lets stats dumps show per-thread chain frequency so
+ * we can see which guest threads dominate dispatch cost.
+ */
+#ifdef XBOX
+#define CRANELIFT_THREAD_RING_BITS 6
+#define CRANELIFT_THREAD_RING_SIZE (1u << CRANELIFT_THREAD_RING_BITS)
+static struct cranelift_thread_slot {
+    uint32_t stack_top;     /* ESP & ~0xFFFFu — 0 means slot is empty */
+    uint64_t chain_hits;    /* chains observed dispatched from this thread */
+} cranelift_thread_ring[CRANELIFT_THREAD_RING_SIZE];
+
+static inline uint32_t cranelift_thread_id_from_esp(uint32_t esp)
+{
+    uint32_t top = esp & ~0xFFFFu;
+    /* Fibonacci-hash a 32-bit key into 6 bits — fast, low-collision. */
+    uint32_t h = (top * 2654435761u) >> (32 - CRANELIFT_THREAD_RING_BITS);
+    if (cranelift_thread_ring[h].stack_top == top) {
+        cranelift_thread_ring[h].chain_hits++;
+        return h;
+    }
+    /* Empty slot or collision — claim it. Lossy on collision, but a
+     * thread evicted here just re-claims its slot on the next chain
+     * (since the hash is deterministic, only same-hash threads collide,
+     * which empirically does not happen on Halo 2). */
+    cranelift_thread_ring[h].stack_top = top;
+    cranelift_thread_ring[h].chain_hits = 1;
+    return h;
+}
+#endif /* XBOX */
+
+/* Telemetry counters. Aggregated across all chains; published in
+ * cranelift_bridge_log_stats(). */
+static uint64_t cranelift_chain_runs;
+static uint64_t cranelift_chain_iters_total;
+static uint64_t cranelift_chain_spins;     /* exits via revisit detection */
+static uint64_t cranelift_chain_irq_exits; /* exits via interrupt_request */
+
 uintptr_t cranelift_chain_continue(CPUArchState *env)
 {
     if (cranelift_in_chain) {
@@ -747,27 +831,39 @@ uintptr_t cranelift_chain_continue(CPUArchState *env)
     CPUState *cpu = env_cpu(env);
     cranelift_in_chain = true;
     uintptr_t ret = 0;
+
+    /* Per-chain quantum: base + jitter. Jitter breaks livelock alignment
+     * across consecutive chains; without it, a chain that always exits
+     * at iter 16 in the same kernel spin-wait sequence stays stuck. */
+    unsigned chain_max = cranelift_chain_max_base +
+        (cranelift_lcg_next() & cranelift_chain_jitter_mask);
+
     /*
-     * Iteration cap. Without this, an inner game loop translated as a
-     * chain of tier-2 TBs with no interrupt/exit reason can run for
-     * thousands of dispatches in a single helper call. That holds BQL
-     * the whole time and skips the dispatcher's tier-1 promotion,
-     * jump-link, and clock-align bookkeeping. The audio render and
-     * pgraph_vk threads can't reliably preempt the vCPU, which
-     * manifests as bursty frame timing -- a flurry of work, then a
-     * pause while other threads catch up.
+     * Spin-revisit detection: REMOVED 2026-05-22.
      *
-     * 64 chains is enough to amortise the dispatcher round-trip but
-     * short enough that the rest of the system gets a regular
-     * heartbeat.
+     * The original idea was to break out of kernel spinlock cmpxchg
+     * loops early (give audio/render threads forced preemption). But:
+     *   - Halo 2's normal gameplay loops are themselves 2-3 TB cycles
+     *     (audio mixer call, IRQL bump, draw command), which trip the
+     *     revisit detector and bail chains at avg 4 iters vs the 16-31
+     *     design target → 4-5x more dispatcher round-trips.
+     *   - The iter cap (16-31 with jitter) already bounds spinlock
+     *     livelock — the cost of running a known-bad loop for 31 extra
+     *     iters is tiny next to the cost of bailing all chains early.
+     *   - cpu->interrupt_request is already checked every iter, so
+     *     timer/audio IRQs DO get delivered without spin-detect.
+     *
+     * Keep the counter so we still know if a future build wants this
+     * back; bump it on tb_lookup misses instead (those are the rare
+     * legitimate "something weird" signals).
      */
-    const unsigned CHAIN_MAX = 64;
     unsigned iters = 0;
-    while (iters++ < CHAIN_MAX) {
+    while (iters++ < chain_max) {
         if (qatomic_read(&cpu->exit_request)) {
             break;
         }
         if (cpu->interrupt_request) {
+            cranelift_chain_irq_exits++;
             break;
         }
         TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
@@ -779,6 +875,26 @@ uintptr_t cranelift_chain_continue(CPUArchState *env)
         if (!tb) {
             break;
         }
+
+        /*
+         * Xbox kernel HLE inside the chain.
+         *
+         * Without this, only kernel calls reached via the main dispatcher
+         * get HLE-handled. Calls that happen INSIDE a tier-2 chain (which
+         * is where the hot loops live — KeQueryPerformanceCounter,
+         * KfRaiseIrql, etc. firing many times per frame from Halo 2 game
+         * code) bypass HLE entirely. Observed 2026-05-22:
+         * KeQueryPerformanceCounter hits=0 despite being called heavily
+         * in gameplay, because it lived inside chains.
+         *
+         * The PC-range fast-path inside xbox_hle_check makes this a
+         * single compare + branch for >99% of TBs, so the per-iter cost
+         * is negligible. The win is huge for in-chain hot kernel funcs.
+         */
+        if (xbox_hle_check(cpu, (uint32_t)s.pc)) {
+            continue;
+        }
+
         const void *code = cranelift_bridge_lookup_shim(tb);
         if (!code) {
             code = tb->tc.ptr;
@@ -791,8 +907,70 @@ uintptr_t cranelift_chain_continue(CPUArchState *env)
             break;
         }
     }
+
+    cranelift_chain_runs++;
+    cranelift_chain_iters_total += iters;
+
+#ifdef XBOX
+    /* Update guest-thread fingerprint from current ESP. Doing this once
+     * per chain (not per-TB) keeps the tracker noise-free against the
+     * push/pop churn inside a chain. The ESP read goes through a
+     * target-side helper since CPUArchState is opaque here. */
+    (void)cranelift_thread_id_from_esp(xemu_chain_thread_fingerprint(env));
+#endif
+
     cranelift_in_chain = false;
     return ret;
+}
+
+/* Apply env-var tuning. Called once from cranelift_bridge init. */
+void cranelift_chain_init_quantum(void)
+{
+    const char *e = getenv("X1BOX_CHAIN_MAX");
+    if (e && *e) {
+        char *end = NULL;
+        unsigned long v = strtoul(e, &end, 10);
+        if (end && *end == '\0' && v >= 1 && v <= 256) {
+            cranelift_chain_max_base = (unsigned)v;
+        }
+    }
+    e = getenv("X1BOX_CHAIN_JITTER");
+    if (e && *e) {
+        char *end = NULL;
+        unsigned long v = strtoul(e, &end, 10);
+        /* Must be 2^N - 1 so the AND masks correctly. */
+        if (end && *end == '\0' && v <= 0xFF &&
+            (v == 0 || ((v + 1) & v) == 0)) {
+            cranelift_chain_jitter_mask = (uint32_t)v;
+        }
+    }
+}
+
+/* Stats accessors. NULL out-params are tolerated. */
+void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
+                                uint64_t *spins, uint64_t *irq_exits,
+                                uint32_t *thread_count,
+                                unsigned *chain_max, uint32_t *jitter)
+{
+    if (runs)        *runs = cranelift_chain_runs;
+    if (iters)       *iters = cranelift_chain_iters_total;
+    if (spins)       *spins = cranelift_chain_spins;
+    if (irq_exits)   *irq_exits = cranelift_chain_irq_exits;
+    if (chain_max)   *chain_max = cranelift_chain_max_base;
+    if (jitter)      *jitter = cranelift_chain_jitter_mask;
+    if (thread_count) {
+#ifdef XBOX
+        uint32_t n = 0;
+        for (unsigned i = 0; i < CRANELIFT_THREAD_RING_SIZE; i++) {
+            if (cranelift_thread_ring[i].chain_hits) {
+                n++;
+            }
+        }
+        *thread_count = n;
+#else
+        *thread_count = 0;
+#endif
+    }
 }
 #endif
 

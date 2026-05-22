@@ -122,6 +122,13 @@ typedef struct CraneliftTcgEnvDesc {
      * tier-2 TBs. The translator pattern-matches against this address
      * to elide the redundant call. Pass 0 to disable the elision. */
     uintptr_t lookup_tb_ptr_fn;
+    /* Address of `cranelift_helper_flcr(uint32_t mxcsr)`. The x86
+     * frontend emits INDEX_op_flcr for FLDCW/FNCLEX etc.; tier-1
+     * aarch64 lowers it to an MSR FPCR sequence inline. Cranelift
+     * can't emit MSR directly, so tier-2 routes flcr through a one-
+     * argument helper that does the MXCSR->FPCR translation. 0 means
+     * flcr is unsupported and the TB bails to tier-1. */
+    uintptr_t flcr_fn;
 } CraneliftTcgEnvDesc;
 
 /* ------------------------------------------------------------------ */

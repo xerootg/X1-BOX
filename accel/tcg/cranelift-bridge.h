@@ -85,8 +85,16 @@ static inline void cranelift_bridge_try_swap(TranslationBlock *tb)
     if (tb->tier >= 2) {
         return;
     }
-    if (qatomic_read(&cranelift_bridge_g_pending_head) ==
-        qatomic_read(&cranelift_bridge_g_pending_tail)) {
+    /*
+     * Per-TB short-circuit: only enter the slow path's mutex + ring
+     * scan when THIS TB has a pending compile result. With the
+     * threshold at 8 the ring is almost always non-empty for some
+     * (other) TB, so the legacy head==tail check stopped being a
+     * useful gate. drain() sets this bit after publishing to the ring;
+     * try_swap_slow() clears it after consuming. Reads here are
+     * uncontended, so qatomic_read is essentially a cache-hot load.
+     */
+    if (!qatomic_read(&tb->cranelift_pending)) {
         return;
     }
     cranelift_bridge_try_swap_slow(tb);
@@ -143,6 +151,29 @@ extern uintptr_t cranelift_g_tb_ret_addr;
  */
 uintptr_t cranelift_chain_continue(CPUArchState *env);
 
+/*
+ * Per-chain quantum + per-guest-thread fingerprint tracker.
+ *
+ * cranelift_chain_init_quantum() reads X1BOX_CHAIN_MAX and
+ * X1BOX_CHAIN_JITTER env vars; safe to call once at startup.
+ *
+ * cranelift_chain_get_stats() reports counters for the stats dump.
+ * NULL out-params are tolerated.
+ */
+void cranelift_chain_init_quantum(void);
+void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
+                                uint64_t *spins, uint64_t *irq_exits,
+                                uint32_t *thread_count,
+                                unsigned *chain_max, uint32_t *jitter);
+
+/*
+ * Target-side helper: returns the top 16 bits of the guest stack pointer
+ * (ESP & ~0xFFFFu on x86). Used by the chain-continue thread fingerprint.
+ * Defined in target/i386/cpu.c so the accel-side stays target-opaque
+ * (cpu-exec.c can't see CPUArchState layout from this layer).
+ */
+uint32_t xemu_chain_thread_fingerprint(CPUArchState *env);
+
 /* Runtime toggle + tuning knobs. */
 void cranelift_bridge_set_enabled(bool enabled);
 bool cranelift_bridge_is_enabled(void);
@@ -198,6 +229,21 @@ static inline void cranelift_bridge_log_stats(void) {}
 static inline void cranelift_bridge_set_swap_enabled(bool e) { (void)e; }
 static inline bool cranelift_bridge_is_swap_enabled(void) { return false; }
 static inline void cranelift_bridge_on_tb_flush(void) {}
+static inline void cranelift_chain_init_quantum(void) {}
+static inline void
+cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
+                          uint64_t *spins, uint64_t *irq_exits,
+                          uint32_t *thread_count,
+                          unsigned *chain_max, uint32_t *jitter)
+{
+    if (runs) *runs = 0;
+    if (iters) *iters = 0;
+    if (spins) *spins = 0;
+    if (irq_exits) *irq_exits = 0;
+    if (thread_count) *thread_count = 0;
+    if (chain_max) *chain_max = 0;
+    if (jitter) *jitter = 0;
+}
 
 #endif /* XEMU_HAVE_CRANELIFT */
 

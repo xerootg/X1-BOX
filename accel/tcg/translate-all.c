@@ -432,6 +432,14 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     tb->exec_count = 0;
     tb->tier = 0;
     tb->cc_defines_first = 0;
+    /*
+     * Must zero here: tcg_tb_alloc bumps a pointer without clearing,
+     * and after tb_flush + arena recycle a new TB can land on memory
+     * whose previous tenant left cranelift_pending=1. Without this,
+     * the inline wrapper would force a slow-path entry on every
+     * dispatch of the recycled TB until try_swap_slow clears it.
+     */
+    tb->cranelift_pending = 0;
     tb->chain_count[0] = 0;
     tb->chain_count[1] = 0;
     tb->superblock = NULL;
@@ -1038,6 +1046,7 @@ TranslationBlock *tb_gen_superblock(CPUState *cpu,
                  | CF_TIER1 | CF_SUPERBLOCK;
     tb->exec_count = 0;
     tb->tier = 2;
+    tb->cranelift_pending = 0;
     tb->chain_count[0] = 0;
     tb->chain_count[1] = 0;
     tb->superblock = NULL;

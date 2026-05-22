@@ -161,23 +161,37 @@ impl Translator {
          */
 
         /*
-         * STI-shadow filter (re-added 2026-05-19): the STI-shadow
-         * semantics issue described at the top of this function is
-         * still real. With lower_load/lower_store enabled the Xbox
-         * kernel post-STI TB compiles in tier-2 (which doesn't chain),
-         * the interrupt-inhibit shadow stretches across the dispatcher
-         * loop forever, and kernel polling loops like the wait-for-bit
-         * pattern at 0x8004edd3 never get interrupted.
+         * STI-shadow filter — RESTORED PERMANENTLY 2026-05-21 after a
+         * full guest wedge (vCPU stats frozen ~110s → Android ANR
+         * force-remove) reproduced the scenario the dispatch-perf memo
+         * warned about: "the interrupt-inhibit shadow stretches across
+         * the dispatcher loop forever, and kernel polling loops like
+         * the wait-for-bit pattern at 0x8004edd3 never get interrupted."
          *
-         * Detect via writes to env+offsetof(CPUX86State, hflags). x86
-         * doesn't declare hflags as a TCG global (translate.c only
-         * declares regs, eip, cc_op/dst/src/src2, df), so we derive
-         * its offset from cc_op which IS a global and sits exactly 8
-         * bytes earlier in the struct (see target/i386/cpu.h
-         * lines 1850 through 1866). Earlier the filter pattern-matched
-         * the AND immediate 0xFFFFFFF7 but TCG rewrites that to andc
-         * with 0x8 so the constant-match missed it. Offset-based
-         * detection is robust.
+         * The audio surges observed earlier this session are the same
+         * root cause: when the post-STI TB compiles in tier-2 without
+         * this filter, an IRQ that arrives during the shadow is gated
+         * on the inhibit bit at delivery time. A guest polling loop
+         * waiting for an IRQ-set bit then spins forever; audio FIFO
+         * refills miss their delivery windows; eventually the main
+         * thread can't respond to UI events → ANR.
+         *
+         * `chain_continue`'s interrupt-check break does NOT save us
+         * because the issue isn't chain length — it's the dispatcher's
+         * interrupt-delivery gate, which honours the inhibit bit
+         * regardless of whether we got back to the dispatcher quickly.
+         *
+         * The filter must stay even though it costs ~27 tier-2 entries
+         * per Halo 2 session. Anything that touches hflags via a 1/2/4
+         * byte store has to run in tier-1, where TCG-aarch64's patched
+         * `goto_tb` keeps STI and post-STI back-to-back without a
+         * dispatcher round-trip.
+         *
+         * Detection via offset: hflags isn't a TCG global (only cc_op/
+         * dst/src/src2, regs, eip, df are). We derive its offset as
+         * `cc_op.offset + 8` (target/i386/cpu.h:1850-1866). Offset-
+         * based detection is robust to optimizer rewrites of the bit
+         * mask (e.g. `AND ~0x8` → `andc 0x8`).
          */
         let hflags_offset: Option<u32> = self
             .env
@@ -373,20 +387,125 @@ impl<'a, 'b> Lowering<'a, 'b> {
         }
     }
 
-    /// Coerce `val` to `want` via extend/reduce as needed. No-op if equal.
+    /// Coerce `val` to `want` via extend/reduce/bitcast as needed.
+    /// No-op if equal.
+    ///
+    /// `uextend` and `ireduce` are integer-only operations in Cranelift;
+    /// passing them a float type fails the verifier (the source of the
+    /// pre-2026-05-21 `VerifierFailed=22` bucket: `uextend.i64 v488`
+    /// where v488 was f32, and `ireduce.f32 v219` where the destination
+    /// was f32). Both shapes arise when a TCG temp's first writer was
+    /// an FP op (`temp_decl_ty` becomes F32/F64) and a later reader
+    /// requests it as a different-width integer, or vice versa.
+    ///
+    /// The fix is to route any cross-domain width change through an
+    /// integer of the source width: bitcast float→int, extend/reduce
+    /// in integer space, then bitcast back if the destination is float.
     fn coerce(&mut self, val: Value, want: Type) -> Value {
         let cur = self.builder.func.dfg.value_type(val);
         if cur == want {
             return val;
         }
-        if cur.bits() < want.bits() {
-            self.builder.ins().uextend(want, val)
-        } else if cur.bits() > want.bits() {
-            self.builder.ins().ireduce(want, val)
+
+        let mf = MemFlags::new();
+        let cur_is_float = cur == types::F32 || cur == types::F64;
+        let want_is_float = want == types::F32 || want == types::F64;
+
+        /*
+         * Cross-domain scalar ↔ vector coerce.
+         *
+         * x86 SSE creates temps that may be first-written by a SCALAR
+         * op (e.g., movd xmm, gpr produces an I32; the XMM register's
+         * upper 96 bits are zeroed by definition), then later read as
+         * V128 for spill via st_vec. The integer fast-path below would
+         * try `uextend(I64X2, scalar)` which is invalid IR — uextend's
+         * destination must be a scalar integer type. Pre-fix this
+         * accounted for ~245 st_vec bails per Halo 2 session (38% of
+         * all tier-2 compile errors).
+         *
+         * The Cranelift `scalar_to_vector` instruction matches movd/
+         * movq semantics exactly: scalar value goes into lane 0, all
+         * upper lanes are zeroed. Symmetric path for vector → scalar
+         * extracts lane 0 and recurses for any further width adjust.
+         */
+        if !cur.is_vector() && want.is_vector() {
+            let lane_ty = want.lane_type();
+            let lane_val = if cur == lane_ty {
+                val
+            } else {
+                /*
+                 * Coerce scalar to lane width first. Recursing into
+                 * `coerce` reuses the same width/float handling logic;
+                 * since `lane_ty` is a scalar this won't re-enter the
+                 * vector branch.
+                 */
+                self.coerce(val, lane_ty)
+            };
+            return self.builder.ins().scalar_to_vector(want, lane_val);
+        }
+        if cur.is_vector() && !want.is_vector() {
+            let lane_ty = cur.lane_type();
+            let lo = self.builder.ins().extractlane(val, 0);
+            /*
+             * `extractlane` already produces a value of `lane_ty`; if
+             * `want` differs (width or float-ness), recurse to handle.
+             */
+            return if lane_ty == want { lo } else { self.coerce(lo, want) };
+        }
+
+        // Fast path: pure integer extend / reduce.
+        if !cur_is_float && !want_is_float {
+            if cur.bits() < want.bits() {
+                return self.builder.ins().uextend(want, val);
+            }
+            if cur.bits() > want.bits() {
+                return self.builder.ins().ireduce(want, val);
+            }
+            // Same width different lane shape (vector ↔ scalar).
+            return self.builder.ins().bitcast(want, mf, val);
+        }
+
+        // Same-width int↔float: pure bitcast.
+        if cur.bits() == want.bits() {
+            return self.builder.ins().bitcast(want, mf, val);
+        }
+
+        // Different-width involving float: bitcast through a same-width
+        // integer first, extend/reduce in integer space, then bitcast to
+        // float if needed.
+        let int_at_cur = match cur.bits() {
+            32 => types::I32,
+            64 => types::I64,
+            _ => {
+                // Unusual width (8/16 floats don't exist) — fall back to
+                // a bitcast and let the verifier complain if shape is
+                // genuinely wrong.
+                return self.builder.ins().bitcast(want, mf, val);
+            }
+        };
+        let v_int = if cur_is_float {
+            self.builder.ins().bitcast(int_at_cur, mf, val)
         } else {
-            // Same width different lane shape (vector vs scalar).
-            let mf = MemFlags::new();
-            self.builder.ins().bitcast(want, mf, val)
+            val
+        };
+        let int_at_want = match want.bits() {
+            8 => types::I8,
+            16 => types::I16,
+            32 => types::I32,
+            64 => types::I64,
+            _ => return self.builder.ins().bitcast(want, mf, val),
+        };
+        let v_at_want_width = if cur.bits() < want.bits() {
+            self.builder.ins().uextend(int_at_want, v_int)
+        } else if cur.bits() > want.bits() {
+            self.builder.ins().ireduce(int_at_want, v_int)
+        } else {
+            v_int
+        };
+        if want_is_float {
+            self.builder.ins().bitcast(want, mf, v_at_want_width)
+        } else {
+            v_at_want_width
         }
     }
 

@@ -217,10 +217,21 @@ fn worker_loop(
                     }
                 }
                 // Periodically dump the histograms so we can see what's
-                // blocking compilation.
-                if total_compiles.is_power_of_two() || total_compiles % 4096 == 0 {
+                // blocking compilation. Total compiles caps out near
+                // ~700 for a steady-state Halo 2 perftest run, so the
+                // previous power-of-two + 4096-stride gating only ever
+                // fired at 512 and any earlier samples rolled out of
+                // logcat's ring buffer. Log at a tight cadence (every
+                // 16 compiles with a 1s floor) so the breakdown shows
+                // up in steady-state with the dominant opcodes visible
+                // by the time the user reads the log.
+                let should_log = total_compiles % 16 == 0
+                    || total_compiles == 1
+                    || (err_unsupported.len() + err_other.len()) > 0
+                        && total_compiles % 8 == 0;
+                if should_log {
                     let mut last = last_log_ns.lock().unwrap();
-                    if last.elapsed().as_secs() >= 2 {
+                    if last.elapsed().as_millis() >= 1000 {
                         *last = Instant::now();
                         drop(last);
                         let mut top: Vec<(u16, u64)> = err_unsupported
@@ -231,7 +242,7 @@ fn worker_loop(
                         let mut summary = format!(
                             "compile_err breakdown (total={total_compiles}): "
                         );
-                        for (opc, count) in top.iter().take(6) {
+                        for (opc, count) in top.iter().take(12) {
                             summary.push_str(&format!("opc{opc}={count} "));
                         }
                         for (k, v) in &err_other {

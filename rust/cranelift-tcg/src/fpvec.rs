@@ -17,8 +17,9 @@
 //! - Atomic ops route through Cranelift's `atomic_rmw` /
 //!   `atomic_cas` / `fence`.
 
-use cranelift_codegen::ir::immediates::Imm64;
-use cranelift_codegen::ir::{types, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::condcodes::FloatCC;
+use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Signature, Value};
+use cranelift_codegen::isa::CallConv;
 
 use crate::ir::DecodedOp;
 use crate::opc::TcgType;
@@ -89,6 +90,97 @@ pub(crate) fn lower_fp(l: &mut Lowering<'_, '_>, raw: u16, op: &DecodedOp) -> Re
     //   37: sqrt_f32, 38: sqrt_f64,
     //   39: sub_f32, 40: sub_f64,
     match idx {
+        /*
+         * flcr — write FPU control register.
+         *
+         * Tier-1 (tcg/aarch64/tcg-target.c.inc:3603) lowers this as an
+         * inline MSR FPCR sequence converting MXCSR rounding bits to
+         * FPCR rounding bits. Cranelift IR has no MSR primitive, so we
+         * route through cranelift_helper_flcr in cranelift-bridge.c
+         * which does the same bit-fiddling and msr.
+         *
+         * Before this lowering existed every TB containing FLDCW /
+         * FNCLEX bailed to tier-1; on Halo 2 that was 23/584 ≈ 4%
+         * of attempted tier-2 compiles, third-largest bail source
+         * after st_vec and the STI-shadow filter (which are both
+         * gated for orthogonal reasons).
+         *
+         * DEF(flcr) in tcg-opc.h: 0 outs, 1 in (the MXCSR value),
+         * 0 cargs. We pass the value through to the helper as i32.
+         */
+        0 => {
+            let flcr_fn = l.env.flcr_fn;
+            if flcr_fn == 0 {
+                return Err(TransError::UnsupportedOp(raw));
+            }
+            let mxcsr = l.read_iarg(op, 0, TcgType::I32)?;
+            let mut sig = Signature::new(CallConv::SystemV);
+            sig.params.push(AbiParam::new(types::I32));
+            let sig_ref = l.builder.import_signature(sig);
+            let addr = l
+                .builder
+                .ins()
+                .iconst(l.host_ptr_ty, flcr_fn as i64);
+            l.builder.ins().call_indirect(sig_ref, addr, &[mxcsr]);
+            Ok(())
+        }
+        /*
+         * com_f32 / com_f64: FP comparison producing x86-FCOM-style
+         * EFLAGS bits packed into an i64 output.
+         *
+         * Tier-1's tcg/aarch64 lowering (tcg-target.c.inc:3119
+         * `tcg_out_fp_com`) runs FCMP, reads NZCV via MRS, and maps:
+         *   CF (bit 0) = N | V   (less-than OR unordered)
+         *   PF (bit 2) = V       (unordered / NaN)
+         *   ZF (bit 6) = Z | V   (equal OR unordered)
+         *
+         * In Cranelift IR we go via three FloatCC predicates that
+         * already encode "or unordered" semantics:
+         *   FloatCC::UnorderedOrLessThan      → CF
+         *   FloatCC::Unordered                → PF
+         *   FloatCC::UnorderedOrEqual         → ZF
+         * Each yields an i8 (0/1) which we widen to i64 and OR with
+         * the correct bit position. Output is i64 per tcg-op-fp.c:71.
+         *
+         * Indices 11 (com_f32) and 12 (com_f64) — biggest remaining
+         * FP bail source at ~17/108 cumulative errs on Halo 2.
+         */
+        11 | 12 => {
+            let a = l.read_iarg(op, 0, op.ty)?;
+            let b = l.read_iarg(op, 1, op.ty)?;
+            let mf = cranelift_codegen::ir::MemFlags::new();
+            let af = if l.builder.func.dfg.value_type(a) != cl_ty {
+                l.builder.ins().bitcast(cl_ty, mf, a)
+            } else { a };
+            let bf = if l.builder.func.dfg.value_type(b) != cl_ty {
+                l.builder.ins().bitcast(cl_ty, mf, b)
+            } else { b };
+            /*
+             * Cranelift's aarch64 backend supports `UnorderedOrLessThan`
+             * (maps to Cond::Lt) but `unimplemented!()`s on
+             * `UnorderedOrEqual` (cranelift-codegen 0.130.2
+             * aarch64/lower.rs:91) — no single ARM64 condition encodes
+             * UN|EQ. Compose it as bor(Equal, Unordered).
+             *
+             * Crash 2026-05-21: first build with com_f64 lowering
+             * panicked in Cranelift compile thread at lower.rs:91:38
+             * "not implemented" before the third install. Decomposing
+             * sidesteps the missing condition.
+             */
+            let lt_or_uo = l.builder.ins().fcmp(FloatCC::UnorderedOrLessThan, af, bf);
+            let uo = l.builder.ins().fcmp(FloatCC::Unordered, af, bf);
+            let eq = l.builder.ins().fcmp(FloatCC::Equal, af, bf);
+            let cf64 = l.builder.ins().uextend(types::I64, lt_or_uo);
+            let pf64 = l.builder.ins().uextend(types::I64, uo);
+            let eq64 = l.builder.ins().uextend(types::I64, eq);
+            let zf64 = l.builder.ins().bor(eq64, pf64);
+            let pf_shifted = l.builder.ins().ishl_imm(pf64, 2);
+            let zf_shifted = l.builder.ins().ishl_imm(zf64, 6);
+            let t = l.builder.ins().bor(cf64, pf_shifted);
+            let result = l.builder.ins().bor(t, zf_shifted);
+            l.write_temp(op.oarg(0), result);
+            Ok(())
+        }
         7 | 8 => bin_fp(l, op, cl_ty, |b, a, c| b.ins().fadd(a, c)),
         25 | 26 => bin_fp(l, op, cl_ty, |b, a, c| b.ins().fdiv(a, c)),
         33 | 34 => bin_fp(l, op, cl_ty, |b, a, c| b.ins().fmul(a, c)),
@@ -258,61 +350,108 @@ pub(crate) fn lower_vec(l: &mut Lowering<'_, '_>, raw: u16, op: &DecodedOp) -> R
  * safe.
  */
 /*
- * Defensive scope: only handle the V128 case (SSE 128-bit movdqa /
- * movaps spill — the common path). V64 (MMX) and V256 (AVX) bail to
- * tier-1 so we never risk a wrong-width memory op. V64 is also rare
- * on Halo 2 (no MMX inner loops) and not worth the encoding risk
- * surface.
+ * Coverage matrix:
+ *   - V128 (SSE movdqa / movaps spill — Halo 2's dominant case at
+ *     146/241 cumulative bails before this change): full I64X2 path.
+ *   - V64  (MMX or SSE movq spill): 8-byte path. The temp is still
+ *     declared I64X2 per `type_for`, so we extract the low lane via
+ *     `extractlane` for the store, and `insertlane` a zero high lane
+ *     after the 8-byte load so the rest of the temp's lifetime is
+ *     well-defined. The high lane being garbage was the original
+ *     reason this case was deferred, not anything fundamental.
+ *   - V256 (AVX): still bails. Xbox is pre-AVX so this is dead in
+ *     practice; the path would require I64X4 plumbing we don't have.
  *
- * Also guard against:
- *   - const-valued vector inputs (TCG IR-optimizer corner case;
- *     iconst-on-I64X2 isn't supported by Cranelift and the helper
- *     coerce path would assert on the scalar→vector widening);
- *   - non-trusted alignment: env spill slots ARE 16-byte aligned but
- *     we use MemFlags::new() (no alignment promise) to let Cranelift
- *     pick the AArch64 unaligned `LDR Q` / `STR Q` form, which the
- *     A78 cores handle without trap or measurable penalty.
+ * Bails kept:
+ *   - const-valued vector value input (no scalar→vector iconst path
+ *     in Cranelift; vanishingly rare on x86 anyway — TCG doesn't fold
+ *     vector temps to const).
+ *
+ * Bail relaxed:
+ *   - const base address: just an iconst, fully supported via
+ *     `read_iarg`. Was previously bailing for "encoding-risk surface"
+ *     reasons that don't actually apply.
+ *
+ * Alignment: env spill slots are 16-byte aligned but we use
+ * `MemFlags::new()` (no alignment promise) so Cranelift picks AArch64
+ * unaligned `LDR Q` / `STR Q`, which A720/X4 handle without trap.
  */
 fn lower_ld_vec(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), TransError> {
-    if !matches!(op.ty, TcgType::V128) {
-        return Err(TransError::UnsupportedOp(OPC_LD_VEC));
-    }
-    if op.iarg_is_const(0) {
-        return Err(TransError::UnsupportedOp(OPC_LD_VEC));
-    }
+    let width_bytes = match op.ty {
+        TcgType::V128 => 16,
+        TcgType::V64 => 8,
+        _ => return Err(TransError::UnsupportedOp(OPC_LD_VEC)),
+    };
     let base = l.read_iarg(op, 0, TcgType::I64)?;
     let off = op.carg(0) as i64;
     let addr = l.builder.ins().iadd_imm(base, off);
-    let v = l
-        .builder
-        .ins()
-        .load(types::I64X2, MemFlags::new(), addr, 0);
+    let v = if width_bytes == 16 {
+        l.builder
+            .ins()
+            .load(types::I64X2, MemFlags::new(), addr, 0)
+    } else {
+        /* Load the low 8 bytes as i64, splat-zero a vector, insert
+         * the loaded scalar as lane 0. Lane 1 stays zero so any
+         * later widening read sees a clean upper half. */
+        let lo = l
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), addr, 0);
+        let zero = l.builder.ins().iconst(types::I64, 0);
+        let vec_zero = l.builder.ins().splat(types::I64X2, zero);
+        l.builder.ins().insertlane(vec_zero, lo, 0)
+    };
     l.write_temp(op.oarg(0), v);
     Ok(())
 }
 
+/*
+ * Diagnostic subcodes for the remaining lower_st_vec bail branches.
+ * Logged via the existing opcN telemetry; non-overlapping with real
+ * TCG opcode space (which tops out around 200). 0x9080+offset is a
+ * sentinel range — opc36992/3/4/5 in the breakdown log distinguishes
+ * which branch fires so we can target the highest-volume one.
+ */
+const OPC_ST_VEC_BAIL_V256:        u16 = 0x9080;
+/* OPC_ST_VEC_BAIL_CONST_VAL (0x9081) was retired 2026-05-22 — const
+ * values now flow through scalar_to_vector via coerce. */
+const OPC_ST_VEC_BAIL_V128_VAL_TY: u16 = 0x9082;
+const OPC_ST_VEC_BAIL_V64_VAL_TY:  u16 = 0x9083;
+
 fn lower_st_vec(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), TransError> {
-    if !matches!(op.ty, TcgType::V128) {
-        return Err(TransError::UnsupportedOp(OPC_ST_VEC));
-    }
-    /* Both inputs must be temps, not consts — a const-valued vector
-     * arg would force a scalar→vector coerce path that doesn't exist. */
-    if op.iarg_is_const(0) || op.iarg_is_const(1) {
-        return Err(TransError::UnsupportedOp(OPC_ST_VEC));
-    }
-    let val = l.read_iarg(op, 0, TcgType::V128)?;
-    /* Belt-and-suspenders: verify the value really is a 128-bit
-     * vector before we hand it to the store. If the temp had been
-     * declared as something else upstream, bail rather than emit a
-     * wrong-width store. */
-    if l.builder.func.dfg.value_type(val) != types::I64X2 {
-        return Err(TransError::UnsupportedOp(OPC_ST_VEC));
-    }
+    let width_bytes = match op.ty {
+        TcgType::V128 => 16,
+        TcgType::V64 => 8,
+        _ => return Err(TransError::UnsupportedOp(OPC_ST_VEC_BAIL_V256)),
+    };
+    /*
+     * Const-valued vector: read_iarg materializes as iconst.I64 then
+     * coerces to I64X2 via the 2026-05-22 scalar→vector path
+     * (`scalar_to_vector(I64X2, iconst.I64)` puts the literal in lane 0
+     * and zeros lane 1 — matches TCG's "TEMP_CONST holds a 64-bit value
+     * spilling into the vector's low half" convention).
+     * Before that fix this branch was the dominant remaining bail (19
+     * of 19 opc128 errors per session). Now const values flow through.
+     */
+    let val = l.read_iarg(op, 0, op.ty)?;
     let base = l.read_iarg(op, 1, TcgType::I64)?;
     let off = op.carg(0) as i64;
     let addr = l.builder.ins().iadd_imm(base, off);
-    l.builder
-        .ins()
-        .store(MemFlags::new(), val, addr, 0);
+    if width_bytes == 16 {
+        if l.builder.func.dfg.value_type(val) != types::I64X2 {
+            return Err(TransError::UnsupportedOp(OPC_ST_VEC_BAIL_V128_VAL_TY));
+        }
+        l.builder.ins().store(MemFlags::new(), val, addr, 0);
+    } else {
+        let val_ty = l.builder.func.dfg.value_type(val);
+        let lo = if val_ty == types::I64X2 {
+            l.builder.ins().extractlane(val, 0)
+        } else if val_ty == types::I64 {
+            val
+        } else {
+            return Err(TransError::UnsupportedOp(OPC_ST_VEC_BAIL_V64_VAL_TY));
+        };
+        l.builder.ins().store(MemFlags::new(), lo, addr, 0);
+    }
     Ok(())
 }

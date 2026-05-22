@@ -10254,3 +10254,22 @@ static void x86_cpu_register_types(void)
 }
 
 type_init(x86_cpu_register_types)
+
+#ifdef XBOX
+/*
+ * Guest-thread fingerprint helper for the Cranelift chain dispatcher.
+ *
+ * cpu-exec.c keeps CPUArchState opaque (the QEMU convention for accel
+ * code), so the ESP read has to live on the target side. Top-16-bit page
+ * of ESP is stable per thread on Xbox -- PsCreateSystemThreadEx allocates
+ * each guest thread its own stack range -- so this is a cheap thread
+ * identity proxy without needing KPCR offsets or kernel symbol
+ * resolution.
+ *
+ * See accel/tcg/cpu-exec.c:cranelift_chain_continue() for the consumer.
+ */
+uint32_t xemu_chain_thread_fingerprint(CPUArchState *env)
+{
+    return ((uint32_t)env->regs[R_ESP]) & ~0xFFFFu;
+}
+#endif
