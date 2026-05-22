@@ -144,6 +144,12 @@ class PerGameSettingsActivity : AppCompatActivity() {
         options = booleanOptions(),
       ),
       SettingField(
+        key = "setting_x87_lib",
+        inputLayoutId = R.id.input_per_game_x87_lib,
+        dropdownId = R.id.dropdown_per_game_x87_lib,
+        options = booleanOptions(),
+      ),
+      SettingField(
         key = "setting_cache_shaders",
         inputLayoutId = R.id.input_per_game_cache_shaders,
         dropdownId = R.id.dropdown_per_game_cache_shaders,
@@ -308,6 +314,7 @@ class PerGameSettingsActivity : AppCompatActivity() {
       "setting_hrtf" -> prefs.getBoolean(key, false).toString()
       "setting_cache_shaders" -> prefs.getBoolean(key, true).toString()
       "setting_hard_fpu" -> prefs.getBoolean(key, true).toString()
+      "setting_x87_lib" -> prefs.getBoolean(key, false).toString()
       "setting_skip_boot_anim" -> prefs.getBoolean(key, true).toString()
       "draw_reorder" -> prefs.getBoolean(key, true).toString()
       "draw_merge" -> prefs.getBoolean(key, true).toString()

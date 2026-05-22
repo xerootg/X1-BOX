@@ -56,6 +56,7 @@
 
 #include "hw/xbox/smbus.h" // For eject, drive tray
 #include "hw/xbox/nv2a/nv2a.h"
+#include "hw/xbox/nv2a/debug.h"
 #include "ui/xemu-notifications.h"
 
 #include <stb_image.h>
@@ -63,6 +64,7 @@
 
 #ifdef __ANDROID__
 #include <android/log.h>
+#include <time.h>
 #endif
 #ifdef _WIN32
 #include "nvapi.h"
@@ -1786,6 +1788,28 @@ void sdl2_gl_refresh(DisplayChangeListener *dcl)
     SDL_GL_SwapWindow(scon->real_window);
 #ifdef __ANDROID__
     android_log_gl_error("refresh-swap");
+    // User-visible frame ping: one logcat line per host swap, tagged
+    // "xemu-fps". Three counters are emitted so the MCP tool can separate
+    // host-side cadence from guest-side cadence:
+    //   f= host swap counter (this site)
+    //   g= nv2a guest-flip counter (NV097_FLIP_STALL increments) —
+    //      the rate at which the Xbox guest declared a new finished
+    //      framebuffer. delta(g)/dt is the actual unique frames the
+    //      user saw, regardless of how often we re-blitted the same
+    //      texture to the SurfaceView.
+    //   t= CLOCK_MONOTONIC ns captured after swap returns
+    // delta(f) - delta(g) over a window = duplicate-swap count (host
+    // rendered the same guest frame more than once).
+    {
+        struct timespec _ts;
+        clock_gettime(CLOCK_MONOTONIC, &_ts);
+        uint64_t _ns = (uint64_t)_ts.tv_sec * 1000000000ULL + (uint64_t)_ts.tv_nsec;
+        __android_log_print(ANDROID_LOG_INFO, "xemu-fps",
+                            "f=%llu g=%u t=%llu",
+                            (unsigned long long)g_android_frame_counter,
+                            (unsigned int)g_nv2a_stats.frame_count,
+                            (unsigned long long)_ns);
+    }
 #endif
 
     /* VGA update (see note above) + vblank */

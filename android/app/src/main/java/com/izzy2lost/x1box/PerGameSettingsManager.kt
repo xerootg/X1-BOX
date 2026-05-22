@@ -28,6 +28,7 @@ object PerGameSettingsManager {
     "setting_hrtf",
     "setting_cache_shaders",
     "setting_hard_fpu",
+    "setting_x87_lib",
     "setting_skip_boot_anim",
     "setting_audio_driver",
     "setting_network_enable",

@@ -58,6 +58,25 @@ UI_LOGCAT_LOG = f"{LOG_DIR}/ui-logcat.log"
 XEMU_LOGCAT_LOG = f"{LOG_DIR}/xemu-logcat.log"
 PREFS_XML = f"/data/data/{PKG}/shared_prefs/x1box_prefs.xml"
 SHADER_CACHE_DIR = f"{INT_FILES_DIR}/cache"   # xemu cache_shaders lives under app cache; cleared with cache wipe
+SHADER_DUMP_DIR = f"{EXT_BASE}/shader_dump"   # per-pipeline-create SPIR-V/GLSL dump (see draw.c, Android-only)
+SHADER_DUMP_LOG_TAG = "hakuX-vk-shaderdump"   # logcat tag the dumper emits per shader
+
+# Arm Performance Studio (malioc) — optional; honoured when set or default exists.
+ARM_PERFORMANCE_STUDIO_HOME = os.environ.get(
+    "ARM_PERFORMANCE_STUDIO_HOME",
+    "/home/xero/repos/Arm_Performance_Studio_2026.2",
+)
+MALIOC_BIN = f"{ARM_PERFORMANCE_STUDIO_HOME}/mali_offline_compiler/malioc"
+
+# Generic GPU probe runner (see hw/xbox/nv2a/pgraph/vk/probe_runner.{c,h}).
+GPU_PROBE_DIR       = f"{EXT_BASE}/gpu_probe"
+GPU_PROBE_REQ       = f"{GPU_PROBE_DIR}/probe_req.bin"
+GPU_PROBE_REQ_USED  = f"{GPU_PROBE_DIR}/probe_req.consumed"
+GPU_PROBE_OUT       = f"{GPU_PROBE_DIR}/probe_out.bin"
+GPU_PROBE_DONE      = f"{GPU_PROBE_DIR}/probe_done.flag"
+GPU_PROBE_VERSION       = 1
+GPU_PROBE_STAGE_COMPUTE = 0
+GPU_PROBE_STAGE_FRAGMENT = 1
 
 ANDROID_ROOT = Path(__file__).resolve().parent.parent  # /home/.../x1-box/android
 APK_OUT_DIR = ANDROID_ROOT / "app/build/outputs/apk"
@@ -67,6 +86,20 @@ APK_OUT_DIR = ANDROID_ROOT / "app/build/outputs/apk"
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+# Active-device selector. When set, exported as ANDROID_SERIAL so every adb
+# subprocess (including the `simpleperf` flow inside profile_native and the
+# `adb exec-out run-as` paths in _pull_to_tmp) targets the same device. Set
+# via set_active_device(); cleared with set_active_device("").
+_ACTIVE_DEVICE: str | None = None
+
+
+def _sync_active_device_env() -> None:
+    if _ACTIVE_DEVICE:
+        os.environ["ANDROID_SERIAL"] = _ACTIVE_DEVICE
+    else:
+        os.environ.pop("ANDROID_SERIAL", None)
+
+
 def _adb(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["adb", *args], capture_output=True, text=True, check=False)
 
@@ -74,9 +107,15 @@ def _sh(*args: str) -> str:
     r = _adb("shell", *args)
     return (r.stdout + r.stderr).strip()
 
-def _device() -> str | None:
+def _list_attached_devices() -> list[str]:
     lines = _adb("devices").stdout.strip().splitlines()[1:]
-    devs = [l.split()[0] for l in lines if l.strip() and "device" in l]
+    return [l.split()[0] for l in lines if l.strip() and "device" in l]
+
+def _device() -> str | None:
+    # If an active device is selected, prefer it (and confirm it's still attached).
+    devs = _list_attached_devices()
+    if _ACTIVE_DEVICE and _ACTIVE_DEVICE in devs:
+        return _ACTIVE_DEVICE
     return devs[0] if devs else None
 
 def _ui_pid() -> str | None:
@@ -235,8 +274,69 @@ def _game_title_from_path(path: str) -> str:
 
 @mcp.tool()
 def list_devices() -> str:
-    """List connected ADB devices."""
-    return _adb("devices").stdout.strip()
+    """List connected ADB devices, annotated with model/manufacturer/SoC
+    properties so it's easy to map a serial to a physical phone, and with a
+    marker showing which (if any) is the currently active device.
+
+    Active-device selection is process-global within this MCP server: see
+    `set_active_device(serial)` to pick one and `get_active_device()` to
+    query it. When set, ANDROID_SERIAL is exported to the environment so
+    every subsequent adb call targets that device.
+    """
+    raw = _adb("devices").stdout.strip()
+    devs = _list_attached_devices()
+    if not devs:
+        return raw
+    rows = [raw, ""]
+    rows.append(f"{'serial':<24}  {'model':<22}  {'manufacturer':<14}  {'soc':<14}  active")
+    rows.append("-" * 96)
+    for serial in devs:
+        def gp(prop: str) -> str:
+            r = subprocess.run(
+                ["adb", "-s", serial, "shell", "getprop", prop],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+            return (r.stdout or "").strip()
+        model = gp("ro.product.model") or "?"
+        manuf = gp("ro.product.manufacturer") or "?"
+        soc = (gp("ro.soc.model")
+               or gp("ro.hardware")
+               or gp("ro.board.platform")
+               or "?")
+        active = "*" if serial == _ACTIVE_DEVICE else ""
+        rows.append(f"{serial:<24}  {model:<22}  {manuf:<14}  {soc:<14}  {active}")
+    return "\n".join(rows)
+
+@mcp.tool()
+def set_active_device(serial: str = "") -> str:
+    """Pin all subsequent MCP tool calls to a specific ADB serial.
+
+    Used for A/B comparisons across two devices in the same session (e.g.
+    Pixel 10a vs Zenfone 10 for Halo 2 perf work). Sets ANDROID_SERIAL in
+    the process environment, which is honored by every `adb` invocation in
+    this server. Pass an empty string to clear the pin (then `_device()`
+    falls back to picking the first attached device).
+
+    Returns the new active device, or an error if `serial` isn't attached.
+    """
+    global _ACTIVE_DEVICE
+    serial = serial.strip()
+    if not serial:
+        _ACTIVE_DEVICE = None
+        _sync_active_device_env()
+        return "Active device cleared (will fall back to first attached device)."
+    devs = _list_attached_devices()
+    if serial not in devs:
+        return (f"Serial '{serial}' not attached. Currently attached: "
+                f"{', '.join(devs) if devs else '(none)'}")
+    _ACTIVE_DEVICE = serial
+    _sync_active_device_env()
+    return f"Active device set to {serial}."
+
+@mcp.tool()
+def get_active_device() -> str:
+    """Return the currently pinned ADB serial, or '(none)' if not set."""
+    return _ACTIVE_DEVICE or "(none)"
 
 @mcp.tool()
 def launch_app(rom: str = "") -> str:
@@ -345,6 +445,397 @@ def screenshot(save_path: str = "/tmp/x1box_screen.png") -> str:
     _sh("rm -f /sdcard/_x1box_ss.png")
     if r.returncode != 0: return f"Screenshot failed: {r.stderr.strip()}"
     return save_path
+
+
+# Friendly aliases for Android keycodes commonly needed when driving xemu's
+# title screens / menus. Numeric codes are accepted too — passed straight to
+# `input keyevent`. Source: https://developer.android.com/reference/android/view/KeyEvent
+_KEY_ALIASES = {
+    "DPAD_UP": 19, "DPAD_DOWN": 20, "DPAD_LEFT": 21, "DPAD_RIGHT": 22,
+    "DPAD_CENTER": 23,
+    "UP": 19, "DOWN": 20, "LEFT": 21, "RIGHT": 22, "CENTER": 23,
+    "ENTER": 66, "ESCAPE": 111, "BACK": 4, "HOME": 3, "MENU": 82,
+    "TAB": 61, "SPACE": 62,
+    "BUTTON_A": 96, "BUTTON_B": 97, "BUTTON_X": 99, "BUTTON_Y": 100,
+    "BUTTON_L1": 102, "BUTTON_R1": 103, "BUTTON_L2": 104, "BUTTON_R2": 105,
+    "BUTTON_THUMBL": 106, "BUTTON_THUMBR": 107,
+    "BUTTON_START": 108, "BUTTON_SELECT": 109, "BUTTON_MODE": 110,
+    "START": 108, "SELECT": 109,
+    "A": 96, "B": 97, "X": 99, "Y": 100,
+    "WAKEUP": 224, "POWER": 26,
+}
+
+
+# Valid sources for Android's `input` command. Using `gamepad` makes the
+# event look like it came from a connected joypad, which goes through a
+# different dispatcher path than touchscreen events — vendor "Game Genie"
+# / "lock-touch" overlays (ASUS Zenfone, ROG, etc.) only block touch and
+# leave gamepad events flowing to the focused activity below.
+_INPUT_SOURCES = {
+    "gamepad", "keyboard", "dpad", "joystick", "touchpad", "touchscreen",
+    "touchnavigation", "mouse", "stylus", "trackball", "default",
+}
+
+
+@mcp.tool()
+def input_keyevent(key: str, repeat: int = 1, delay_ms: int = 150,
+                   source: str = "gamepad") -> str:
+    """Send an Android key event to whatever has focus on the active device.
+
+    Built for driving xemu through its title / menu screens without a
+    physical gamepad: SDL's Android backend translates these into joypad
+    events, so `BUTTON_A`/`BUTTON_START`/`DPAD_UP` reach the running game.
+
+    Args:
+      key:      Key name (BUTTON_A, BUTTON_START, DPAD_UP, ENTER, ...) or
+                a numeric keycode like '96'. Case-insensitive.
+      repeat:   Number of presses (1-32). Useful for menu navigation
+                ('DPAD_DOWN' repeat=3). Default 1.
+      delay_ms: Delay between presses when repeat > 1 (0-2000). Default 150.
+      source:   Android `input` source tag: 'gamepad' (default), 'keyboard',
+                'dpad', 'touchscreen', etc. The default `gamepad` value
+                bypasses ASUS/ROG GameGenie "lock-touch" overlays which only
+                block touchscreen events; gamepad events keep flowing to the
+                focused activity. Pass 'default' or '' to use the legacy
+                `input keyevent` path with no explicit source.
+
+    Returns a one-line summary of what was sent.
+    """
+    if not _device(): return "No device connected."
+    raw = key.strip().upper()
+    if raw.isdigit():
+        code = int(raw)
+    else:
+        if raw.startswith("KEYCODE_"):
+            raw = raw[len("KEYCODE_"):]
+        code = _KEY_ALIASES.get(raw)
+        if code is None:
+            known = ", ".join(sorted(set(_KEY_ALIASES))[:12])
+            return (f"Unknown key '{key}'. Pass a numeric keycode or one of: "
+                    f"{known}, ...")
+    repeat = max(1, min(int(repeat), 32))
+    delay_ms = max(0, min(int(delay_ms), 2000))
+
+    src = (source or "").strip().lower()
+    if src in ("", "default"):
+        prefix = "input"
+    elif src in _INPUT_SOURCES:
+        prefix = f"input {src}"
+    else:
+        return (f"Unknown source '{source}'. Use one of: "
+                f"{', '.join(sorted(_INPUT_SOURCES))} (or '' / 'default').")
+
+    if repeat == 1:
+        _sh(f"{prefix} keyevent {code}")
+        return f"sent {prefix} keyevent {code} ({key}) x1"
+
+    # Compose a single on-device shell command so we keep adb round-trips
+    # to one regardless of repeat count.
+    cmd_parts = []
+    for i in range(repeat):
+        cmd_parts.append(f"{prefix} keyevent {code}")
+        if i < repeat - 1 and delay_ms:
+            cmd_parts.append(f"sleep {delay_ms / 1000:.3f}")
+    _sh(" ; ".join(cmd_parts))
+    return f"sent {prefix} keyevent {code} ({key}) x{repeat} (delay {delay_ms}ms)"
+
+
+# ---------------------------------------------------------------------------
+# Keep-alive daemon
+#
+# Persistent on-device shell loop that (a) wakes the screen when it goes to
+# sleep and (b) periodically nudges the running game with a gamepad button
+# (DPAD_UP by default) to prevent the Halo 2 attract-mode demo from kicking
+# in. Runs entirely in adb shell — no app changes — and is identified by a
+# PID file under /data/local/tmp so we can stop / status-check it from any
+# subsequent MCP tool call.
+# ---------------------------------------------------------------------------
+
+# Files live under /data/local/tmp because that's world-writable to the shell
+# user (no run-as needed) and survives across our adb sessions.
+KEEPALIVE_DIR = "/data/local/tmp"
+KEEPALIVE_SCRIPT = f"{KEEPALIVE_DIR}/x1box_keepalive.sh"
+KEEPALIVE_PID = f"{KEEPALIVE_DIR}/x1box_keepalive.pid"
+KEEPALIVE_LOG = f"{KEEPALIVE_DIR}/x1box_keepalive.log"
+KEEPALIVE_HB = f"{KEEPALIVE_DIR}/x1box_keepalive.hb"
+
+# The actual loop run on-device. Uses POSIX shell so it works on toybox /
+# busybox without bash. `setsid` detaches it from the controlling tty so it
+# survives the spawning adb shell exiting. Each iteration:
+#   1. If `keep_awake` is set and the screen is off, send a WAKEUP keyevent.
+#   2. Send `input <source> keyevent <key>` to nudge the game.
+#   3. Touch the heartbeat file with the current epoch.
+#   4. Sleep `interval`.
+# Exits cleanly if the pid-file is removed or replaced — that's how
+# keepalive_stop kills us.
+_KEEPALIVE_LOOP = r"""#!/system/bin/sh
+INTERVAL="${1:-90}"
+KEY="${2:-19}"
+SRC="${3:-gamepad}"
+KEEP_AWAKE="${4:-1}"
+PID_FILE="__PID_FILE__"
+HB_FILE="__HB_FILE__"
+LOG_FILE="__LOG_FILE__"
+
+# Compose the input command once. 'default' source = plain `input keyevent`.
+if [ "$SRC" = "default" ] || [ -z "$SRC" ]; then
+  INPUT_CMD="input keyevent $KEY"
+else
+  INPUT_CMD="input $SRC keyevent $KEY"
+fi
+
+echo "$$" > "$PID_FILE"
+echo "$(date +%s) keepalive started: interval=${INTERVAL}s key=${KEY} src=${SRC} awake=${KEEP_AWAKE}" >> "$LOG_FILE"
+
+while :; do
+  # Stop signal: pid-file deleted or owned by a different pid.
+  if [ ! -f "$PID_FILE" ]; then
+    echo "$(date +%s) pid-file gone, exiting" >> "$LOG_FILE"
+    exit 0
+  fi
+  PF_PID=$(cat "$PID_FILE" 2>/dev/null)
+  if [ "$PF_PID" != "$$" ]; then
+    echo "$(date +%s) pid-file replaced (now=$PF_PID, me=$$), exiting" >> "$LOG_FILE"
+    exit 0
+  fi
+
+  if [ "$KEEP_AWAKE" = "1" ]; then
+    # `dumpsys power` field — works on every Android we care about.
+    STATE=$(dumpsys power 2>/dev/null | grep -m1 'mWakefulness=' | sed 's/.*mWakefulness=//;s/ .*//')
+    if [ "$STATE" != "Awake" ]; then
+      input keyevent 224 >/dev/null 2>&1
+      echo "$(date +%s) woke from state=$STATE" >> "$LOG_FILE"
+    fi
+  fi
+
+  $INPUT_CMD >/dev/null 2>&1
+  date +%s > "$HB_FILE"
+
+  # toybox sleep accepts integer seconds.
+  sleep "$INTERVAL"
+done
+"""
+
+
+@mcp.tool()
+def keepalive_start(interval_s: int = 90, key: str = "DPAD_UP",
+                    source: str = "gamepad", keep_awake: bool = True) -> str:
+    """Start a persistent on-device daemon that prevents the screen from
+    sleeping and nudges the running game with a gamepad button on an
+    interval — so an idle Halo 2 doesn't drift into the attract-mode demo
+    while we're collecting perf samples.
+
+    The daemon lives on the active device under /data/local/tmp/ and
+    survives across MCP tool calls. Stops automatically when the pid-file
+    is removed (see `keepalive_stop`).
+
+    Args:
+      interval_s: seconds between key nudges (default 90; Halo 2's attract
+                  timeout is well over 2 minutes so ~90s leaves comfortable
+                  margin without spamming inputs).
+      key:        button name (e.g. 'DPAD_UP', 'BUTTON_A') or numeric code.
+                  Default 'DPAD_UP' — does no menu action but resets the
+                  idle timer.
+      source:     `input` source tag. Default 'gamepad' so the event
+                  bypasses ASUS GameGenie's lock-touch overlay and is
+                  dispatched as a joypad button (SDL maps it through to
+                  xemu the same as a real controller).
+      keep_awake: if True, also send WAKEUP keyevent whenever the screen
+                  goes to sleep.
+
+    Returns the on-device PID of the daemon and current settings.
+    """
+    if not _device():
+        return "No device connected."
+
+    raw = key.strip().upper()
+    if raw.isdigit():
+        code = int(raw)
+    else:
+        if raw.startswith("KEYCODE_"):
+            raw = raw[len("KEYCODE_"):]
+        code = _KEY_ALIASES.get(raw)
+        if code is None:
+            return f"Unknown key '{key}'. See input_keyevent for valid names."
+
+    src = (source or "").strip().lower()
+    if src and src != "default" and src not in _INPUT_SOURCES:
+        return (f"Unknown source '{source}'. Use one of: "
+                f"{', '.join(sorted(_INPUT_SOURCES))} (or 'default').")
+
+    interval = max(5, min(int(interval_s), 3600))
+
+    # Stop any existing daemon first (idempotent).
+    keepalive_stop()
+
+    # Push the script.
+    script = (_KEEPALIVE_LOOP
+              .replace("__PID_FILE__", KEEPALIVE_PID)
+              .replace("__HB_FILE__", KEEPALIVE_HB)
+              .replace("__LOG_FILE__", KEEPALIVE_LOG))
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+        f.write(script)
+        local = f.name
+    try:
+        if _adb("push", local, KEEPALIVE_SCRIPT).returncode != 0:
+            return "Failed to stage keepalive script."
+    finally:
+        os.unlink(local)
+    _sh(f"chmod 755 {KEEPALIVE_SCRIPT}")
+    _sh(f": > {KEEPALIVE_LOG}; rm -f {KEEPALIVE_HB} {KEEPALIVE_PID}")
+
+    # Launch detached. `setsid` is sometimes absent on Android shells; fall
+    # back to a double-fork via `nohup ... &` which produces the same effect
+    # (parent shell exits, daemon's parent becomes init, no controlling tty).
+    awake = "1" if keep_awake else "0"
+    src_arg = src or "default"
+    spawn = (
+        f"cd /data/local/tmp && "
+        f"nohup sh {KEEPALIVE_SCRIPT} {interval} {code} {src_arg} {awake} "
+        f">> {KEEPALIVE_LOG} 2>&1 < /dev/null &"
+    )
+    _sh(spawn)
+
+    # Wait briefly for the daemon to write its pid.
+    pid = ""
+    for _ in range(20):
+        out = _sh(f"cat {KEEPALIVE_PID} 2>/dev/null").strip()
+        if out and out.isdigit():
+            pid = out
+            break
+        time.sleep(0.1)
+
+    if not pid:
+        tail = _sh(f"tail -n 20 {KEEPALIVE_LOG} 2>/dev/null")
+        return f"Daemon did not announce its PID. Log tail:\n{tail or '(empty)'}"
+
+    return (f"keepalive: pid={pid} interval={interval}s "
+            f"key={key}({code}) source={src_arg} keep_awake={keep_awake}")
+
+
+@mcp.tool()
+def keepalive_stop() -> str:
+    """Stop the on-device keepalive daemon (if running) and remove its
+    pid-file / heartbeat. Idempotent — safe to call when nothing is
+    running.
+    """
+    if not _device():
+        return "No device connected."
+    pid = _sh(f"cat {KEEPALIVE_PID} 2>/dev/null").strip()
+    if pid and pid.isdigit():
+        _sh(f"kill {pid} 2>/dev/null; sleep 0.2; kill -9 {pid} 2>/dev/null")
+        _sh(f"rm -f {KEEPALIVE_PID} {KEEPALIVE_HB}")
+        return f"keepalive: stopped pid={pid}"
+    _sh(f"rm -f {KEEPALIVE_PID} {KEEPALIVE_HB}")
+    return "keepalive: not running"
+
+
+@mcp.tool()
+def keepalive_status() -> str:
+    """Report whether the keepalive daemon is alive on the active device,
+    its PID, age, last heartbeat, and the tail of its log.
+    """
+    if not _device():
+        return "No device connected."
+    pid = _sh(f"cat {KEEPALIVE_PID} 2>/dev/null").strip()
+    if not pid or not pid.isdigit():
+        return "keepalive: not running"
+    alive = _sh(f"test -d /proc/{pid} && echo yes || echo no").strip()
+    if alive != "yes":
+        return f"keepalive: pid={pid} but /proc/{pid} missing (stale)"
+    hb = _sh(f"cat {KEEPALIVE_HB} 2>/dev/null").strip()
+    now = _sh("date +%s").strip()
+    try:
+        age = int(now) - int(hb) if hb else None
+    except ValueError:
+        age = None
+    tail = _sh(f"tail -n 5 {KEEPALIVE_LOG} 2>/dev/null")
+    parts = [f"keepalive: pid={pid} alive"]
+    if age is not None:
+        parts.append(f"last_hb={age}s ago")
+    if tail:
+        parts.append("log_tail:\n" + tail)
+    return "  ".join(parts[:2]) + (("\n" + parts[2]) if len(parts) > 2 else "")
+
+
+@mcp.tool()
+def device_status() -> str:
+    """One-shot health snapshot of the active device: screen power,
+    foreground activity, x1box pids, recent xemu-reported FPS, GPU busy %,
+    battery temp, and keepalive-daemon state. Use this as the quick "is
+    the rig still in a useful state?" check between heavy probes.
+
+    All values come from cheap reads (dumpsys / sysfs / /proc); the call
+    completes in well under a second on a healthy device.
+    """
+    if not _device():
+        return "No device connected."
+
+    # Screen power + wakefulness — one dumpsys call.
+    wake = _sh(
+        "dumpsys power 2>/dev/null | "
+        "grep -E 'mWakefulness=|mScreenState=|mDisplayState=' | head -4"
+    )
+
+    # Foreground activity.
+    top = _sh(
+        "dumpsys activity activities 2>/dev/null | "
+        "grep -m1 'topResumedActivity=' | sed 's/^ *//'"
+    )
+
+    # x1box pids.
+    ui = _ui_pid()
+    emu = _sh(f"pidof {EMU_PROCESS}").strip()
+
+    # Battery temperature (deci-degC) — cheap one-line read.
+    batt_temp_raw = _sh("cat /sys/class/power_supply/battery/temp 2>/dev/null").strip()
+    try:
+        batt_temp_c = int(batt_temp_raw) / 10.0
+        batt_temp = f"{batt_temp_c:.1f}°C"
+    except ValueError:
+        batt_temp = batt_temp_raw or "?"
+
+    # GPU busy %. Try Mali sysfs, then Adreno KGSL.
+    gpu = _sh(
+        "cat /sys/class/misc/mali0/device/utilization 2>/dev/null || "
+        "cat /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null"
+    ).strip()
+    if not gpu:
+        gpu = "?"
+
+    # FPS from xemu's own overlay (writes to logcat tag "xemu" / on-screen).
+    # As a cheap proxy, pull the most recent gfxinfo line.
+    gfx = _sh(
+        f"dumpsys gfxinfo {PKG} 2>/dev/null | "
+        f"grep -m1 'Janky frames:' || true"
+    ).strip()
+
+    # Keepalive daemon.
+    ka_pid = _sh(f"cat {KEEPALIVE_PID} 2>/dev/null").strip()
+    if ka_pid and ka_pid.isdigit():
+        alive = _sh(f"test -d /proc/{ka_pid} && echo yes || echo no").strip()
+        hb = _sh(f"cat {KEEPALIVE_HB} 2>/dev/null").strip()
+        now = _sh("date +%s").strip()
+        try:
+            age = int(now) - int(hb) if hb else "?"
+        except ValueError:
+            age = "?"
+        ka = f"pid={ka_pid} alive={alive} last_hb={age}s"
+    else:
+        ka = "not running"
+
+    lines = [
+        "=== device_status ===",
+        f"power:        {wake or '(unknown)'}",
+        f"foreground:   {top or '(unknown)'}",
+        f"x1box.ui:     {ui or 'not running'}",
+        f"x1box.emu:    {emu or 'not running'}",
+        f"battery_temp: {batt_temp}",
+        f"gpu_busy:     {gpu}",
+        f"gfx_jank:     {gfx or '(no gfxinfo)'}",
+        f"keepalive:    {ka}",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +1043,775 @@ def get_gfxinfo() -> str:
     """Frame timing / jank stats for X1 BOX (dumpsys gfxinfo)."""
     if not _device(): return "No device connected."
     return _sh(f"dumpsys gfxinfo {PKG}")
+
+
+# User-visible FPS is measured from xemu's own host-swap callsite. ui/xemu.c
+# emits one logcat line per SDL_GL_SwapWindow under the tag "xemu-fps":
+#
+#     11-20 14:32:10.123 12345 12999 I xemu-fps: f=4711 g=823 t=98765432109876
+#
+# Three counters are captured per swap:
+#   f = g_android_frame_counter         (host swap counter)
+#   g = g_nv2a_stats.frame_count        (guest NV097_FLIP_STALL ticks —
+#                                        rate the Xbox produced new frames)
+#   t = CLOCK_MONOTONIC ns after swap returns
+#
+# Host swap fires every ~16ms regardless of whether the guest produced
+# anything new, so delta(f)/dt is misleading. delta(g)/dt is the rate
+# at which a NEW guest framebuffer reached the swap site — i.e. the
+# rate of unique frames the user actually saw on screen.
+#
+# Why not SurfaceFlinger --latency? On Android 14+ with BLAST surfaces the
+# legacy --latency dumper does not populate frame triples for SurfaceView-
+# backed apps like x1-box — empirically it returns just the refresh period.
+_FPS_LOGCAT_RE = re.compile(r"\bf=(\d+)\s+g=(\d+)\s+t=(\d+)\b")
+# Backward-compat: APKs from the first iteration of the instrumentation
+# emit only f= and t= (no g=). Parse those too and report degraded mode.
+_FPS_LOGCAT_RE_LEGACY = re.compile(r"\bf=(\d+)\s+t=(\d+)\b")
+
+
+def _percentile(sorted_vals: list[float], pct: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    idx = (len(sorted_vals) - 1) * (pct / 100.0)
+    lo = int(idx)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    frac = idx - lo
+    return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+
+
+@mcp.tool()
+def measure_fps(duration: float = 5.0) -> str:
+    """User-visible FPS: unique guest-rendered frames per second.
+
+    Drains logcat for the `xemu-fps` tag emitted by ui/xemu.c after every
+    SDL_GL_SwapWindow. The host swaps a buffer ~every refresh tick whether
+    or not the guest produced anything new, so swap-rate is the wrong
+    answer — what the user actually sees is unique guest frames. We get
+    that from nv2a's NV097_FLIP_STALL counter (`g=`), snapshot at swap
+    time, and report:
+        - User-visible FPS: delta(guest flip counter) / window seconds
+          — the rate of unique frames hitting the screen, what the
+          eye perceives. NOT the panel refresh rate, NOT nv2a's
+          internal sim rate (which doesn't account for whether the
+          host swapped the guest frame).
+        - Host swap FPS:   delta(swap counter) / window — for diagnostic
+          context.
+        - Unique-frame ratio: how many host swaps showed a new guest
+          frame vs. re-blitted the previous one.
+        - Per-unique-frame intervals + percentiles, computed from the
+          host-side timestamps of swaps where g advanced.
+
+    Args:
+        duration: sampling window in seconds (default 5.0).
+
+    Requires the `g=` field in the log line (added 2026-05-20). Older
+    builds fall back to swap-only reporting with a warning.
+    """
+    if not _device():
+        return "No device connected."
+    if duration <= 0:
+        return "duration must be > 0."
+
+    # xemu-fps is emitted from the :xemu process, NOT the launcher UI.
+    # We don't filter by pid since the tag is unique to xemu's swap site
+    # and :xemu can respawn mid-sample.
+    if not _emu_pid() and not _ui_pid():
+        return f"{PKG} is not running. Launch it before sampling."
+
+    _adb("logcat", "-c")
+    time.sleep(duration)
+    raw = _sh("logcat -d -s xemu-fps:I")
+    lines = raw.splitlines() if raw else []
+
+    # Each sample: (host_swap_count, guest_flip_count, mono_ns).
+    # legacy samples (no g=) record guest=None.
+    samples: list[tuple[int, int | None, int]] = []
+    for ln in lines:
+        m = _FPS_LOGCAT_RE.search(ln)
+        if m:
+            samples.append((int(m.group(1)), int(m.group(2)), int(m.group(3))))
+            continue
+        m = _FPS_LOGCAT_RE_LEGACY.search(ln)
+        if m:
+            samples.append((int(m.group(1)), None, int(m.group(2))))
+
+    if len(samples) < 2:
+        return (f"Got {len(samples)} xemu-fps samples in {duration:.2f}s. "
+                f"Either xemu isn't swapping (paused / background / boot "
+                f"animation in slot 0), or the running APK predates the "
+                f"`xemu-fps` instrumentation in ui/xemu.c. "
+                f"Try `logcat -d -s xemu-fps:I` to inspect manually.")
+
+    samples.sort(key=lambda s: s[2])
+    swap_counter = [s[0] for s in samples]
+    guest_counter = [s[1] for s in samples]
+    timestamps = [s[2] for s in samples]
+
+    legacy_mode = any(g is None for g in guest_counter)
+
+    span_ns = timestamps[-1] - timestamps[0]
+    if span_ns <= 0:
+        return f"Got {len(samples)} samples but zero-duration window."
+
+    swap_delta = swap_counter[-1] - swap_counter[0]
+    swap_fps = swap_delta / (span_ns / 1e9)
+
+    out: list[str] = ["=== User-visible FPS (xemu host-swap + nv2a flip) ==="]
+    out.append(f"Sample window    : {duration:.2f}s requested, "
+               f"{span_ns/1e9:.2f}s observed")
+    out.append(f"Swap log lines   : {len(samples)} "
+               f"(swap-counter delta {swap_delta})")
+    out.append("")
+
+    if legacy_mode:
+        out.append("WARNING: log lines missing g= field — running an older APK. "
+                   "Rebuild from current source to get the user-visible (guest "
+                   "flip) FPS. Reporting swap-rate only:")
+        out.append(f"Host swap FPS    : {swap_fps:6.2f}")
+        return "\n".join(out)
+
+    guest_delta = guest_counter[-1] - guest_counter[0]
+    user_fps = guest_delta / (span_ns / 1e9)
+
+    # Find swaps that carried a NEW guest frame (g advanced since previous
+    # swap). Per-unique-frame intervals come from the host monotonic ns at
+    # those swaps — that's when the user's eyes saw the frame change.
+    unique_swap_ts: list[int] = [timestamps[0]] if guest_counter[0] is not None else []
+    for i in range(1, len(samples)):
+        if guest_counter[i] != guest_counter[i - 1]:
+            unique_swap_ts.append(timestamps[i])
+
+    out.append(f"Guest flips (NV097_FLIP_STALL) : {guest_delta}")
+    out.append(f"Unique-frame swaps             : {len(unique_swap_ts)}")
+    duplicate = swap_delta - guest_delta
+    duplicate_pct = (100.0 * duplicate / swap_delta) if swap_delta > 0 else 0.0
+    out.append(f"Duplicate swaps                : {duplicate} ({duplicate_pct:.1f}% of "
+               f"swaps re-blitted the previous frame)")
+    out.append("")
+    out.append(f"USER-VISIBLE FPS : {user_fps:6.2f}   <-- what the eye sees")
+    out.append(f"Host swap FPS    : {swap_fps:6.2f}   (for context — capped at "
+               f"display refresh)")
+    out.append("")
+
+    intervals_ns = [b - a for a, b in zip(unique_swap_ts, unique_swap_ts[1:]) if b > a]
+    long_stall_threshold_ns = 2_000_000_000
+    stalls = [i for i in intervals_ns if i >= long_stall_threshold_ns]
+    clean = [i for i in intervals_ns if i < long_stall_threshold_ns]
+
+    if len(clean) >= 2:
+        mean_int = sum(clean) / len(clean)
+        sc = sorted(clean)
+        median_int = _percentile(sc, 50.0)
+        p5_int = _percentile(sc, 5.0)
+        p95_int = _percentile(sc, 95.0)
+        p99_int = _percentile(sc, 99.0)
+        fps_median = 1e9 / median_int if median_int > 0 else 0.0
+        fps_best5 = 1e9 / p5_int if p5_int > 0 else 0.0
+        fps_low5 = 1e9 / p95_int if p95_int > 0 else 0.0
+        fps_low1 = 1e9 / p99_int if p99_int > 0 else 0.0
+        var = sum((i - mean_int) ** 2 for i in clean) / (len(clean) - 1) \
+              if len(clean) > 1 else 0.0
+        stddev_ms = (var ** 0.5) / 1e6
+        jitter_pct = 100.0 * (var ** 0.5) / mean_int if mean_int else 0.0
+
+        out.append(f"FPS median       : {fps_median:6.2f}")
+        out.append(f"FPS 1%-low       : {fps_low1:6.2f}   (slowest 1% of unique frames)")
+        out.append(f"FPS 5%-low       : {fps_low5:6.2f}   (slowest 5% of unique frames)")
+        out.append(f"FPS best 5%      : {fps_best5:6.2f}")
+        out.append("")
+        out.append(f"Unique-frame interval : mean {mean_int/1e6:.2f} ms, "
+                   f"median {median_int/1e6:.2f} ms")
+        out.append(f"Jitter           : stddev {stddev_ms:.2f} ms ({jitter_pct:.1f}%)")
+        if stalls:
+            out.append(f"Long stalls      : {len(stalls)} (>2s, excluded from "
+                       f"percentile math)")
+    elif user_fps < 0.1:
+        out.append("(guest counter did not advance — emulator paused, on a static "
+                   "menu xemu hasn't reached, or pre-FLIP_STALL boot)")
+    else:
+        out.append("(too few unique frames in window for percentile stats; "
+                   "increase duration)")
+
+    return "\n".join(out)
+
+
+# Audio-trace log line shape from hw/xbox/mcpx/apu/apu.c:
+#   prod : hakuX-apu-prod : t=<ns> q_pre=<bytes> q_post=<bytes> peak=<int> work_us=<us> div=<frame_div>
+#   cons : hakuX-apu-cons : t=<ns> req=<bytes> avail=<bytes> copied=<bytes> underrun=<0|1>
+#   throt: hakuX-apu-throt: t=<ns> reason=deadline qb=<bytes> slip_us=<int> limit_us=<int>
+# Enabled by $X1BOX_AUDIO_TRACE=1 OR by touch <ext>/x1box/audio_trace.flag.
+# The file-based gate is the easy-to-flip path — no rebuild required.
+_AUDIO_PROD_RE  = re.compile(r"t=(\d+)\s+q_pre=(\d+)\s+q_post=(\d+)\s+peak=(\d+)\s+work_us=(\d+)\s+div=(\d+)")
+_AUDIO_CONS_RE  = re.compile(
+    r"t=(\d+)\s+req=(\d+)\s+avail=(\d+)\s+copied=(\d+)\s+underrun=([01])"
+    r"(?:\s+dur_us=(\d+))?"
+)
+_AUDIO_FFWAIT_RE = re.compile(
+    r"t=(\d+)\s+kind=ffwait\s+wait_us=(\d+)\s+qb_entry=(\d+)\s+"
+    r"qb_exit=(\d+)\s+iters=(\d+)"
+)
+_AUDIO_THROT_RE = re.compile(r"t=(\d+)\s+reason=(\w+)\s+qb=(-?\d+)\s+slip_us=(-?\d+)\s+limit_us=(\d+)")
+_AUDIO_VDISP_RE = re.compile(r"t=(\d+)\s+total=(\d+)\s+silent_env=(\d+)\s+silent_vol=(\d+)\s+processed=(\d+)\s+work_us=(\d+)\s+mode=(\w+)")
+# hakuX-apu-bql is emitted only on slow acquisitions/runs (filter is in C).
+# Two shapes:
+#   kind=bql_lock     acq_us=<int>             — bql_lock held for >1ms by vCPU
+#   kind=dlock_post_irq acq_us=<int>           — d->lock reacquire after IRQ held >1ms
+#   kind=se_or_dlock  se_us=<int> dlock_us=<int> — se_frame >5ms OR dlock reacquire >1ms
+_AUDIO_BQL_RE_SIMPLE = re.compile(r"t=(\d+)\s+kind=(bql_lock|dlock_post_irq)\s+acq_us=(\d+)")
+_AUDIO_BQL_RE_SED    = re.compile(r"t=(\d+)\s+kind=se_or_dlock\s+se_us=(\d+)\s+dlock_us=(\d+)")
+
+
+def _audio_trace_flag_paths() -> list[str]:
+    """Both possible flag-file locations — standard + perftest packages.
+    The C code's android_x1box_ext_dir() reads /proc/self/cmdline to pick
+    the right one at runtime; here we return both so the MCP user can
+    enable for whichever variant they happen to be running."""
+    return [
+        "/storage/emulated/0/Android/data/com.izzy2lost.x1box/files/x1box/audio_trace.flag",
+        "/storage/emulated/0/Android/data/com.izzy2lost.x1box.perftest/files/x1box/audio_trace.flag",
+    ]
+
+
+@mcp.tool()
+def audio_trace_enable() -> str:
+    """Enable APU producer/consumer/throttle tracing without a rebuild.
+
+    Creates `<ext>/x1box/audio_trace.flag` in BOTH the standard and
+    perftest data dirs so whichever variant launches next picks it up.
+    The C-side check `audio_trace_enabled()` stats this file at first
+    call per process and caches the result, so a re-launch of :xemu is
+    required for the flag change to take effect (force_stop the package
+    or restart from the launcher).
+
+    Once enabled, ~17 KB/s of logcat is emitted under tags
+    `hakuX-apu-prod`, `hakuX-apu-cons`, `hakuX-apu-throt`. Drain via
+    `audio_trace_analyze(duration_s)`.
+    """
+    if not _device(): return "No device connected."
+    # IMPORTANT history: a plain `touch` from the adb shell uid on the
+    # external path creates a file the app uid CANNOT stat() — FUSE/
+    # sdcardfs remaps writes from non-app uids and gates app-side reads
+    # of those files (permission denied even with mode 660). Writing via
+    # `run-as <pkg>` to external storage *also* fails because the FUSE
+    # layer rejects the write context.
+    #
+    # The C-side now (audio_trace.h) checks BOTH:
+    #   1. <ext>/x1box/audio_trace.flag (matches frame_stats.flag pattern)
+    #   2. /data/data/<pkg>/files/audio_trace.flag (this tool's path)
+    # We write the INTERNAL path via run-as, which works reliably for
+    # any debuggable build, and the C code finds it on check #2.
+    created = []
+    failed  = []
+    packages = ["com.izzy2lost.x1box", "com.izzy2lost.x1box.perftest"]
+    for pkg in packages:
+        # /data/data/<pkg>/files/ is owned by the app uid; run-as has
+        # full uid context there. Create files/ if missing (it's the
+        # normal AppContext.getFilesDir() target, but might not exist
+        # until the app has actually written to it).
+        path = f"/data/data/{pkg}/files/audio_trace.flag"
+        result = _sh(
+            f"run-as {pkg} mkdir -p /data/data/{pkg}/files 2>&1; "
+            f"run-as {pkg} touch {path} 2>&1; "
+            f"run-as {pkg} ls -la {path} 2>&1"
+        )
+        if result and "audio_trace.flag" in result and "denied" not in result.lower():
+            created.append(f"{path}  (uid={pkg})")
+        else:
+            failed.append(f"{path}: {result.strip() or 'unknown error'}")
+    out = ["=== audio_trace_enable ==="]
+    for p in created:
+        out.append(f"  set: {p}")
+    for f in failed:
+        out.append(f"  fail: {f}")
+    if not created:
+        out.append("No flags set. The packages may not be debuggable, or "
+                   "the files dir doesn't exist (launch the app once first).")
+    out.append("\nNOTE: re-launch :xemu (force_stop or relaunch from "
+               "launcher) so the cached `audio_trace_enabled` flag picks "
+               "up the new state.")
+    return "\n".join(out)
+
+
+@mcp.tool()
+def audio_trace_disable() -> str:
+    """Remove the audio_trace.flag from both data dirs.
+
+    The C-side flag is process-cached at first frame, so a running :xemu
+    will continue emitting trace lines until restart even after the flag
+    is gone. Re-launch to actually stop the spam.
+    """
+    if not _device(): return "No device connected."
+    out = ["=== audio_trace_disable ==="]
+    # Remove from the internal-data path (where audio_trace_enable now
+    # writes) AND clean up any stale flag in the external path from
+    # older versions of this tool.
+    for pkg in ["com.izzy2lost.x1box", "com.izzy2lost.x1box.perftest"]:
+        internal_path = f"/data/data/{pkg}/files/audio_trace.flag"
+        external_path = (f"/storage/emulated/0/Android/data/{pkg}/files/"
+                         f"x1box/audio_trace.flag")
+        _sh(f"run-as {pkg} rm -f {internal_path} 2>&1")
+        _sh(f"rm -f {external_path} 2>&1")
+        out.append(f"  rm -f {internal_path}")
+        out.append(f"  rm -f {external_path}")
+    out.append("\nNOTE: re-launch :xemu to stop emission. Running process "
+               "has the enabled state cached for its lifetime.")
+    return "\n".join(out)
+
+
+@mcp.tool()
+def audio_trace_analyze(duration: float = 10.0, package: str = "") -> str:
+    """Diagnose audio-stutter cause from on-device APU trace logs.
+
+    Enable on-device first by setting X1BOX_AUDIO_TRACE=1 in the running
+    process's env. The simplest path is to add it to the launcher's
+    setenv list in xemu_settings_android.cc — once flipped, every APU
+    frame push, every audio-callback drain, and every throttle catch-up
+    snap emits a structured line under tags `hakuX-apu-{prod,cons,throt}`.
+
+    This tool:
+      1. Clears logcat (loses unrelated history — accept).
+      2. Sleeps `duration` seconds.
+      3. Drains the three tags and parses every line.
+      4. Reports the *cause* of any audio stutter visible in the window:
+            - Underrun count + cadence (consumer copied < requested).
+            - Throttle snap count (producer slipped past 43ms catchup
+              window, dropping audio frames).
+            - Slow-frame count (producer work_us > EP_FRAME_US=5333).
+            - Silent-but-claimed frames (peak == 0 surrounded by audible
+              frames — points at fast-path mis-silencing).
+            - Producer inter-push gap percentiles (regular = healthy).
+            - Consumer inter-callback gap percentiles (AAudio burst-size
+              jitter shows up here).
+
+    A "clip + blank @ 250-500ms" stutter pattern is conclusively
+    identified by:
+      - Underrun events on the consumer side at ~3-4 Hz cadence
+      - Throttle snaps in the same window, OR producer inter-push gaps
+        > 6ms in the same window
+      - The PRODUCER's `q_post` at the snap-or-slow moment shows the
+        FIFO state at the moment of the gap
+
+    Args:
+        duration: sampling window in seconds (default 10). 5-30 is sane.
+        package: 'standard' (com.izzy2lost.x1box, default), 'perftest'
+            (com.izzy2lost.x1box.perftest), or empty to auto-detect.
+
+    Returns a multi-section human-readable report.
+    """
+    if not _device():
+        return "No device connected."
+    if duration <= 0:
+        return "duration must be > 0."
+
+    # Verify a target process is running before we clear logcat. The
+    # caller wants the *xemu* subprocess specifically since the trace
+    # is emitted from it, not the launcher.
+    if not _emu_pid():
+        return ("xemu emulation process not running. Launch a game first.\n"
+                "Then enable tracing by ensuring the running APK has\n"
+                "X1BOX_AUDIO_TRACE=1 set (via xemu_settings_android.cc\n"
+                "setenv, or by directly exporting it before launch).")
+
+    _adb("logcat", "-c")
+    time.sleep(duration)
+    raw = _sh(
+        "logcat -d -s hakuX-apu-prod:I hakuX-apu-cons:I "
+        "hakuX-apu-throt:W hakuX-apu-vdisp:I hakuX-apu-bql:W"
+    )
+    if not raw:
+        return "logcat returned nothing — trace flag may not be enabled."
+
+    prod: list[tuple[int, int, int, int, int, int]] = []  # t, q_pre, q_post, peak, work_us, div
+    cons: list[tuple[int, int, int, int, int, int]] = []  # t, req, avail, copied, underrun, dur_us
+    throt: list[tuple[int, str, int, int, int]] = []     # t, reason, qb, slip_us, limit_us
+    vdisp: list[tuple[int, int, int, int, int, int, str]] = []  # t, total, silent_env, silent_vol, processed, work_us, mode
+    bql: list[tuple[int, str, int]] = []                # t, kind, acq_us  (bql_lock | dlock_post_irq | se | dlock)
+
+    for ln in raw.splitlines():
+        m = _AUDIO_PROD_RE.search(ln)
+        if m:
+            prod.append((int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                         int(m.group(4)), int(m.group(5)), int(m.group(6))))
+            continue
+        m = _AUDIO_CONS_RE.search(ln)
+        if m:
+            dur_us = int(m.group(6)) if m.group(6) else -1
+            cons.append((int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                         int(m.group(4)), int(m.group(5)), dur_us))
+            continue
+        m = _AUDIO_FFWAIT_RE.search(ln)
+        if m:
+            bql.append((int(m.group(1)), "ffwait", int(m.group(2))))
+            continue
+        m = _AUDIO_THROT_RE.search(ln)
+        if m:
+            throt.append((int(m.group(1)), m.group(2), int(m.group(3)),
+                          int(m.group(4)), int(m.group(5))))
+            continue
+        m = _AUDIO_VDISP_RE.search(ln)
+        if m:
+            vdisp.append((int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                          int(m.group(4)), int(m.group(5)), int(m.group(6)),
+                          m.group(7)))
+            continue
+        m = _AUDIO_BQL_RE_SIMPLE.search(ln)
+        if m:
+            bql.append((int(m.group(1)), m.group(2), int(m.group(3))))
+            continue
+        m = _AUDIO_BQL_RE_SED.search(ln)
+        if m:
+            t = int(m.group(1))
+            se_us = int(m.group(2))
+            dlock_us = int(m.group(3))
+            if se_us > 5000:
+                bql.append((t, "se_frame_slow", se_us))
+            if dlock_us > 1000:
+                bql.append((t, "dlock_post_se", dlock_us))
+
+    if not prod and not cons and not throt and not vdisp and not bql:
+        return (f"Got 0 trace events in {duration:.1f}s.\n"
+                f"Either X1BOX_AUDIO_TRACE is not set in the running\n"
+                f"process, or the build doesn't have the trace instrumentation.\n"
+                f"To enable: add `setenv(\"X1BOX_AUDIO_TRACE\", \"1\", 1)`\n"
+                f"to android/app/src/main/cpp/xemu_settings_android.cc,\n"
+                f"rebuild, install, relaunch.")
+
+    out: list[str] = []
+    out.append("=== Audio trace analysis ===")
+    out.append(f"Window: {duration:.1f}s   prod={len(prod)}  cons={len(cons)}  "
+               f"throt={len(throt)}  vdisp={len(vdisp)}  bql_stalls={len(bql)}")
+
+    # --- Underruns (consumer ran out of FIFO data) ---
+    underruns = [c for c in cons if c[4] == 1]
+    if underruns:
+        # Compute spacing between underruns to detect cadence.
+        if len(underruns) > 1:
+            gaps_ms = [(underruns[i+1][0] - underruns[i][0]) / 1e6
+                       for i in range(len(underruns) - 1)]
+            gaps_ms.sort()
+            p50_gap = _percentile(gaps_ms, 50)
+            p95_gap = _percentile(gaps_ms, 95)
+            mean_rate = len(underruns) / duration
+            out.append(f"\n>>> UNDERRUNS: {len(underruns)} ({mean_rate:.2f}/s)  "
+                       f"gap_ms p50={p50_gap:.0f}  p95={p95_gap:.0f}")
+        else:
+            out.append(f"\n>>> UNDERRUNS: 1 (insufficient for cadence)")
+        # Sample the first few underruns to show shortfall sizes.
+        for i, c in enumerate(underruns[:5]):
+            t, req, avail, copied, _, _ = c
+            short = req - copied
+            out.append(f"  [{i}] t={t} req={req}B avail={avail}B copied={copied}B "
+                       f"shortfall={short}B ({short/(req or 1)*100:.0f}%)")
+        if len(underruns) > 5:
+            out.append(f"  ...({len(underruns)-5} more)")
+    else:
+        out.append("\nUNDERRUNS: none — consumer was always fed in this window.")
+
+    # --- Throttle catch-up snaps (producer lost time) ---
+    if throt:
+        snap_rate = len(throt) / duration
+        slips_us = sorted(t[3] for t in throt)
+        out.append(f"\n>>> THROTTLE SNAPS: {len(throt)} ({snap_rate:.2f}/s) — "
+                   f"producer slipped past catch-up budget")
+        out.append(f"  slip_us p50={_percentile(slips_us, 50):.0f}  "
+                   f"p95={_percentile(slips_us, 95):.0f}  "
+                   f"max={slips_us[-1]:.0f}")
+        for i, ev in enumerate(throt[:5]):
+            t, reason, qb, slip, limit = ev
+            out.append(f"  [{i}] t={t} reason={reason} qb={qb}B "
+                       f"slip={slip}us limit={limit}us")
+        if len(throt) > 5:
+            out.append(f"  ...({len(throt)-5} more)")
+    else:
+        out.append("\nTHROTTLE SNAPS: none — producer kept pace in this window.")
+
+    # --- Producer inter-push gap analysis ---
+    if len(prod) > 1:
+        prod_sorted = sorted(prod, key=lambda x: x[0])
+        deltas_ms = [(prod_sorted[i+1][0] - prod_sorted[i][0]) / 1e6
+                     for i in range(len(prod_sorted) - 1)]
+        deltas_ms.sort()
+        # Producer should push every EP_FRAME_US = 5.333ms when not throttled.
+        # Anything > 6 ms is a slip; > 10 ms is severe.
+        slips = [d for d in deltas_ms if d > 6.0]
+        severe = [d for d in deltas_ms if d > 10.0]
+        out.append(f"\n--- Producer inter-push gaps (target ~5.33ms) ---")
+        out.append(f"  p50={_percentile(deltas_ms, 50):.2f}ms  "
+                   f"p95={_percentile(deltas_ms, 95):.2f}ms  "
+                   f"p99={_percentile(deltas_ms, 99):.2f}ms  "
+                   f"max={deltas_ms[-1]:.2f}ms")
+        out.append(f"  slips>6ms: {len(slips)}  severe>10ms: {len(severe)}")
+
+        # Work-time analysis: how long was se_frame busy each push?
+        works_us = sorted(p[4] for p in prod)
+        out.append(f"--- Producer work_us (EP_FRAME_US=5333) ---")
+        out.append(f"  p50={_percentile(works_us, 50):.0f}us  "
+                   f"p95={_percentile(works_us, 95):.0f}us  "
+                   f"p99={_percentile(works_us, 99):.0f}us  "
+                   f"max={works_us[-1]:.0f}us")
+        slow = [w for w in works_us if w > 5333]
+        if slow:
+            out.append(f"  SLOW FRAMES (work_us > 5333): {len(slow)} "
+                       f"({len(slow)*100/len(works_us):.1f}% of total)")
+
+        # FIFO occupancy at push time (q_post tells us if we're refilling
+        # from low watermark — points at recent underrun recovery).
+        q_posts = sorted(p[2] for p in prod)
+        out.append(f"--- FIFO occupancy at push time ---")
+        out.append(f"  q_post p5={_percentile(q_posts, 5):.0f}B  "
+                   f"p50={_percentile(q_posts, 50):.0f}B  "
+                   f"p95={_percentile(q_posts, 95):.0f}B")
+
+    # --- Silent-frame detection ---
+    # A 'suspicious silent' frame = peak==0 within a run of audible frames
+    # (audible neighbors on both sides). This is the signature of voice
+    # processing returning zeros for a frame that should have had audio.
+    if len(prod) > 2:
+        prod_sorted = sorted(prod, key=lambda x: x[0])
+        peaks = [p[3] for p in prod_sorted]
+        suspicious = []
+        for i in range(1, len(peaks) - 1):
+            if peaks[i] == 0 and peaks[i-1] > 100 and peaks[i+1] > 100:
+                suspicious.append((prod_sorted[i][0], peaks[i-1], peaks[i+1]))
+        total_silent = sum(1 for p in peaks if p == 0)
+        out.append(f"\n--- Silent frames (peak==0) ---")
+        out.append(f"  total: {total_silent} / {len(peaks)} "
+                   f"({total_silent*100/len(peaks):.1f}%)")
+        if suspicious:
+            out.append(f"  SUSPICIOUS (silent between audible neighbors): "
+                       f"{len(suspicious)}")
+            for i, (t, prev_peak, next_peak) in enumerate(suspicious[:5]):
+                out.append(f"    [{i}] t={t} prev_peak={prev_peak} "
+                           f"next_peak={next_peak}")
+
+    # --- Lock-acquisition stalls (the actual stall source if it's lock-related) ---
+    if bql:
+        by_kind: dict[str, list[int]] = {}
+        for t, kind, acq_us in bql:
+            by_kind.setdefault(kind, []).append(acq_us)
+        out.append(f"\n>>> LOCK-STALL EVENTS: {len(bql)} total")
+        for kind, vals in sorted(by_kind.items()):
+            vs = sorted(vals)
+            rate = len(vs) / duration
+            out.append(f"  kind={kind:18s} n={len(vs):4d} ({rate:.2f}/s)  "
+                       f"p50={_percentile(vs, 50):.0f}us  "
+                       f"p95={_percentile(vs, 95):.0f}us  "
+                       f"max={vs[-1]}us")
+        # Show the top 5 longest events as full traces.
+        bql_sorted = sorted(bql, key=lambda x: -x[2])
+        out.append("  longest stalls:")
+        for i, (t, kind, acq_us) in enumerate(bql_sorted[:5]):
+            out.append(f"    [{i}] t={t} kind={kind} acq={acq_us}us "
+                       f"(={acq_us/1000:.1f}ms)")
+    else:
+        out.append("\nLOCK-STALL EVENTS: none above thresholds "
+                   "(>1ms bql/d->lock, >5ms se_frame).")
+
+    # --- Voice dispatch breakdown (silent-voice fast-path elision rate) ---
+    if vdisp:
+        vd_sorted = sorted(vdisp, key=lambda x: x[0])
+        totals = [v[1] for v in vd_sorted]
+        env_skips = [v[2] for v in vd_sorted]
+        vol_skips = [v[3] for v in vd_sorted]
+        processed = [v[4] for v in vd_sorted]
+        vd_works = [v[5] for v in vd_sorted]
+        total_sum = sum(totals)
+        env_sum = sum(env_skips)
+        vol_sum = sum(vol_skips)
+        proc_sum = sum(processed)
+        out.append(f"\n--- Voice dispatch (per-frame, mode={vd_sorted[-1][6]}) ---")
+        out.append(f"  frames: {len(vd_sorted)}   "
+                   f"voices total: {total_sum}   "
+                   f"~{total_sum/max(1,len(vd_sorted)):.1f}/frame")
+        if total_sum > 0:
+            out.append(f"  silent_env: {env_sum} ({env_sum*100/max(1,total_sum):.1f}%)  "
+                       f"silent_vol: {vol_sum} ({vol_sum*100/max(1,total_sum):.1f}%)  "
+                       f"processed: {proc_sum} ({proc_sum*100/max(1,total_sum):.1f}%)")
+        works_sorted = sorted(vd_works)
+        out.append(f"  vdisp work_us p50={_percentile(works_sorted, 50):.0f}  "
+                   f"p95={_percentile(works_sorted, 95):.0f}  "
+                   f"max={works_sorted[-1] if works_sorted else 0}")
+
+        # If silent-voice elision rate spikes briefly, that's the
+        # smoking-gun for clip+blank stutter. Find frames where
+        # (silent_env + silent_vol) / total > 90% surrounded by frames
+        # where it's < 50%.
+        silent_spikes = []
+        for i in range(1, len(vd_sorted) - 1):
+            tot, se, sv = vd_sorted[i][1], vd_sorted[i][2], vd_sorted[i][3]
+            if tot < 4:
+                continue
+            ratio = (se + sv) / tot
+            prev_tot = vd_sorted[i-1][1]
+            next_tot = vd_sorted[i+1][1]
+            prev_ratio = ((vd_sorted[i-1][2] + vd_sorted[i-1][3]) /
+                          prev_tot) if prev_tot > 0 else 0.0
+            next_ratio = ((vd_sorted[i+1][2] + vd_sorted[i+1][3]) /
+                          next_tot) if next_tot > 0 else 0.0
+            if ratio > 0.9 and prev_ratio < 0.5 and next_ratio < 0.5:
+                silent_spikes.append((vd_sorted[i][0], tot, se, sv,
+                                      vd_sorted[i][4]))
+        if silent_spikes:
+            out.append(f"  SILENT-ELISION SPIKES (>90% elided between "
+                       f"<50% neighbors): {len(silent_spikes)}")
+            for i, (t, tot, se, sv, proc) in enumerate(silent_spikes[:5]):
+                out.append(f"    [{i}] t={t} total={tot} env={se} vol={sv} "
+                           f"processed={proc}")
+
+    # --- Cross-correlation: underrun moments vs voice dispatch state ---
+    # For each underrun, find the closest vdisp event (within ±5ms) and
+    # report what was happening voice-wise. If underruns consistently
+    # follow high-elision frames, the silent-voice gate is the cause.
+    if underruns and vdisp:
+        vd_sorted = sorted(vdisp, key=lambda x: x[0])
+        vd_times = [v[0] for v in vd_sorted]
+        out.append("\n--- Underrun-vs-vdisp correlation ---")
+        elide_at_underrun = []
+        for ur in underruns[:20]:
+            ur_t = ur[0]
+            # Binary search would be cleaner; len(vd_times) is small enough.
+            best = min(vd_sorted, key=lambda v: abs(v[0] - ur_t))
+            if abs(best[0] - ur_t) <= 5_000_000:  # within 5ms
+                tot = best[1]
+                elide_pct = ((best[2] + best[3]) / tot * 100) if tot > 0 else 0
+                elide_at_underrun.append(elide_pct)
+        if elide_at_underrun:
+            elide_at_underrun.sort()
+            out.append(f"  elide% at underrun moments (n={len(elide_at_underrun)}): "
+                       f"p50={_percentile(elide_at_underrun, 50):.1f}  "
+                       f"max={elide_at_underrun[-1]:.1f}")
+
+    # --- Consumer inter-callback gap analysis ---
+    if len(cons) > 1:
+        cons_sorted = sorted(cons, key=lambda x: x[0])
+        deltas_ms = sorted((cons_sorted[i+1][0] - cons_sorted[i][0]) / 1e6
+                           for i in range(len(cons_sorted) - 1))
+        out.append(f"\n--- Consumer inter-callback gaps ---")
+        out.append(f"  p50={_percentile(deltas_ms, 50):.2f}ms  "
+                   f"p95={_percentile(deltas_ms, 95):.2f}ms  "
+                   f"p99={_percentile(deltas_ms, 99):.2f}ms  "
+                   f"max={deltas_ms[-1]:.2f}ms")
+
+        # Callback duration: if dur_us is available, this tells us how
+        # much time WE spent inside the callback. Combined with the
+        # inter-callback gap, this discriminates "audio backend isn't
+        # calling us" (long gap, short dur) from "our code is slow"
+        # (long dur).
+        durs_us = [c[5] for c in cons_sorted if c[5] >= 0]
+        if durs_us:
+            durs_sorted = sorted(durs_us)
+            slow_cb = [d for d in durs_us if d > 5000]  # >5ms is slow
+            out.append(f"--- Consumer callback duration (time inside our cb) ---")
+            out.append(f"  p50={_percentile(durs_sorted, 50):.0f}us  "
+                       f"p95={_percentile(durs_sorted, 95):.0f}us  "
+                       f"p99={_percentile(durs_sorted, 99):.0f}us  "
+                       f"max={durs_sorted[-1]}us")
+            if slow_cb:
+                out.append(f"  SLOW CALLBACKS (dur > 5ms): {len(slow_cb)}")
+
+            # Discriminate cause of long inter-callback gaps. If the
+            # NEXT callback's dur is short but the gap before it was
+            # long, the audio backend held us off (silence happens
+            # because no audio was demanded). If dur is large the
+            # callback itself stalled.
+            backend_gates = 0
+            self_stalls = 0
+            for i in range(1, len(cons_sorted)):
+                gap_ms = (cons_sorted[i][0] - cons_sorted[i-1][0]) / 1e6
+                if gap_ms < 50:  # threshold for "long gap"
+                    continue
+                prev_dur_ms = cons_sorted[i-1][5] / 1000.0 \
+                              if cons_sorted[i-1][5] >= 0 else 0
+                if prev_dur_ms < 5.0:
+                    backend_gates += 1
+                else:
+                    self_stalls += 1
+            if backend_gates or self_stalls:
+                out.append(f"  >50ms gaps: backend-gated={backend_gates}  "
+                           f"self-stalled={self_stalls}")
+
+    # --- Verdict ---
+    out.append("\n=== Verdict ===")
+    bql_kinds = {k for _, k, _ in bql}
+    has_bql_stall = any(k == "bql_lock" for _, k, _ in bql)
+    has_dlock_stall = any(k.startswith("dlock") for _, k, _ in bql)
+    has_se_slow = any(k == "se_frame_slow" for _, k, _ in bql)
+    has_ffwait = any(k == "ffwait" for _, k, _ in bql)
+    # Magnitude check: pick the biggest single stall and compare to
+    # observed producer-gap p99. If max bql_lock < 1/3 of p99 gap, BQL
+    # contention can't be the primary cause.
+    max_bql_acq_us = max([x[2] for x in bql if x[1] == "bql_lock"], default=0)
+    max_ffwait_us = max([x[2] for x in bql if x[1] == "ffwait"], default=0)
+    prod_p99_us = 0
+    if len(prod) > 1:
+        prod_sorted = sorted(prod, key=lambda x: x[0])
+        gaps_us = sorted((prod_sorted[i+1][0] - prod_sorted[i][0]) / 1000
+                         for i in range(len(prod_sorted) - 1))
+        prod_p99_us = int(_percentile(gaps_us, 99))
+
+    if not underruns and not throt:
+        out.append("Audio path looks CLEAN in this window. No underruns and "
+                   "no throttle snaps. If the user reports stutter, it is "
+                   "either intermittent (try a longer window) or downstream "
+                   "of this code path (Android audio HAL / openslES burst).")
+    elif has_ffwait and max_ffwait_us > prod_p99_us * 0.5:
+        out.append("PRIMARY CAUSE: Consumer (audio backend) is gating the FIFO.")
+        out.append(f"  Producer enters throttle's FIFO-full wait loop for up to "
+                   f"{max_ffwait_us}us at a time — that's the FIFO being full "
+                   f"because the audio callback isn't draining it.")
+        out.append("  Check the consumer 'backend-gated' vs 'self-stalled' "
+                   "counts above. If 'backend-gated' dominates, OpenSL/AAudio "
+                   "isn't calling us often enough — that's the audio backend "
+                   "buffer config, not xemu.")
+        out.append("  Fix path: shrink the host-side audio device buffer "
+                   "(XEMU_ANDROID_AUDIO_SAMPLES env) so the backend calls more "
+                   "often, or pump frames in a non-callback driven loop.")
+    elif has_bql_stall and max_bql_acq_us > prod_p99_us / 3:
+        out.append("PRIMARY CAUSE: BQL contention from vCPU.")
+        out.append(f"  Underruns coincide with bql_lock acquisitions up to "
+                   f"{max_bql_acq_us}us; producer p99 gap is {prod_p99_us}us.")
+        out.append("  The vCPU is holding BQL during MMIO emulation / DMA / TB "
+                   "execution longer than the audio frame budget allows.")
+        out.append("  Fix path: reduce BQL hold duration on vCPU. Candidates:")
+        out.append("    * lower CHAIN_MAX in cranelift_chain_continue further")
+        out.append("    * drop BQL more aggressively in nv2a MMIO write paths")
+        out.append("    * check for a specific guest MMIO that's pinning BQL")
+    elif has_bql_stall:
+        out.append(f"BQL stalls exist ({max_bql_acq_us}us max) but are too "
+                   f"small to account for the {prod_p99_us}us producer p99 gap.")
+        out.append("  The producer's stall is happening somewhere else — most "
+                   "likely waiting for the audio callback (consumer) to drain "
+                   "the FIFO. Check the consumer gap p95/p99 and "
+                   "backend-gated count.")
+    elif has_dlock_stall:
+        out.append("PRIMARY CAUSE: d->lock contention.")
+        out.append("  apu_thread is waiting on d->lock — something else holds it.")
+        out.append("  Audit: voice_lock paths, monitor_sink_cb, MMIO write handlers.")
+    elif has_se_slow:
+        out.append("PRIMARY CAUSE: se_frame execution exceeds 5ms occasionally.")
+        out.append("  Voice processing or DSP frame work is the actual slow path.")
+    elif underruns and throt:
+        out.append("Producer is FALLING BEHIND. Throttle snaps coincide with "
+                   "FIFO drainage but no lock-stall events were captured. "
+                   "Either the stalls are sub-1ms accumulating (try lower "
+                   "threshold) or stalls live outside the apu_thread "
+                   "lock-acquisition sites we instrument.")
+    elif underruns and not throt:
+        out.append("Underruns WITHOUT producer slip or BQL stall. Either the "
+                   "consumer is draining the FIFO faster than the producer can "
+                   "fill it (check AAudio burst size vs producer rate), or the "
+                   "FIFO is being initialized smaller than required for "
+                   "callback cadence.")
+    elif throt and not underruns:
+        out.append("Producer is snapping forward but the FIFO never drains "
+                   "fully. Audio plays back fine but you lose ~43ms of "
+                   "content per snap. Not the user's stutter cause.")
+
+    return "\n".join(out)
+
 
 @mcp.tool()
 def get_gpu_stats() -> str:
@@ -1155,6 +2415,12 @@ def list_state(kind: str = "all") -> str:
         parts.append("=== debug-logs ===\n" + ls(LOG_DIR, True))
     if kind in ("all", "shader_cache"):
         parts.append("=== shader/cache dir ===\n" + ls(SHADER_CACHE_DIR, True))
+    if kind in ("all", "shader_dump"):
+        # Per-pipeline-create SPIR-V/GLSL dump (Android-only, see draw.c).
+        # External path so no run-as needed.
+        count = _sh(f"ls {SHADER_DUMP_DIR} 2>/dev/null | wc -l").strip()
+        size  = _sh(f"du -sh {SHADER_DUMP_DIR} 2>/dev/null").strip()
+        parts.append(f"=== shader_dump ===\n{count} hashes\n{size}")
     if kind in ("all", "snapshots"):
         parts.append("=== snapshots ===\n" + ls(f"{INT_FILES_DIR}/x1box/snapshots", True))
     if kind in ("all", "gpu_driver"):
@@ -1179,11 +2445,435 @@ def clear_cache(kind: str = "shader") -> str:
         "covers":             ["files/downloaded_covers/*", "files/custom_covers/*"],
         "disc_format_cache":  ["files/disc_format_cache.tsv"],
     }
+    if kind == "shader_dump":
+        # External path under sdcard — wipe directly, no run-as needed.
+        out = _sh(f"rm -rf {SHADER_DUMP_DIR}/* 2>&1; echo done")
+        return f"Cleared shader_dump: {out}"
     if kind not in targets:
-        return f"Unknown kind '{kind}'. Options: {', '.join(targets)}"
+        return f"Unknown kind '{kind}'. Options: {', '.join(list(targets) + ['shader_dump'])}"
     cmds = " ; ".join(f"rm -rf {t}" for t in targets[kind])
     out = _sh(f"run-as {PKG} sh -c '{cmds} 2>&1; echo done'")
     return f"Cleared {kind}: {out}"
+
+
+# ---------------------------------------------------------------------------
+# Shader-dump audit (Android pipeline-create SPIR-V/GLSL archive + malioc)
+# ---------------------------------------------------------------------------
+#
+# Pairs with the dumper at hw/xbox/nv2a/pgraph/vk/draw.c, which writes
+# <SHADER_DUMP_DIR>/<hash>/killer_{vsh,psh,geom}.{spv,glsl} on every unique
+# pipeline-create (disk-backed dedupe — keeps building across launches).
+
+def _mali_gpu() -> str:
+    """Detect the Mali GPU model from SurfaceFlinger; fall back to a sensible
+    default. Cached after first call to avoid repeated dumpsys cost."""
+    cached = getattr(_mali_gpu, "_cached", None)
+    if cached: return cached
+    out = _sh("dumpsys SurfaceFlinger | grep -m1 'GLES:'")
+    m = re.search(r"Mali-[A-Za-z0-9]+", out)
+    gpu = m.group(0) if m else "Mali-G715"
+    _mali_gpu._cached = gpu  # type: ignore[attr-defined]
+    return gpu
+
+@mcp.tool()
+def shader_dump_list(hash_prefix: str = "") -> str:
+    """List shader hashes currently in <files>/x1box/shader_dump/.
+
+    Each entry shows the hash + sizes of vsh/psh/geom (spv/glsl). Optionally
+    filter by a hash prefix (e.g. "8c7" or "daf11ef5"). The dumper at
+    draw.c is disk-backed-dedupe, so this archive grows with playtime."""
+    if not _device(): return "No device connected."
+    prefix = (hash_prefix or "").strip().lower()
+    cmd = (
+        f"ls {SHADER_DUMP_DIR} 2>/dev/null"
+        + (f" | grep -E '^{re.escape(prefix)}'" if prefix else "")
+    )
+    hashes = [h for h in _sh(cmd).splitlines() if h.strip()]
+    if not hashes:
+        return f"No shaders in {SHADER_DUMP_DIR}" + (f" matching '{prefix}'" if prefix else "")
+    rows = [f"{len(hashes)} hash{'es' if len(hashes) != 1 else ''} in {SHADER_DUMP_DIR}:", ""]
+    rows.append(f"{'hash':<17}  {'vsh.spv':>8} {'psh.spv':>8} {'geom.spv':>9} {'vsh.glsl':>9} {'psh.glsl':>9} {'geom.glsl':>10}")
+    for h in hashes:
+        sizes = _sh(
+            f"stat -c '%n %s' {SHADER_DUMP_DIR}/{h}/killer_vsh.spv "
+            f"{SHADER_DUMP_DIR}/{h}/killer_psh.spv "
+            f"{SHADER_DUMP_DIR}/{h}/killer_geom.spv "
+            f"{SHADER_DUMP_DIR}/{h}/killer_vsh.glsl "
+            f"{SHADER_DUMP_DIR}/{h}/killer_psh.glsl "
+            f"{SHADER_DUMP_DIR}/{h}/killer_geom.glsl 2>/dev/null"
+        )
+        by_file: dict[str, str] = {}
+        for line in sizes.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                by_file[parts[0].rsplit('/', 1)[-1]] = parts[1]
+        def s(name: str) -> str: return by_file.get(name, "-")
+        rows.append(
+            f"{h:<17}  {s('killer_vsh.spv'):>8} {s('killer_psh.spv'):>8} "
+            f"{s('killer_geom.spv'):>9} {s('killer_vsh.glsl'):>9} "
+            f"{s('killer_psh.glsl'):>9} {s('killer_geom.glsl'):>10}"
+        )
+    return "\n".join(rows)
+
+@mcp.tool()
+def shader_dump_session_hashes(lines: int = 4000) -> str:
+    """Return hashes seen at pipeline-create in recent logcat, in order.
+
+    Useful for slicing the cumulative dump by play-area: clear logcat
+    (`clear_log logcat`), play the area, then call this to get the exact
+    hash list that became active. Pair with shader_dump_audit() on the
+    resulting set."""
+    if not _device(): return "No device connected."
+    raw = _sh(f"logcat -d -t {int(lines)} -s {SHADER_DUMP_LOG_TAG}:W")
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for line in raw.splitlines():
+        m = re.search(r"shader 0x([0-9a-f]+) seen at pipeline-create", line)
+        if not m: continue
+        h = m.group(1)
+        if h in seen_set: continue
+        seen.append(h); seen_set.add(h)
+    if not seen:
+        return "No shader-dump events in recent logcat. Play the target area, then retry."
+    header = f"{len(seen)} unique shaders dumped this session:"
+    return header + "\n" + "\n".join(seen)
+
+@mcp.tool()
+def shader_dump_audit(stage: str = "psh", gpu: str = "",
+                      hash_prefix: str = "", details: bool = False) -> str:
+    """Run Mali Offline Compiler over every dumped <stage>.spv and report.
+
+    stage:        'psh' (default), 'vsh', or 'geom'
+    gpu:          Mali GPU core (e.g. 'Mali-G715'). Auto-detected if empty.
+    hash_prefix:  optional hash-prefix filter, same as shader_dump_list
+    details:      if True, include the full malioc report per shader
+
+    Pulls each <stage>.spv via adb to /tmp, runs malioc --vulkan against
+    the device GPU, and returns a summary table flagging warnings/errors
+    + Mali's late-ZS / coverage flags (the early-Z killers). Requires
+    Arm Performance Studio installed at $ARM_PERFORMANCE_STUDIO_HOME."""
+    if not _device(): return "No device connected."
+    if stage not in ("vsh", "psh", "geom"):
+        return f"Unknown stage '{stage}' (vsh|psh|geom)"
+    if not os.path.exists(MALIOC_BIN):
+        return (f"malioc not found at {MALIOC_BIN}. "
+                f"Set $ARM_PERFORMANCE_STUDIO_HOME or install Arm Performance Studio.")
+    gpu = gpu or _mali_gpu()
+    prefix = (hash_prefix or "").strip().lower()
+    cmd = (
+        f"ls {SHADER_DUMP_DIR} 2>/dev/null"
+        + (f" | grep -E '^{re.escape(prefix)}'" if prefix else "")
+    )
+    hashes = [h for h in _sh(cmd).splitlines() if h.strip()]
+    if not hashes:
+        return f"No shaders in {SHADER_DUMP_DIR}" + (f" matching '{prefix}'" if prefix else "")
+
+    with tempfile.TemporaryDirectory(prefix="x1box-malioc-") as td:
+        rows = [f"malioc audit on {gpu} — {len(hashes)} {stage} shader(s):", ""]
+        rows.append(f"{'hash':<17}  {'warn':>4} {'err':>3} {'mod_cov':>7} {'late_zs':>7} {'side_fx':>7}  {'flags'}")
+        suspects: list[str] = []
+        for h in hashes:
+            dev_path = f"{SHADER_DUMP_DIR}/{h}/killer_{stage}.spv"
+            local = os.path.join(td, f"{h}.spv")
+            r = _adb("pull", dev_path, local)
+            if r.returncode != 0 or not os.path.exists(local):
+                rows.append(f"{h:<17}  pull-failed")
+                continue
+            mr = subprocess.run(
+                [MALIOC_BIN, "--vulkan", f"--{({'vsh':'vertex','psh':'fragment','geom':'geometry'})[stage]}",
+                 "-c", gpu, "-d", "--format", "text", local],
+                capture_output=True, text=True, check=False,
+            )
+            txt = mr.stdout + mr.stderr
+            warn = len(re.findall(r"(?i)\bwarning\b", txt))
+            err  = len(re.findall(r"(?i)\berror\b|\bfatal\b", txt))
+            def flag(label: str) -> str:
+                m = re.search(rf"{re.escape(label)}\s*:\s*(true|false)", txt)
+                return m.group(1) if m else "?"
+            mod_cov = flag("Modifies coverage")
+            late_t  = flag("Uses late ZS test")
+            late_u  = flag("Uses late ZS update")
+            side    = flag("Has side-effects")
+            flags_short = []
+            if mod_cov == "true": flags_short.append("discard")
+            if late_t == "true" or late_u == "true": flags_short.append("late-ZS")
+            if side == "true": flags_short.append("side-fx")
+            rows.append(
+                f"{h:<17}  {warn:>4} {err:>3} {mod_cov:>7} "
+                f"{(late_t if late_t == late_u else f'{late_t}/{late_u}'):>7} {side:>7}  "
+                f"{','.join(flags_short) if flags_short else '-'}"
+            )
+            if warn or err or details:
+                suspects.append(f"\n--- {h} ({stage}) ---\n{txt}")
+        out = "\n".join(rows)
+        if suspects and (details or any("warn" in r.lower() or " err " in r for r in suspects)):
+            out += "\n\nFull reports for shaders with warnings/errors:\n" + "\n".join(suspects)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Generic GPU probe runner — compile GLSL → SPIR-V → push → restart → pull
+# ---------------------------------------------------------------------------
+#
+# Pairs with hw/xbox/nv2a/pgraph/vk/probe_runner.{c,h}. xemu watches for
+# `<ext>/x1box/gpu_probe/probe_req.bin` at pgraph_vk_init time; if present
+# it runs the user-supplied compute or fragment shader, writes a binary
+# result to probe_out.bin, drops probe_done.flag as a sentinel, and
+# renames the request to .consumed. We never touch logcat here — that's
+# the whole reason this tool exists.
+
+def _glslang_bin() -> str | None:
+    """Locate a SPIR-V compiler on the host."""
+    for c in ("glslangValidator", "glslc"):
+        p = subprocess.run(["which", c], capture_output=True, text=True, check=False)
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout.strip()
+    return None
+
+def _compile_glsl_to_spirv(glsl: str, stage: str) -> tuple[bytes | None, str]:
+    """Compile a GLSL source string to SPIR-V bytes. Returns (spv, err)."""
+    bin_ = _glslang_bin()
+    if not bin_:
+        return None, "No SPIR-V compiler in PATH (glslangValidator / glslc)."
+    s_map = {"compute": "comp", "fragment": "frag"}
+    s = s_map.get(stage)
+    if not s:
+        return None, f"stage must be 'compute' or 'fragment', got '{stage}'."
+    with tempfile.TemporaryDirectory(prefix="x1box-glsl-") as td:
+        src = os.path.join(td, f"probe.{s}")
+        out = os.path.join(td, "probe.spv")
+        with open(src, "w") as f:
+            f.write(glsl)
+        if "glslang" in bin_:
+            cmd = [bin_, "-V", "-S", s, src, "-o", out]
+        else:  # glslc
+            cmd = [bin_, f"-fshader-stage={s}", src, "-o", out]
+        p = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if p.returncode != 0 or not os.path.exists(out):
+            return None, (p.stdout + p.stderr).strip() or "glsl compile failed"
+        with open(out, "rb") as f:
+            return f.read(), ""
+
+def _build_probe_request(stage_id: int, n_outputs: int,
+                         push_floats: list[float], spv: bytes) -> bytes:
+    """Serialize struct x1b_probe_req + SPIR-V payload."""
+    if len(spv) % 4 != 0:
+        spv = spv + b"\x00" * (4 - (len(spv) % 4))
+    n_push = len(push_floats)
+    if n_push > 16:
+        raise ValueError("push_floats must have at most 16 entries")
+    pad = push_floats + [0.0] * (16 - n_push)
+    # <4sIIIIIII = magic, version, stage, n_outputs, n_push_floats, spv_size, reserved[2]
+    header = struct.pack("<4sIIIIIII", b"XPRB", GPU_PROBE_VERSION, stage_id,
+                          n_outputs, n_push, len(spv), 0, 0)
+    pcs = struct.pack("<16f", *pad)
+    return header + pcs + spv
+
+# struct x1b_probe_out (probe_runner.h):
+#   char     magic[4];              // "XPRO"            4
+#   uint32_t version;                                    4
+#   uint32_t status;                                     4
+#   uint32_t n_outputs;                                  4
+#   char     gpu_name[256];                              256
+#   uint32_t vendor_id, device_id, driver_version;       12
+#   uint32_t fp32_szinfnan, denorm_preserve, denorm_ftz,
+#            rounding_rte, rounding_rtz;                 20
+#   uint32_t error_msg_size;                             4
+#   uint32_t reserved[3];                                12
+# = 320 bytes total.
+_OUT_HDR_FMT = "<4sIII256sIIIIIIIII3I"
+assert struct.calcsize(_OUT_HDR_FMT) == 320, struct.calcsize(_OUT_HDR_FMT)
+
+def _classify_bits(v: int) -> str:
+    """Match probe_runner.c's classify_bits()."""
+    sign = (v >> 31) & 1
+    exp  = (v >> 23) & 0xFF
+    mant = v & 0x7FFFFF
+    if exp == 0xFF and mant != 0:
+        return "NaN"
+    if exp == 0xFF and mant == 0:
+        return "-Inf" if sign else "+Inf"
+    if exp == 0   and mant == 0:
+        return "-0" if sign else "+0"
+    if exp == 0   and mant != 0:
+        return "-denorm" if sign else "+denorm"
+    return "finite"
+
+def _decode_probe_output(blob: bytes) -> dict:
+    """Unpack probe_out.bin into a dict. Raises ValueError on bad data."""
+    if len(blob) < struct.calcsize(_OUT_HDR_FMT):
+        raise ValueError(f"output too short ({len(blob)} bytes)")
+    fields = struct.unpack_from(_OUT_HDR_FMT, blob, 0)
+    (magic, version, status, n_outputs, gpu_raw,
+     vendor_id, device_id, driver_version,
+     fp32_szinf, fp32_denp, fp32_dftz, fp32_rte, fp32_rtz,
+     err_size, _r0, _r1, _r2) = fields
+    if magic != b"XPRO":
+        raise ValueError(f"bad output magic: {magic!r}")
+    gpu_name = gpu_raw.split(b"\x00", 1)[0].decode("ascii", errors="replace")
+    off = struct.calcsize(_OUT_HDR_FMT)
+    outputs = list(struct.unpack_from(f"<{n_outputs}I", blob, off))
+    off += n_outputs * 4
+    err_msg = ""
+    if err_size and off + err_size <= len(blob):
+        err_msg = blob[off:off + err_size].decode("ascii", errors="replace")
+    return {
+        "version": version, "status": status, "n_outputs": n_outputs,
+        "gpu_name": gpu_name, "vendor_id": vendor_id, "device_id": device_id,
+        "driver_version": driver_version,
+        "float_controls": {
+            "fp32_signed_zero_inf_nan_preserve": bool(fp32_szinf),
+            "fp32_denorm_preserve": bool(fp32_denp),
+            "fp32_denorm_flush_to_zero": bool(fp32_dftz),
+            "fp32_rounding_mode_rte": bool(fp32_rte),
+            "fp32_rounding_mode_rtz": bool(fp32_rtz),
+        },
+        "outputs": outputs,
+        "error": err_msg,
+    }
+
+def _format_probe_results(decoded: dict, labels: list[str] | None) -> str:
+    rows = [
+        f"GPU: {decoded['gpu_name']}"
+        f"  (vendor=0x{decoded['vendor_id']:04x},"
+        f" device=0x{decoded['device_id']:08x},"
+        f" driver={decoded['driver_version']})",
+        "FloatControls.fp32: "
+        + ", ".join(f"{k.split('fp32_')[1]}={v}"
+                    for k, v in decoded["float_controls"].items()),
+        f"status: {decoded['status']}"
+        + (f" ({decoded['error']})" if decoded['error'] else ""),
+        "",
+        f"{'slot':<5} {'label':<30} {'hex':>10}  {'class':<8}  decoded",
+    ]
+    for i, v in enumerate(decoded["outputs"]):
+        f = struct.unpack("<f", struct.pack("<I", v))[0]
+        label = labels[i] if labels and i < len(labels) else ""
+        rows.append(f"{i:<5} {label:<30} 0x{v:08x}  "
+                    f"{_classify_bits(v):<8}  {f!r}")
+    return "\n".join(rows)
+
+@mcp.tool()
+def gpu_probe(glsl: str, stage: str = "compute", n_outputs: int = 24,
+              push_floats: str = "", labels: str = "",
+              auto_restart: bool = True, game_name: str = "",
+              timeout: float = 30.0) -> str:
+    """Run a one-shot Vulkan probe on the device GPU and return raw outputs.
+
+    Compiles GLSL → SPIR-V on the host via glslangValidator, pushes the
+    request file to the device, optionally stops + relaunches the emulator
+    to trigger pgraph_vk_init (where probe_runner picks up the request),
+    waits for `probe_done.flag`, pulls the result, and decodes it.
+
+    The probe runs with ZERO logcat traffic — results come back as a
+    binary file, not log lines, so dispatch overhead is one disk-write
+    on each side.
+
+    Compute shader expectations:
+      #version 450
+      layout(local_size_x = 1) in;
+      layout(std430, set=0, binding=0) buffer Out { uint probe[N]; };
+      // optional: layout(push_constant) uniform Push { float p[<= 16]; };
+      void main() { probe[i] = floatBitsToUint(<expr>); ... }
+
+    Fragment shader expectations:
+      #version 450
+      layout(location = 0) out uint result;     // R32_UINT attachment
+      // optional: layout(push_constant) uniform Push { float p[<= 16]; };
+      void main() { int slot = int(gl_FragCoord.x); result = ...; }
+      // (the runner supplies a fullscreen-triangle vertex shader)
+
+    Args:
+      glsl:         the GLSL source. Must match the layout above.
+      stage:        'compute' (default) or 'fragment'.
+      n_outputs:    number of uint32 result slots (1..1024).
+      push_floats:  comma-separated floats for the push-constant block.
+      labels:       comma-separated per-slot labels for the result table.
+      auto_restart: stop the app + relaunch a title to trigger the probe.
+      game_name:    title to launch (case-insensitive substring match).
+                    If empty, uses the first available from list_games.
+      timeout:      seconds to wait for probe_done.flag.
+
+    Returns: formatted table of GPU info + per-slot hex/decoded values."""
+    if not _device(): return "No device connected."
+    if stage not in ("compute", "fragment"):
+        return f"stage must be 'compute' or 'fragment', got '{stage}'"
+    if n_outputs < 1 or n_outputs > 1024:
+        return "n_outputs must be in [1, 1024]"
+
+    floats: list[float] = []
+    if push_floats.strip():
+        try:
+            floats = [float(x) for x in push_floats.split(",")]
+        except ValueError as e:
+            return f"push_floats parse error: {e}"
+    if len(floats) > 16:
+        return "at most 16 push_floats supported"
+
+    label_list = [x.strip() for x in labels.split(",")] if labels.strip() else None
+
+    # Compile GLSL → SPIR-V locally.
+    spv, err = _compile_glsl_to_spirv(glsl, stage)
+    if not spv:
+        return f"GLSL compile failed:\n{err}"
+
+    stage_id = GPU_PROBE_STAGE_COMPUTE if stage == "compute" else GPU_PROBE_STAGE_FRAGMENT
+    req_blob = _build_probe_request(stage_id, n_outputs, floats, spv)
+
+    # Clean any stale done/out from a prior run, then push the request.
+    _sh(f"mkdir -p {GPU_PROBE_DIR}; rm -f {GPU_PROBE_DONE} {GPU_PROBE_OUT} {GPU_PROBE_REQ_USED}")
+    with tempfile.NamedTemporaryFile(suffix=".bin") as tmp:
+        tmp.write(req_blob); tmp.flush()
+        p = _adb("push", tmp.name, GPU_PROBE_REQ)
+        if p.returncode != 0:
+            return f"adb push failed: {p.stderr.strip() or p.stdout.strip()}"
+
+    if auto_restart:
+        # Force-stop, then launch a game so pgraph_vk_init runs.
+        _sh(f"am force-stop {PKG}")
+        target = game_name
+        if not target:
+            # First listed game wins. list_games returns "title\tpath" lines.
+            try:
+                head = list_games().splitlines()  # type: ignore[name-defined]
+                for line in head[1:]:
+                    if "\t" in line:
+                        target = line.split("\t", 1)[0]; break
+            except Exception:
+                target = ""
+        if target:
+            launch_game(target)  # type: ignore[name-defined]
+        else:
+            return ("Request pushed to " + GPU_PROBE_REQ +
+                    " but no game available to launch; restart the app "
+                    "manually and re-run gpu_probe with auto_restart=False "
+                    "to just wait for the result.")
+
+    # Poll for the done sentinel.
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    poll_interval = 0.4
+    while time.monotonic() < deadline:
+        if _sh(f"[ -f {GPU_PROBE_DONE} ] && echo yes").strip() == "yes":
+            break
+        time.sleep(poll_interval)
+    else:
+        return (f"Timed out waiting for {GPU_PROBE_DONE} after {timeout:.1f}s. "
+                f"Is xemu actually starting? (Check `logcat -d -s hakuX-gpu-probe:*`.)")
+
+    # Pull the binary output.
+    with tempfile.TemporaryDirectory(prefix="x1box-probe-") as td:
+        local = os.path.join(td, "probe_out.bin")
+        p = _adb("pull", GPU_PROBE_OUT, local)
+        if p.returncode != 0 or not os.path.exists(local):
+            return f"adb pull {GPU_PROBE_OUT} failed: {p.stderr.strip()}"
+        with open(local, "rb") as f:
+            blob = f.read()
+    try:
+        decoded = _decode_probe_output(blob)
+    except ValueError as e:
+        return f"output decode failed: {e}"
+
+    return _format_probe_results(decoded, label_list)
 
 
 # ---------------------------------------------------------------------------
@@ -1290,6 +2980,423 @@ def profile(duration: int = 3, tid: str = "", target: str = "emu") -> str:
     )
     return (f"=== simpleperf {duration}s profile (pid={pid}{', tid='+tid if tid else ''}) ===\n"
             f"Record: {record_out.strip()}\n\n=== Top symbols ===\n{report_out}")
+
+
+# ---------------------------------------------------------------------------
+# Extended profiling: multi-device, hw counters, call-graph, core affinity
+# ---------------------------------------------------------------------------
+#
+# Built for cross-device A/B comparisons (e.g. Pixel 10a Mali vs Zenfone 10
+# Adreno). The existing `profile` tool above is single-device, cpu-clock-only,
+# and capped at head -60. These three tools generalise that:
+#
+#   profile_native           — simpleperf record+report with selectable
+#                              events (cpu-clock:u, cpu-cycles, instructions,
+#                              cache-misses, dTLB-load-misses, ...), flat or
+#                              call-graph output, and a `device` parameter so
+#                              both phones can be polled from one session.
+#   core_affinity_snapshot   — per-thread last_cpu sampling over a window so
+#                              you can see whether hot threads land on big
+#                              (Cortex-X) or little (A520) cores. No code on
+#                              device; purely reads /proc.
+#   _adb_dev / _sh_dev       — `adb -s <serial>` shims used by the above so
+#                              we don't trample the existing single-device
+#                              flow.
+
+def _adb_dev(serial: str | None, *args: str) -> subprocess.CompletedProcess:
+    """adb with optional -s <serial>. None => default device."""
+    if serial:
+        return subprocess.run(
+            ["adb", "-s", serial, *args],
+            capture_output=True, text=True, check=False,
+        )
+    return _adb(*args)
+
+def _sh_dev(serial: str | None, *args: str) -> str:
+    r = _adb_dev(serial, "shell", *args)
+    return (r.stdout + r.stderr).strip()
+
+def _emu_pid_dev(serial: str | None, package: str | None = None) -> str | None:
+    """Like _emu_pid() but targets a specific device and (optionally) a
+    specific package. `package` defaults to PKG (the canonical debug
+    install); pass e.g. "com.izzy2lost.x1box.perftest" to target the
+    side-by-side perftest variant.
+
+    /proc/<pid>/comm is truncated to 15 chars by the kernel so `pidof
+    <pkg>:xemu` is empty even when the process runs. Match against
+    /proc/<pid>/cmdline (full name, not truncated) AND verify argv[0]
+    equals the expected emu-process name exactly — a substring grep
+    matches transient helper shells that have the string in their args
+    (e.g. our own `sh -c grep ... :xemu` invocation).
+
+    Returns None if the :xemu process for `package` is not running on
+    the target device. Does NOT fall back to the UI pid: tools that want
+    emu time will silently profile the wrong process if we conflate the
+    two. Use a UI-specific path when you want the launcher.
+    """
+    pkg = package or PKG
+    emu_proc = f"{pkg}:xemu"
+    rc = _adb_dev(
+        serial, "shell",
+        f"grep -l -F '{emu_proc}' /proc/[0-9]*/cmdline 2>/dev/null"
+    )
+    if rc.returncode != 0:
+        return None
+    candidates = []
+    for line in (rc.stdout or "").splitlines():
+        parts = line.strip().split("/")
+        if len(parts) >= 3 and parts[2].isdigit():
+            candidates.append(parts[2])
+    for pid in candidates:
+        rc2 = _adb_dev(
+            serial, "shell",
+            f"tr '\\0' '\\n' < /proc/{pid}/cmdline 2>/dev/null | head -1"
+        )
+        if rc2.returncode == 0 and rc2.stdout.strip() == emu_proc:
+            return pid
+    return None
+
+def _list_devices() -> list[str]:
+    lines = _adb("devices").stdout.strip().splitlines()[1:]
+    return [l.split()[0] for l in lines if l.strip() and "device" in l]
+
+
+@mcp.tool()
+def profile_native(duration: int = 5,
+                   events: str = "cpu-clock:u",
+                   mode: str = "flat",
+                   sort: str = "comm,dso,symbol",
+                   top_n: int = 60,
+                   tid: str = "",
+                   device: str = "",
+                   target: str = "emu",
+                   package: str = "") -> str:
+    """
+    Sample-based profiler with selectable hardware events and multi-device
+    support. Wraps `simpleperf record --app <pkg>` (which uses run-as
+    internally so it works on debuggable Android builds without root) and
+    `simpleperf report`. Returns a ranked symbol table or a call-graph view.
+
+    Built for cross-device A/B (Pixel vs Zenfone) and for going beyond
+    cpu-clock:u when you need to know *why* a hot symbol is hot — IPC,
+    cache misses, dTLB misses, etc.
+
+    Args:
+      duration:  recording window in seconds (default 5).
+      events:    comma-separated simpleperf events. Defaults to wall-clock
+                 sampling. Useful alternatives:
+                 - 'cpu-clock:u'                     where time was spent
+                 - 'cpu-cycles,instructions'         per-symbol IPC
+                 - 'cache-misses,cache-references'   memory pressure
+                 - 'dTLB-load-misses'                page-walk pressure
+                 - 'branch-misses'                   predictor whiff
+                 Run `adb shell simpleperf list hw` to see what the device
+                 supports. `:u` suffix restricts to userspace (required when
+                 not root).
+      mode:      'flat' (default) for a ranked symbol table; 'callgraph' for
+                 the inclusive-time tree (sort defaults to comm,symbol then
+                 walks callers).
+      sort:      simpleperf --sort columns. Default 'comm,dso,symbol' attributes
+                 each symbol to its thread + dso so cross-thread hotspots are
+                 obvious. 'comm,symbol' is more compact.
+      top_n:     max rows in the flat report (default 60). Ignored for callgraph.
+      tid:       optional thread id (numeric string) to restrict sampling to a
+                 single thread. Use get_threads() to find the TID; or just
+                 leave empty for process-wide.
+      device:    adb serial. Empty = use the default device (first one
+                 connected). Use `list_devices` to discover serials when both
+                 Pixel and Zenfone are plugged in.
+      target:    'emu' (default :xemu emulation process), 'ui' (launcher).
+      package:   Android package id to profile. Empty = the canonical debug
+                 install (`com.izzy2lost.x1box`). Pass
+                 `com.izzy2lost.x1box.perftest` to profile the side-by-side
+                 debug-off perftest variant (lets us A/B debug-log overhead
+                 vs no-log steady state across two separately-installed APKs
+                 without changing tool plumbing).
+
+    The recorded perf.data is left at /data/local/tmp/perf_native.data so you
+    can pull and post-process with simpleperf if needed (e.g. flame graphs).
+
+    Examples:
+      # Wall-clock profile, both phones — same arguments, just change device.
+      profile_native(device='61291JEA311201')
+      profile_native(device='RBAIB70003585LA')
+      # Profile the side-by-side perftest install (debug-off variant).
+      profile_native(device='61291JEA311201',
+                     package='com.izzy2lost.x1box.perftest')
+      # IPC profile: tells you where the CPU is memory-stalled vs compute-bound.
+      profile_native(events='cpu-cycles,instructions', top_n=40)
+      # Why is tlb_reset_dirty slow? Cache miss profile.
+      profile_native(events='cache-misses,cache-references', top_n=40)
+      # Call-graph attribution: who's calling the hot leaf?
+      profile_native(mode='callgraph', sort='comm,symbol')
+    """
+    if device and device not in _list_devices():
+        return f"device '{device}' not in adb devices. Available: {_list_devices()}"
+    if not device and not _list_devices():
+        return "No device connected."
+
+    pkg = package or PKG
+    pid = _emu_pid_dev(device, package=pkg) if target != "ui" else (
+        _sh_dev(device, f"pidof {pkg}").strip() or None)
+    if not pid:
+        return f"{pkg}:{'ui' if target == 'ui' else 'xemu'} not running on device '{device or '(default)'}'"
+
+    duration = max(1, min(int(duration), 60))
+    top_n = max(5, min(int(top_n), 500))
+    perf_data = "/data/local/tmp/perf_native.data"
+
+    record_args = [
+        "simpleperf", "record",
+        "--app", pkg,
+        "-e", events,
+        "-g",
+        "--duration", str(duration),
+        "-o", perf_data,
+    ]
+    if tid:
+        record_args.extend(["-t", tid])
+
+    try:
+        rec = subprocess.run(
+            ["adb", *(["-s", device] if device else []), "shell", *record_args],
+            capture_output=True, text=True, check=False,
+            timeout=duration + 15,
+        )
+    except subprocess.TimeoutExpired:
+        return f"simpleperf record timed out after {duration + 15}s"
+
+    rec_err = rec.stderr.strip()
+    if rec.returncode != 0:
+        return f"simpleperf record failed (rc={rec.returncode}):\n{rec_err}"
+
+    if mode == "callgraph":
+        report_args = [
+            "simpleperf", "report", "-i", perf_data,
+            "--sort", sort,
+            "--children", "-g", "caller",
+            "--full-callgraph", "--max-stack", "20",
+        ]
+    else:
+        report_args = [
+            "simpleperf", "report", "-i", perf_data,
+            "--sort", sort,
+            "-n", "--print-event-count",
+        ]
+
+    try:
+        rep = subprocess.run(
+            ["adb", *(["-s", device] if device else []), "shell", *report_args],
+            capture_output=True, text=True, check=False,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return "simpleperf report timed out"
+
+    # report has unbounded output for callgraph mode — cap it.
+    out = rep.stdout
+    if mode == "callgraph":
+        # callgraph mode prints one tree per symbol; cap by lines.
+        lines = out.splitlines()
+        if len(lines) > 600:
+            out = "\n".join(lines[:600]) + f"\n... ({len(lines) - 600} more lines truncated)"
+    else:
+        # flat mode: header (5 lines) + top_n symbol rows + tail entries.
+        lines = out.splitlines()
+        if len(lines) > top_n + 10:
+            out = "\n".join(lines[:top_n + 10])
+
+    header = (
+        f"device={device or '(default)'}  pid={pid}  events={events}  "
+        f"duration={duration}s  mode={mode}\n"
+        f"perf.data => {perf_data}\n"
+    )
+    if rec_err:
+        header += f"record stderr:\n{rec_err}\n"
+    return header + "\n" + out
+
+
+_AFFINITY_SCRIPT = r"""
+PID="$1"
+DUR_MS="$2"
+INT_MS="$3"
+
+if [ -z "$PID" ] || [ ! -d /proc/$PID/task ]; then
+    echo "ERR no_pid"; exit 1
+fi
+
+# Convert ms to fractional seconds for `sleep` once. Doing it per-iteration
+# forks awk every loop and on Android fork+exec is ~50-100ms, which
+# dominated our sampling window before this rewrite.
+SLEEP_SEC=$(awk "BEGIN{printf \"%.3f\", $INT_MS / 1000}")
+DUR_SEC=$(awk "BEGIN{printf \"%d\", ($DUR_MS + 999) / 1000}")
+
+# Snapshot all thread names + comm at the start.
+# Single fork: one awk that walks every comm file. Per-thread forks would
+# cost ~5s on a 50-thread process.
+awk 'BEGIN{
+    cmd = "ls /proc/'"$PID"'/task"
+    while ((cmd | getline tid) > 0) {
+        getline c < ("/proc/'"$PID"'/task/" tid "/comm")
+        close("/proc/'"$PID"'/task/" tid "/comm")
+        printf "N|%s|%s\n", tid, c
+    }
+    close(cmd)
+}'
+
+START_SEC=$(cut -d. -f1 /proc/uptime)
+END_SEC=$((START_SEC + DUR_SEC))
+
+while :; do
+    NOW_SEC=$(cut -d. -f1 /proc/uptime)
+    [ "$NOW_SEC" -ge "$END_SEC" ] && break
+    # ONE awk pass over all /proc/<pid>/task/*/stat files. FILENAME gives
+    # us the tid (4th path component). Walk comm-paren from end so names
+    # with spaces ("(CPU 0/TCG)") don't shift field indices.
+    awk '
+    {
+        for (i = NF; i >= 1; i--) if ($i ~ /\)/) { rest = i + 1; break }
+        n = split(FILENAME, parts, "/")
+        printf "S|%s|%s\n", parts[n-1], $(rest+36)
+    }
+    ' /proc/$PID/task/*/stat 2>/dev/null
+    sleep $SLEEP_SEC
+done
+echo "DONE"
+"""
+
+
+@mcp.tool()
+def core_affinity_snapshot(duration: int = 5,
+                           interval_ms: int = 100,
+                           device: str = "",
+                           target: str = "emu",
+                           thread_filter: str = "",
+                           package: str = "") -> str:
+    """
+    Sample which CPU core each thread of the emulator is running on, over a
+    window, and report per-thread histograms.
+
+    Why this matters on big.LITTLE: Tensor G4 has 1 Cortex-X4 (CPU 7),
+    3 Cortex-A720 (CPUs 4-6), 4 Cortex-A520 (CPUs 0-3). Snapdragon 8 Gen 2
+    has 1 Cortex-X3 (CPU 7), 2 A715 + 2 A710 (CPUs 3-6), 3 A510 (CPUs 0-2).
+    If `CPU 0/TCG` or `nv2a.pfifo_thre` lands on the little cluster, the
+    same code runs 3-5x slower than on the big core — that alone explains
+    cross-device perf gaps that look like cache or memory issues.
+
+    Method: every `interval_ms`, read /proc/<pid>/task/<tid>/stat and pull
+    field 39 (the last CPU the thread ran on). Build a histogram per thread.
+    Read-only, zero perturbation to the running emulator. Costs roughly
+    `duration / interval_ms` adb-shell stat reads, all done in a single
+    on-device script so we don't round-trip per sample.
+
+    Args:
+      duration:      window length in seconds (default 5).
+      interval_ms:   sample period in milliseconds (default 100 = 10 Hz).
+                     50ms gives finer resolution at higher cost.
+      device:        adb serial. Empty = default device. Use list_devices
+                     to discover when multiple are connected.
+      target:        'emu' (default) or 'ui'.
+      thread_filter: only report threads whose comm matches this substring
+                     (e.g. 'TCG', 'pfifo', 'vk.rende', 'mcpx'). Empty = all
+                     threads with samples.
+      package:       Android package id to target. Empty = the canonical
+                     debug install (`com.izzy2lost.x1box`). Pass
+                     `com.izzy2lost.x1box.perftest` to sample the perftest
+                     variant when both are installed side-by-side.
+
+    Returns a table where each row is a thread (name + tid) and the columns
+    are CPU 0..N-1 with the % of samples observed on each.
+    """
+    if device and device not in _list_devices():
+        return f"device '{device}' not in adb devices. Available: {_list_devices()}"
+    if not device and not _list_devices():
+        return "No device connected."
+
+    pkg = package or PKG
+    pid = _emu_pid_dev(device, package=pkg) if target != "ui" else (
+        _sh_dev(device, f"pidof {pkg}").strip() or None)
+    if not pid:
+        return f"{pkg}:{'ui' if target == 'ui' else 'xemu'} not running"
+
+    duration = max(1, int(duration))
+    interval_ms = max(20, int(interval_ms))
+    dur_ms = duration * 1000
+
+    script = f"set -- {pid} {dur_ms} {interval_ms}\n{_AFFINITY_SCRIPT}"
+    try:
+        r = subprocess.run(
+            ["adb", *(["-s", device] if device else []),
+             "exec-out", "sh", "-c", script],
+            capture_output=True, text=True, check=False,
+            timeout=duration + 15,
+        )
+    except subprocess.TimeoutExpired:
+        return f"core_affinity_snapshot timed out after {duration + 15}s"
+
+    raw = r.stdout
+    if "ERR no_pid" in raw:
+        return f"profile failed: pid {pid} disappeared"
+    if not raw.strip():
+        return f"affinity sampler returned no output (stderr: {r.stderr.strip()})"
+
+    # Parse: N|tid|comm establish names; S|tid|cpu accumulate.
+    comm: dict[str, str] = {}
+    samples: dict[str, dict[int, int]] = {}
+    cpus_seen: set[int] = set()
+    for line in raw.splitlines():
+        if line.startswith("N|"):
+            _, tid, c = line.split("|", 2)
+            comm[tid] = c
+        elif line.startswith("S|"):
+            try:
+                _, tid, cpu = line.split("|", 2)
+                ci = int(cpu)
+            except ValueError:
+                continue
+            cpus_seen.add(ci)
+            samples.setdefault(tid, {})
+            samples[tid][ci] = samples[tid].get(ci, 0) + 1
+
+    if not samples:
+        return f"no samples collected. raw head:\n{raw[:400]}"
+
+    cpus = sorted(cpus_seen)
+    rows = []
+    for tid, hist in samples.items():
+        name = comm.get(tid, "?")
+        if thread_filter and thread_filter not in name:
+            continue
+        total = sum(hist.values())
+        if total == 0:
+            continue
+        row = {"tid": tid, "comm": name, "total": total, "hist": hist}
+        rows.append(row)
+
+    # Sort by total samples descending — busiest threads first.
+    rows.sort(key=lambda r: -r["total"])
+
+    # Build output table.
+    lines = []
+    lines.append(
+        f"device={device or '(default)'}  pid={pid}  "
+        f"window={duration}s  interval={interval_ms}ms  "
+        f"threads_with_samples={len(rows)}"
+    )
+    lines.append("")
+    header = f"{'TID':>6}  {'COMM':<20}  {'N':>4}  "
+    header += "  ".join(f"cpu{c:>2}" for c in cpus)
+    lines.append(header)
+    lines.append("-" * len(header))
+    for r in rows:
+        cells = [f"{r['tid']:>6}", f"{r['comm'][:20]:<20}", f"{r['total']:>4}"]
+        for c in cpus:
+            n = r["hist"].get(c, 0)
+            pct = n * 100 / r["total"]
+            cells.append(f"{pct:>5.0f}" if n else "    .")
+        lines.append("  ".join(cells))
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

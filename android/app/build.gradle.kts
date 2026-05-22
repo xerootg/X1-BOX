@@ -71,6 +71,34 @@ android {
         debugSymbolLevel = "NONE"
       }
     }
+    /*
+     * perftest variant — sits side-by-side with the standard debug install
+     * (different applicationId via the ".perftest" suffix and its own data
+     * dir under /data/data/com.izzy2lost.x1box.perftest), so we can A/B the
+     * debug-logging-on build against a debug-logging-off build without
+     * uninstalling the original. Same NDK flags as `debug` so the
+     * libxemu.so codegen is identical (lets us isolate runtime-config /
+     * sched-debug-log overhead from compile-flag differences). `isDebuggable
+     * = true` keeps simpleperf / run-as / lldb-server attachable; pair with
+     * a sched_config.txt that omits the X1BOX_*_DEBUG=1 flags to actually
+     * measure the no-logging steady state.
+     *
+     * Build with: `./gradlew assemblePerftest`
+     * Install with: `adb install -r app/build/outputs/apk/perftest/app-perftest.apk`
+     */
+    create("perftest") {
+      isDebuggable = true
+      applicationIdSuffix = ".perftest"
+      versionNameSuffix = "-perftest"
+      ndk {
+        debugSymbolLevel = "NONE"
+      }
+      matchingFallbacks += listOf("debug")
+      /* Sign with the debug keystore so `adb install` works without
+       * needing key.properties. Distinct from the release variant which
+       * uses the project's release keystore when available. */
+      signingConfig = signingConfigs.getByName("debug")
+    }
     release {
       externalNativeBuild {
         cmake {

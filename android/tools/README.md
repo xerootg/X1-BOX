@@ -97,6 +97,7 @@ Pass `target="ui"` to inspect the launcher process instead.
 |---|---|
 | `get_gpu_info()` | `dumpsys gpu` + SurfaceFlinger driver lines. |
 | `get_gfxinfo()` | Frame timings / jank counts. |
+| `measure_fps(duration=5.0)` | User-visible FPS: rate of unique guest frames hitting the screen. Reads the `xemu-fps` logcat tag (emitted per `SDL_GL_SwapWindow` in ui/xemu.c) which carries `f=swap_counter g=NV097_FLIP_STALL_counter t=mono_ns`. Reports user-visible fps as `delta(g)/dt`, host swap fps as `delta(f)/dt`, the duplicate-swap ratio, and percentiles (median, 1%/5%-low, best 5%) computed from intervals between swaps where the guest counter advanced. Host swaps every refresh tick regardless of new content, so swap-rate is NOT user-visible fps — verified 2026-05-20: reported 20.49 vs eyeball 21–23 on Halo 2/Pixel 10a. |
 | `get_gpu_stats()` | Mali sysfs + Adreno KGSL + meminfo for UI **and** `:xemu`. |
 | `get_vulkan_layers()` | Discoverable validation layers. |
 | `get_gpu_driver_dir()` | adrenotools custom-driver install dir under the app sandbox. |
@@ -118,8 +119,123 @@ Pass `target="ui"` to inspect the launcher process instead.
 |---|---|
 | `show_config()` | Cat `xemu.toml`. |
 | `push_config(local_path)` | Replace `xemu.toml`. |
-| `list_state(kind)` | `kind` ∈ `all, config, logs, shader_cache, snapshots, gpu_driver`. |
-| `clear_cache(kind)` | `kind` ∈ `shader, logs, snapshots, covers, disc_format_cache`. |
+| `list_state(kind)` | `kind` ∈ `all, config, logs, shader_cache, shader_dump, snapshots, gpu_driver`. |
+| `clear_cache(kind)` | `kind` ∈ `shader, shader_dump, logs, snapshots, covers, disc_format_cache`. |
+
+### Shader-dump audit (pgraph_vk SPIR-V archive + malioc)
+
+Pairs with the per-pipeline-create dumper in `hw/xbox/nv2a/pgraph/vk/draw.c`, which writes
+`<external-files>/x1box/shader_dump/<hash>/killer_{vsh,psh,geom}.{spv,glsl}` for every unique
+shader-state hash. Dedupe is disk-backed so the archive grows organically across launches.
+
+| Tool | Notes |
+|---|---|
+| `shader_dump_list(hash_prefix="")` | Tabulate hashes + per-stage byte sizes. Filter by hash prefix. |
+| `shader_dump_session_hashes(lines=4000)` | Extract hashes seen in recent logcat (tag `hakuX-vk-shaderdump`), in order. Use after `clear_log(name='logcat')` + a play session to slice the cumulative dump by area. |
+| `shader_dump_audit(stage='psh', gpu='', hash_prefix='', details=False)` | Run Mali Offline Compiler on every dumped `<stage>.spv` against the device GPU (auto-detected) and tabulate warnings/errors + Mali's `discard`/`late-ZS`/`side-fx` flags. Requires `$ARM_PERFORMANCE_STUDIO_HOME` (defaults to `/home/xero/repos/Arm_Performance_Studio_2026.2`). |
+
+### Generic GPU probe (driver-divergence experiments)
+
+`gpu_probe()` compiles a small GLSL probe shader on the host, pushes a binary
+request to the device, runs it on the real Vulkan device at `pgraph_vk_init`
+time (see `hw/xbox/nv2a/pgraph/vk/probe_runner.{c,h}`), and pulls back a
+binary result file. No logcat traffic; one disk-write on each side.
+
+Use it to compare what different drivers (Mali vs Adreno vs anything) do
+for a given GLSL expression — NaN/Inf semantics, FP precision questions,
+edge-case texture sampling, etc. Replaces ad-hoc "rebuild + log + parse"
+cycles.
+
+| Tool | Notes |
+|---|---|
+| `gpu_probe(glsl, stage='compute', n_outputs=24, push_floats='', labels='', auto_restart=True, game_name='', timeout=30)` | Compile GLSL → SPIR-V via local `glslangValidator`/`glslc`, push to device, optionally stop+launch the emulator to fire `pgraph_vk_init`, poll for `probe_done.flag`, pull `probe_out.bin`, decode each uint32 slot as raw hex + classified float (NaN/Inf/+0/finite). For `stage='fragment'`, the runner supplies a fullscreen-triangle vertex shader; the user fragment shader writes to a single `out uint` at `layout(location=0)` and selects its slot via `int(gl_FragCoord.x)`. Compute shaders write `probe[i]` of an SSBO at `set=0, binding=0`. Up to 16 `push_floats` are exposed via `layout(push_constant) uniform Push`. |
+
+### Per-thread CPU scheduling (Android only)
+
+Pairs with `util/sched-android.{c,h}`, hooked from `util/qemu-thread-posix.c`
+right after `PR_SET_NAME`. Sets `uclamp.min` via `sched_setattr(2)` and
+optional `sched_setaffinity(2)` per thread, with a name-prefix policy
+table (`CPU N/TCG`, `mcpx.*`, `nv2a.pfifo`, `pgraph.vk.*`, `cranelift-tcg`,
+etc.). Detects bigLITTLE topology from `/sys/devices/system/cpu/cpuN/cpu_capacity`
+so it works on Tensor / Snapdragon without device-specific tables.
+
+**Default is OFF** — nothing changes unless the user opts in. The bug
+this addresses is Tensor G4 / `sched_pixel` under-clocking the A720
+mid cluster to ~35% of max despite ample workload, dropping Halo 2 to
+~16 FPS on Pixel 10a while Zenfone 10 holds 25 FPS at all-cores-100%.
+
+Tunables (read at xemu startup, propagated to every QEMU thread):
+
+| env var | values | default | effect |
+|---|---|---|---|
+| `X1BOX_SCHED_PROFILE` | `off` / `balanced` / `max` | `off` | top-level enable |
+| `X1BOX_SCHED_UCLAMP_HOT` | 0..1024 | 512 (balanced) / 1024 (max) | uclamp.min for `CPU N/TCG` |
+| `X1BOX_SCHED_UCLAMP_WARM` | 0..1024 | 256 (balanced) / 768 (max) | uclamp.min for `mcpx.*`, `nv2a.*`, `pgraph.vk.*`, `cranelift-tcg`, `SDLAudioP2` |
+| `X1BOX_SCHED_UCLAMP_COOL` | 0..1024 | 0 / 256 | uclamp.min for `qemu_main` and other utility threads |
+| `X1BOX_SCHED_EXCLUDE_LITTLE` | 0/1 | profile default | excludes the lowest-capacity cluster from HOT+WARM affinity |
+| `X1BOX_SCHED_PIN_TCG_BIG` | 0/1 | 0 (balanced) / 1 (max) | pins `CPU N/TCG` to the single biggest core |
+| `X1BOX_SCHED_DEBUG` | 0/1 | 0 | log every policy decision to `logcat -s x1box-sched` |
+
+Power consideration: profiles only raise the floor (`uclamp.min`), they
+never raise the ceiling. The governor still scales down when the
+threads sleep — uclamp.min is a *minimum-when-running* request, not a
+fixed-frequency demand. Backgrounded apps also get cgroup-constrained
+by Android's `/background` policy. The `sched_android_set_boost(false)`
+API drops uclamp.min for explicit foreground/background switching, but
+isn't currently wired into the Android lifecycle — TODO.
+
+### Android Dynamic Performance Framework (ADPF)
+
+Direct `sched_setattr(SCHED_FLAG_UTIL_CLAMP_MIN)` returns EPERM on Android 14
+without CAP_SYS_NICE (verified empirically on Pixel 10a, Halo 2, 2026-05-20),
+so the affinity-only profile above gives ~15-20% FPS recovery but can't lift
+the mid-cluster clock. ADPF (`<android/performance_hint.h>`, Android 13+)
+relays uclamp requests through `system_server`, which *does* have the
+privilege; `util/adpf-android.{c,h}` is the wrapper.
+
+Same `sched_config.txt` knob file. Default OFF.
+
+| key | default | meaning |
+|---|---|---|
+| `X1BOX_ADPF_ENABLED` | `0` | master switch (independent of `SCHED_PROFILE`) |
+| `X1BOX_ADPF_TARGET_NS` | `33333333` | target work duration (30 FPS = 33.3ms) |
+| `X1BOX_ADPF_REPORT_PERIOD_MS` | system-preferred (~16) | reporter-thread sleep |
+| `X1BOX_ADPF_THREAD_FILTER` | `hot,hotwarm,warm` | comma-list of classes to enroll |
+| `X1BOX_ADPF_DEBUG` | `0` | log session/target/period to `logcat -s x1box-adpf` |
+
+The init enumerates `/proc/self/task` for the same name prefixes the sched
+layer uses (`CPU N/TCG`, `nv2a.pfifo`, `mcpx.*`, `pgraph.vk.*`,
+`cranelift-tcg`, `SDLAudioP2`), so it captures the threads in flight at
+`pgraph_vk_init` time. Up to 32 TIDs per session — generally fine, but
+the filter lets you trim if needed.
+
+```
+adb shell sh -c 'cat > /storage/emulated/0/Android/data/com.izzy2lost.x1box/files/x1box/sched_config.txt <<EOF
+X1BOX_SCHED_PROFILE=max
+X1BOX_ADPF_ENABLED=1
+X1BOX_ADPF_TARGET_NS=33333333
+X1BOX_ADPF_DEBUG=1
+X1BOX_SCHED_DEBUG=1
+EOF'
+adb shell am force-stop com.izzy2lost.x1box
+# launch Halo 2
+adb logcat -d -s x1box-sched:* x1box-adpf:*
+```
+
+**Runtime tweaking on Android**: `am start` doesn't propagate env vars, so
+in addition to env, the runner reads a config file at
+`<ext>/x1box/sched_config.txt`. Each line is `KEY=VALUE`; values
+override env. Quick test on Pixel:
+```
+adb shell sh -c 'cat > /storage/emulated/0/Android/data/com.izzy2lost.x1box/files/x1box/sched_config.txt <<EOF
+X1BOX_SCHED_PROFILE=max
+X1BOX_SCHED_DEBUG=1
+EOF'
+adb shell am force-stop com.izzy2lost.x1box
+# Relaunch Halo 2, then:
+adb logcat -d -s x1box-sched:* | head -40   # confirm the policy was applied
+```
+Iterate by editing the file and force-stopping; no rebuild required.
 
 ### Build / install / FS
 

@@ -295,6 +295,15 @@ bool xemu_settings_load(void)
     setenv("XEMU_ANDROID_TCG_TUNING", "1", 1);
     setenv("XEMU_ANDROID_TCG_THREAD", "multi", 1);
     setenv("XEMU_ANDROID_TCG_TB_SIZE", "128", 1);
+    /* Xbox kernel HLE: default ON now that the ordinal table is
+     * Ghidra-verified against the running Halo 2 retail kernel and
+     * every install path goes through `prologue_matches()`. Active
+     * handlers are NtYieldExecution, KfRaiseIrql, and
+     * KeStallExecutionProcessor; KeDelayExecutionThread and
+     * KfLowerIrql are probe-only until their Interval/DPC plumbing
+     * lands. Set X1BOX_HLE=0 to disable, or per-family
+     * X1BOX_HLE_YIELD=0 / _KF=0. */
+    setenv("X1BOX_HLE", "1", 0);
 
     const char *path = xemu_settings_get_path();
     if (!path || *path == '\0') {

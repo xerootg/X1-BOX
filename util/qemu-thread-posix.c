@@ -415,6 +415,14 @@ static void *qemu_thread_start(void *args)
                             "qemu_thread_create: tid=%d name=%s name_threads=%d",
                             tid, log_name, (int)name_threads);
     }
+    /* Apply the configured CPU-scheduling profile (uclamp.min + optional
+     * affinity) — only effective when $X1BOX_SCHED_PROFILE is set to
+     * balanced|max; default OFF leaves system behavior unchanged. Must
+     * run after PR_SET_NAME so the profile lookup sees the real comm. */
+    {
+        extern void sched_android_apply_for_thread(const char *name);
+        sched_android_apply_for_thread(qemu_thread_args->name);
+    }
 #endif
     QEMU_TSAN_ANNOTATE_THREAD_NAME(qemu_thread_args->name);
     g_free(qemu_thread_args->name);
