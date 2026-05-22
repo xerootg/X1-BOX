@@ -1059,19 +1059,41 @@ static bool hle_ke_stall_execution_processor(X86CPU *cpu)
  * NTSTATUS KeDelayExecutionThread(KPROCESSOR_MODE WaitMode,
  *                                  BOOLEAN Alertable,
  *                                  PLARGE_INTEGER Interval)
- * __stdcall, 3 args. We special-case Interval==0 (and Interval->Quad==0)
- * as a pure yield — return STATUS_SUCCESS immediately. Real timeouts
- * still go through the kernel; we don't intercept those because they
- * need real wait-queue plumbing.
+ * __stdcall, 3 args. Imported by Halo 2 / SS2 / COD3 and used as the
+ * canonical "give up timeslice" call across the XDK.
  *
- * For now: return STATUS_SUCCESS unconditionally (treat as instant
- * timeout). This matches the "yield-as-flush-window" goal but is more
- * aggressive than strictly correct. Gated by X1BOX_HLE_YIELD=1.
+ * Strictly correct Interval-inspect path:
+ *   - Alertable wait can return STATUS_USER_APC — decline (we can't
+ *     simulate APC delivery), kernel handles it.
+ *   - UserMode wait can also return STATUS_USER_APC — decline.
+ *   - Read the LARGE_INTEGER at *Interval:
+ *       Quad ==  0  → pure yield, HLE as STATUS_SUCCESS.
+ *       Quad <  0   → relative timed wait; decline (real wait-queue
+ *                     needed; some titles use small negative values
+ *                     as a sleep, not a yield, and HLE'ing those was
+ *                     observed to break frame pacing).
+ *       Quad >  0   → absolute timed wait; decline (same).
+ *
+ * Gated by X1BOX_HLE_YIELD=1. The previous (uninstalled, probe-only)
+ * version blanket-returned STATUS_SUCCESS regardless of Interval — too
+ * aggressive for the broad title set we now know imports this.
  */
 static bool hle_ke_delay_execution_thread(X86CPU *cpu)
 {
     CPUX86State *env = &cpu->env;
-    /* args ignored — we'd need to check Interval to be strictly correct */
+    uint32_t wait_mode    = hle_arg32(env, 0);  /* 0 = KernelMode */
+    uint32_t alertable    = hle_arg32(env, 1) & 0xff;
+    uint32_t interval_ptr = hle_arg32(env, 2);
+
+    if (alertable) return false;
+    if (wait_mode != 0) return false;
+    if (!interval_ptr) return false;
+
+    uint32_t lo, hi;
+    if (!g_read32(interval_ptr, &lo)) return false;
+    if (!g_read32(interval_ptr + 4, &hi)) return false;
+    if (lo != 0 || hi != 0) return false;
+
     env->regs[R_EAX] = 0; /* STATUS_SUCCESS */
     hle_return_stdcall(env, 3);
     return true;
@@ -1720,6 +1742,10 @@ static const uint8_t SIG_RTL_EQUAL_STRING[] = {
     /* push ebp; mov ebp,esp; mov ecx,[ebp+8]; mov edx,[ebp+0xC] */
     0x55, 0x8b, 0xec, 0x8b, 0x4d, 0x08, 0x8b, 0x55
 };
+static const uint8_t SIG_KE_WAIT_FOR_MULTIPLE_OBJECTS[] = {
+    /* push ebp; mov ebp, esp; sub esp, 0x20; push ebx; push esi */
+    0x55, 0x8b, 0xec, 0x83, 0xec, 0x20, 0x53, 0x56
+};
 
 #define SIG(arr) arr, sizeof(arr)
 
@@ -1789,13 +1815,25 @@ static const struct ord_entry g_ordinal_table[] = {
     { 128, "KeQuerySystemTime",           hle_ke_query_system_time,           &g_gate_kf,
         SIG(SIG_KE_QUERY_SYSTEM_TIME) },
     /*
-     * KeDelayExecutionThread: probe-only. Blanket STATUS_SUCCESS would
-     * break non-zero-Interval callers (frame pacing, asset loaders).
-     * Needs an Interval-inspect path that only HLE's the Interval==0
-     * yield case.
+     * KeDelayExecutionThread: Interval-inspect path. HLEs only the
+     * Interval->QuadPart == 0 pure-yield case (KernelMode, non-alertable);
+     * timed waits and alertable/UserMode calls decline so the real
+     * kernel runs. Imported by Halo 2 / SS2 / COD3 and most XDK titles.
      */
-    {  99, "KeDelayExecutionThread",    NULL,                          &g_gate_yield,
+    {  99, "KeDelayExecutionThread",    hle_ke_delay_execution_thread, &g_gate_yield,
         SIG(SIG_KE_DELAY_EXECUTION_THREAD) },
+    /*
+     * KeWaitForMultipleObjects: probe-only. Directly imported by COD3
+     * (Halo 2 / SS2 use the Nt variant which resolves handles then calls
+     * this). Fast path is "all Count objects already signalled when
+     * WaitType=WaitAll" — requires iterating the object array, peeking
+     * each dispatcher header, then atomically decrementing each
+     * SignalState. Promote once profiled-hot on a real workload; the
+     * single-object KeWaitForSingleObject HLE covers the common case
+     * already.
+     */
+    { 158, "KeWaitForMultipleObjects",  NULL,                          &g_gate_kf,
+        SIG(SIG_KE_WAIT_FOR_MULTIPLE_OBJECTS) },
     /*
      * KfLowerIrql: dominant unhooked hotspot (0x80014386 at 122K/s on
      * Halo 2 title screen). Fast path = no pending IRQs eligible at
@@ -1893,6 +1931,57 @@ static const struct extra_hook g_extra_hooks[] = {
         SIG(SIG_XC_SHA_TRANSFORM),
     },
 };
+
+/* ------------------------------------------------------------------ */
+/*  XBE-side probes (D3D8 LTCG vertex-shader-constant emitters)        */
+/* ------------------------------------------------------------------ */
+/*
+ * Halo 2 v1.0 inlines D3DDevice_SetVertexShaderConstantN as raw NV2A
+ * FIFO writers at the addresses below. We install no-op probes that
+ * always return `false` — the TB runs normally, but the decline counter
+ * gives us per-variant call rates without disturbing the game.
+ *
+ * Promote to a real handler by swapping `hle_probe_decline` for an
+ * impl that takes ownership of the call. See [[project_xbox_hle_v1]]
+ * Option C in the SetVertexShaderConstant plan.
+ *
+ * PC-range fast-path (xbox_hle_check) is widened by 0x500 bytes to
+ * cover this window — measured cost is negligible vs. the kernel-only
+ * range, and we collapse the whole D3D8-LTCG constant region.
+ */
+static bool hle_probe_decline(X86CPU *cpu)
+{
+    (void)cpu;
+    return false;
+}
+
+#define HALO2_VSH_PROBE_LO 0x003f7000u
+#define HALO2_VSH_PROBE_HI 0x003fad00u
+
+static const struct {
+    const char *name;
+    uint32_t pc;
+    XboxHleHandler handler;
+} g_xbe_probes[] = {
+    { "D3DDevice_SetVertexShaderConstant1",             0x003f71d0u, hle_probe_decline },
+    { "D3DDevice_SetVertexShaderConstant1Fast",         0x003f7230u, hle_probe_decline },
+    { "D3DDevice_SetVertexShaderConstant4",             0x003f7280u, hle_probe_decline },
+    { "D3DDevice_SetVertexShaderConstantNotInlineFast", 0x003f7330u, hle_probe_decline },
+    { "D3DDevice_SetVertexShaderConstantNotInline_0",   0x003f7410u, hle_probe_decline },
+    { "D3DDevice_MakeSpace",                            0x003fac20u, hle_probe_decline },
+};
+
+static bool g_xbe_probes_installed;
+
+static void install_xbe_probes_once(void)
+{
+    if (g_xbe_probes_installed) return;
+    g_xbe_probes_installed = true;
+    for (size_t i = 0; i < ARRAY_SIZE(g_xbe_probes); i++) {
+        hle_install(g_xbe_probes[i].name, g_xbe_probes[i].pc,
+                    g_xbe_probes[i].handler);
+    }
+}
 
 /*
  * Verify the function at `va` matches the expected prologue. NULL/zero
@@ -2101,22 +2190,24 @@ bool xbox_hle_check(CPUState *cs, uint32_t pc)
     }
     if (!g_hle_enabled) return false;
     /*
-     * Fast-path range filter: every HLE hook today lives in the Xbox
-     * kernel image at 0x80010000+. Game code (Halo 2 XBE) is at much
-     * lower addresses (< 0x800000). Reject the >99% of TBs that
-     * aren't in the kernel range with a single compare — eliminates
-     * the hash-table lookup cost for them. At 12M TB/s this is the
-     * dominant cost of the dispatcher hook.
-     *
-     * Update XKRNL_HOOK_RANGE_* if Tier 2 hooks ever land outside the
-     * kernel image (e.g., D3D8 fast paths).
+     * Fast-path range filter. Two narrow windows:
+     *   - kernel image at 0x80010000..0x800b0000
+     *   - Halo 2 D3D8-LTCG vertex-shader-constant emitters at
+     *     0x003f7000..0x003f7500 (1.25 KB)
+     * Two compares; rejects the >99% of TBs that aren't in either.
      */
 #define XKRNL_HOOK_RANGE_LO 0x80010000u
 #define XKRNL_HOOK_RANGE_HI 0x800b0000u
-    if (pc < XKRNL_HOOK_RANGE_LO || pc >= XKRNL_HOOK_RANGE_HI) {
+    bool in_kernel = (pc >= XKRNL_HOOK_RANGE_LO && pc < XKRNL_HOOK_RANGE_HI);
+    bool in_xbe_vsh = (pc >= HALO2_VSH_PROBE_LO && pc < HALO2_VSH_PROBE_HI);
+    if (!in_kernel && !in_xbe_vsh) {
         return false;
     }
-    if (!g_hle_resolved) {
+    if (in_xbe_vsh) {
+        /* Probes don't depend on PE resolution — install on first hit. */
+        install_xbe_probes_once();
+    }
+    if (in_kernel && !g_hle_resolved) {
         /* Throttle the PE walk — it touches guest memory which isn't
          * mapped early in boot. Try every ~256 calls until it lands. */
         static uint32_t throttle;
@@ -2163,6 +2254,18 @@ void xbox_hle_log_stats(void)
             " next_thread_pending=%" PRIu64,
             g_idle_loop_idle, g_idle_loop_dpc_pending,
             g_idle_loop_next_thread_pending);
+
+    /* Cross-check: how many SET_TRANSFORM_CONSTANT slot writes pgraph saw
+     * vs. how many of those slot writes were redundant (value unchanged).
+     * Divide writes by 4 to get constant-update count. If pgraph is hot but
+     * the XBE-entry probes above are cold, LTCG inlined the FIFO write at
+     * draw sites and the named D3DDevice_SetVertexShaderConstant* are not
+     * the right hook surface. */
+    extern uint64_t pgraph_vsh_const_writes_total;
+    extern uint64_t pgraph_vsh_const_writes_redundant;
+    HLE_LOG("pgraph vsh_const_writes total=%" PRIu64 " redundant=%" PRIu64,
+            pgraph_vsh_const_writes_total,
+            pgraph_vsh_const_writes_redundant);
 
     /* Top 10 unhooked kernel PCs — these are the next HLE candidates.
      * Simple selection sort; HLE_PROFILE_SLOTS=256 so this is cheap. */

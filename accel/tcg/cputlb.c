@@ -889,9 +889,26 @@ static void tlb_reset_dirty_range_locked(CPUTLBEntryFull *full, CPUTLBEntry *ent
                                          uintptr_t start, uintptr_t length)
 {
     const uintptr_t addr = ent->addr_write;
-    int flags = addr | full->slow_flags[MMU_DATA_STORE];
+    const int mask = TLB_INVALID_MASK | TLB_MMIO | TLB_DISCARD_WRITE | TLB_NOTDIRTY;
 
-    flags &= TLB_INVALID_MASK | TLB_MMIO | TLB_DISCARD_WRITE | TLB_NOTDIRTY;
+    /*
+     * Fast pre-check using only ent->addr_write — the cache line for `ent`
+     * is already touched by the table walk. If any of the slow-path flag
+     * bits is set in addr, OR'ing with full->slow_flags can't clear them,
+     * so flags != 0 and the body is a no-op. Returning here avoids loading
+     * full->slow_flags, which lives in a separate ~64 KB fulltlb[] array
+     * and is the dominant cache cost of this walk (tb_link_page ->
+     * tlb_protect_code -> tlb_reset_dirty hits this loop ~4096 times per
+     * call). Bink playback in particular has most entries TLB_NOTDIRTY (the
+     * pages are code-protected), so the slow_flags load was wasted for
+     * ~90% of entries.
+     */
+    if (addr & mask) {
+        return;
+    }
+
+    int flags = full->slow_flags[MMU_DATA_STORE];
+    flags &= mask;
     if (flags == 0) {
         uintptr_t host = (addr & TARGET_PAGE_MASK) + ent->addend;
         if ((host - start) < length) {

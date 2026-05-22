@@ -1456,6 +1456,106 @@ static void pgraph_method_non_inc(MethodFunc handler, METHOD_HANDLER_ARG_DECL)
     }                                                             \
     DEF_METHOD_INT(gclass, name)
 
+/* Defined alongside the per-slot DEF_METHOD_INC(NV097, SET_TRANSFORM_CONSTANT)
+ * handler below; the batched fast-path uses the same counters. */
+extern uint64_t pgraph_vsh_const_writes_total;
+extern uint64_t pgraph_vsh_const_writes_redundant;
+
+/*
+ * Batched applier for SET_TRANSFORM_CONSTANT (NV097 method 0xB80, 32-slot
+ * range). The default DEF_METHOD_INC path dispatches once per dword; Halo 2
+ * pushes 16-dword chunks ~120k slot writes/s at title screen with ~75% of the
+ * writes being redundant (value already in pg->vsh_constants). This routine
+ * collapses the whole chunk into:
+ *   - one PG_GET_MASK + one PG_SET_MASK for CONST_LD_PTR
+ *   - per-row chunk compare; full-row redundant chunks skip the cell write
+ *     AND the dirty-flag write
+ *   - per-cell counter parity with the original DEF_METHOD_INC path
+ *
+ * Caller guarantees `method` is in [NV097_SET_TRANSFORM_CONSTANT,
+ * NV097_SET_TRANSFORM_CONSTANT + 32*4) and inc=true.
+ */
+static int pgraph_set_transform_constant_batched(
+    PGRAPHState *pg, unsigned int method,
+    uint32_t *parameters, size_t num_words_available)
+{
+    unsigned slot_start = (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
+    unsigned const_load = PG_GET_MASK(NV_PGRAPH_CHEOPS_OFFSET,
+                                      NV_PGRAPH_CHEOPS_OFFSET_CONST_LD_PTR);
+    unsigned slots_remaining = 32 - slot_start;
+    size_t count = MIN(num_words_available, slots_remaining);
+
+    pgraph_vsh_const_writes_total += count;
+
+    unsigned cur_load = const_load;
+    unsigned col = slot_start % 4;
+    size_t i = 0;
+
+    /* Leading partial row (col != 0 at start). */
+    while (col != 0 && i < count) {
+        assert(cur_load < NV2A_VERTEXSHADER_CONSTANTS);
+        uint32_t p = ldl_le_p(parameters + i);
+        uint32_t *cell = &pg->vsh_constants[cur_load][col];
+        if (p != *cell) {
+            pg->vsh_constants_dirty[cur_load] = true;
+            pg->vsh_constants_any_dirty = true;
+            *cell = p;
+        } else {
+            pgraph_vsh_const_writes_redundant++;
+        }
+        col++;
+        i++;
+        if (col == 4) { col = 0; cur_load++; break; }
+    }
+
+    /* Full-row chunks. 16-byte equality skips the entire row's writes. */
+    while (i + 4 <= count) {
+        assert(cur_load < NV2A_VERTEXSHADER_CONSTANTS);
+        uint32_t p0 = ldl_le_p(parameters + i);
+        uint32_t p1 = ldl_le_p(parameters + i + 1);
+        uint32_t p2 = ldl_le_p(parameters + i + 2);
+        uint32_t p3 = ldl_le_p(parameters + i + 3);
+        uint32_t *row = pg->vsh_constants[cur_load];
+        if (p0 == row[0] && p1 == row[1] && p2 == row[2] && p3 == row[3]) {
+            pgraph_vsh_const_writes_redundant += 4;
+        } else {
+            /* Keep per-cell redundancy parity for the cross-check counter. */
+            if (p0 == row[0]) pgraph_vsh_const_writes_redundant++;
+            if (p1 == row[1]) pgraph_vsh_const_writes_redundant++;
+            if (p2 == row[2]) pgraph_vsh_const_writes_redundant++;
+            if (p3 == row[3]) pgraph_vsh_const_writes_redundant++;
+            row[0] = p0; row[1] = p1; row[2] = p2; row[3] = p3;
+            pg->vsh_constants_dirty[cur_load] = true;
+            pg->vsh_constants_any_dirty = true;
+        }
+        cur_load++;
+        i += 4;
+    }
+
+    /* Trailing partial row. */
+    while (i < count) {
+        assert(cur_load < NV2A_VERTEXSHADER_CONSTANTS);
+        uint32_t p = ldl_le_p(parameters + i);
+        uint32_t *cell = &pg->vsh_constants[cur_load][col];
+        if (p != *cell) {
+            pg->vsh_constants_dirty[cur_load] = true;
+            pg->vsh_constants_any_dirty = true;
+            *cell = p;
+        } else {
+            pgraph_vsh_const_writes_redundant++;
+        }
+        col++;
+        i++;
+    }
+
+    if (cur_load != const_load) {
+        PG_SET_MASK(NV_PGRAPH_CHEOPS_OFFSET,
+                    NV_PGRAPH_CHEOPS_OFFSET_CONST_LD_PTR, cur_load);
+    }
+
+    return (int)count;
+}
+
 int pgraph_method(NV2AState *d, unsigned int subchannel,
                    unsigned int method, uint32_t parameter,
                    uint32_t *parameters, size_t num_words_available,
@@ -1464,6 +1564,16 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
     int num_processed = 1;
 
     PGRAPHState *pg = &d->pgraph;
+
+    /* Hot path: SET_TRANSFORM_CONSTANT — ~75% redundant in Halo 2.
+     * See pgraph_set_transform_constant_batched for rationale. */
+    if (inc && method >= NV097_SET_TRANSFORM_CONSTANT &&
+        method < NV097_SET_TRANSFORM_CONSTANT + 32 * 4 &&
+        subchannel == pg->last_subchannel &&
+        pg->cached_graphics_class == NV_KELVIN_PRIMITIVE) {
+        return pgraph_set_transform_constant_batched(
+            pg, method, parameters, num_words_available);
+    }
 
 #if XEMU_OPT_METHOD_FAST_TABLE
     if (inc && method >= 0x100 &&
@@ -3166,6 +3276,14 @@ DEF_METHOD_INC(NV097, SET_TRANSFORM_PROGRAM)
     }
 }
 
+/* Telemetry: how many SET_TRANSFORM_CONSTANT slot writes pgraph saw, and how
+ * many were redundant (parameter equal to current value). Read by
+ * xbox_hle_log_stats() to cross-check the XBE-entry probes — if pgraph sees
+ * thousands/s while the entry probes see only a handful, LTCG inlined the
+ * FIFO writes at draw sites that bypass the named functions. */
+uint64_t pgraph_vsh_const_writes_total;
+uint64_t pgraph_vsh_const_writes_redundant;
+
 DEF_METHOD_INC(NV097, SET_TRANSFORM_CONSTANT)
 {
     int slot = (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
@@ -3174,9 +3292,11 @@ DEF_METHOD_INC(NV097, SET_TRANSFORM_CONSTANT)
 
     assert(const_load < NV2A_VERTEXSHADER_CONSTANTS);
     // VertexShaderConstant *constant = &pg->constants[const_load];
-    pg->vsh_constants_dirty[const_load] |=
-        (parameter != pg->vsh_constants[const_load][slot%4]);
-    if (parameter != pg->vsh_constants[const_load][slot%4]) {
+    pgraph_vsh_const_writes_total++;
+    bool changed = (parameter != pg->vsh_constants[const_load][slot%4]);
+    if (!changed) pgraph_vsh_const_writes_redundant++;
+    pg->vsh_constants_dirty[const_load] |= changed;
+    if (changed) {
         pg->vsh_constants_any_dirty = true;
     }
     pg->vsh_constants[const_load][slot%4] = parameter;
