@@ -18,6 +18,7 @@
  */
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "hw/xbox/xpacks.h"
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -230,6 +231,10 @@ void nv2a_profile_flip_stall(void)
     g_nv2a_stats.frame_count++;
     memset(&g_nv2a_stats.frame_working, 0, sizeof(g_nv2a_stats.frame_working));
 
+    /* xpacks: re-scan guest memory for any pending pattern_bytes patches.
+     * Cheap when nothing is pending; throttled internally. */
+    xpacks_tick();
+
     snapshot_phase_timing();
     snapshot_cpu_timing();
     snapshot_vsync_timing();
@@ -249,6 +254,9 @@ void nv2a_profile_flip_stall(void)
             p->game_frame_max_ms = frame_ms;
     }
     prev_flip_us = now;
+
+    /* Drive xpack pattern-scan; throttled internally to ~1Hz. */
+    xpacks_tick();
 
 #if defined(__ANDROID__) && NV2A_PERF_LOG
     if ((g_nv2a_stats.frame_count % 60) == 0) {

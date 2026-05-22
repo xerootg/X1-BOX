@@ -66,5 +66,11 @@
       android:screenOrientation="fullSensor"
       android:exported="false" />
 
+    <activity
+      android:name=".XPackActivity"
+      android:label="Mods"
+      android:screenOrientation="fullSensor"
+      android:exported="false" />
+
   </application>
 </manifest>

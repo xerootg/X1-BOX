@@ -20,6 +20,7 @@
 #include "ui/xemu-settings.h"
 #include "renderer.h"
 #include "qemu/fast-hash.h"
+#include "hw/xbox/xpacks.h"
 
 #include <assert.h>
 #include <glslang/Include/glslang_c_interface.h>
@@ -448,21 +449,37 @@ ShaderModuleInfo *pgraph_vk_create_shader_module_from_glsl(
 
     if (g_config.perf.cache_shaders) {
         uint64_t hash = fast_hash((const uint8_t *)glsl, strlen(glsl));
-        GByteArray *cached = spv_cache_load(hash);
-        if (cached) {
-            info->spirv = cached;
-            g_nv2a_stats.shader_stats.spv_cache_hits++;
+
+        /* xpacks: opt-in SPIR-V replacement keyed by GLSL hash. Bypasses
+         * both the disk cache and the glslang compiler. */
+        size_t ovr_len = 0;
+        void *ovr = xpacks_lookup_spirv(hash, &ovr_len);
+        if (ovr) {
+            info->spirv = g_byte_array_new_take((guint8 *)ovr, ovr_len);
+        } else {
+            GByteArray *cached = spv_cache_load(hash);
+            if (cached) {
+                info->spirv = cached;
+                g_nv2a_stats.shader_stats.spv_cache_hits++;
+            } else {
+                info->spirv = pgraph_vk_compile_glsl_to_spv(
+                    vk_shader_stage_to_glslang_stage(stage), glsl);
+                if (info->spirv) {
+                    spv_cache_store(hash, info->spirv);
+                }
+                g_nv2a_stats.shader_stats.spv_cache_misses++;
+            }
+        }
+    } else {
+        uint64_t hash = fast_hash((const uint8_t *)glsl, strlen(glsl));
+        size_t ovr_len = 0;
+        void *ovr = xpacks_lookup_spirv(hash, &ovr_len);
+        if (ovr) {
+            info->spirv = g_byte_array_new_take((guint8 *)ovr, ovr_len);
         } else {
             info->spirv = pgraph_vk_compile_glsl_to_spv(
                 vk_shader_stage_to_glslang_stage(stage), glsl);
-            if (info->spirv) {
-                spv_cache_store(hash, info->spirv);
-            }
-            g_nv2a_stats.shader_stats.spv_cache_misses++;
         }
-    } else {
-        info->spirv = pgraph_vk_compile_glsl_to_spv(
-            vk_shader_stage_to_glslang_stage(stage), glsl);
     }
 
     if (!info->spirv) {

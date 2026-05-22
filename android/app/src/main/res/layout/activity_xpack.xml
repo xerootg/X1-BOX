@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+  xmlns:app="http://schemas.android.com/apk/res-auto"
+  android:layout_width="match_parent"
+  android:layout_height="match_parent"
+  android:background="@drawable/setup_wizard_background">
+
+  <androidx.core.widget.NestedScrollView
+    android:id="@+id/xpack_scroll"
+    android:layout_width="0dp"
+    android:layout_height="0dp"
+    android:clipToPadding="false"
+    android:fillViewport="true"
+    android:paddingHorizontal="@dimen/top_level_card_outer_padding_horizontal"
+    android:paddingVertical="@dimen/top_level_card_outer_padding_vertical"
+    app:layout_constraintBottom_toBottomOf="parent"
+    app:layout_constraintEnd_toEndOf="parent"
+    app:layout_constraintStart_toStartOf="parent"
+    app:layout_constraintTop_toTopOf="parent">
+
+    <LinearLayout
+      android:layout_width="match_parent"
+      android:layout_height="wrap_content"
+      android:gravity="center_horizontal"
+      android:orientation="vertical">
+
+      <com.google.android.material.card.MaterialCardView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        app:cardBackgroundColor="@color/xemu_surface"
+        app:cardCornerRadius="28dp"
+        app:cardElevation="14dp"
+        app:strokeColor="@color/xemu_outline"
+        app:strokeWidth="2dp">
+
+        <LinearLayout
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:orientation="vertical"
+          android:padding="24dp">
+
+          <!-- Header -->
+          <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Mods (xpacks)"
+            android:textAppearance="@style/TextAppearance.Material3.HeadlineMedium" />
+
+          <TextView
+            android:id="@+id/tv_xpack_subtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="Patch packs that modify guest memory and shaders at game launch."
+            android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+            android:textColor="@color/xemu_text_muted" />
+
+          <!-- Storage path readout -->
+          <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:layout_marginBottom="8dp"
+            android:background="@drawable/section_header_background"
+            android:text="Storage"
+            android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
+            android:textColor="@color/xemu_green_light" />
+
+          <TextView
+            android:id="@+id/tv_xpack_storage_path"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="4dp"
+            android:fontFamily="monospace"
+            android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+            android:textColor="@color/xemu_text" />
+
+          <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="20dp"
+            android:text="Drop &lt;TITLE_ID&gt;/&lt;pack_name&gt;/pack.toml directories here. Changes take effect on next game launch."
+            android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+            android:textColor="@color/xemu_text_muted" />
+
+          <!-- Packs list section -->
+          <TextView
+            android:id="@+id/tv_xpack_section_header"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/section_header_background"
+            android:text="Available packs"
+            android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
+            android:textColor="@color/xemu_green_light" />
+
+          <!-- Packs container — programmatically populated -->
+          <LinearLayout
+            android:id="@+id/xpack_list_container"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+
+          <!-- Empty state -->
+          <TextView
+            android:id="@+id/tv_xpack_empty"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginVertical="32dp"
+            android:gravity="center"
+            android:text="No packs installed.\n\nCopy a pack directory into the storage path above and reopen this screen."
+            android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+            android:textColor="@color/xemu_text_muted"
+            android:visibility="gone" />
+
+          <!-- Footer note -->
+          <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="20dp"
+            android:layout_marginBottom="16dp"
+            android:background="@color/xemu_outline_variant" />
+
+          <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="⚠ Patches can break or speed-hack games. Enable one at a time and verify behavior."
+            android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+            android:textColor="@color/xemu_text_muted" />
+
+        </LinearLayout>
+      </com.google.android.material.card.MaterialCardView>
+
+    </LinearLayout>
+  </androidx.core.widget.NestedScrollView>
+
+</androidx.constraintlayout.widget.ConstraintLayout>

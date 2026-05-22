@@ -1,0 +1,25 @@
+# Halo 2 — 60 Hz simulation tick demo
+#
+# Flips the engine's seconds_per_tick constant from 1/30 (0x3D088889) to 1/60
+# (0x3C888889) at 0x0045DC6C. Because the engine multiplies *everything*
+# (velocities, scripts, audio cues) by this value, the game runs at 2x speed.
+# Provided as a demonstration of the xpack system, not as a usable mod.
+#
+# To install: copy this directory to
+#   <sdcard>/Android/data/com.izzy2lost.x1box/files/xpacks/4D530064/
+# then enable it in Settings → Manage Mods.
+
+schema = 1
+name = "Halo 2 60 Hz tick (DEMO — runs 2x speed)"
+author = "x1-box"
+description = "Doubles simulation tick rate. Cosmetic demo; game runs fast."
+
+[match]
+title_id = 0x4D530064
+
+[[patch]]
+kind = "bytes"
+description = "seconds_per_tick: 1/30 -> 1/60"
+address = 0x0045DC6C
+expected = "89 88 08 3D"
+replace  = "89 88 88 3C"

@@ -1,0 +1,42 @@
+# Halo 2 — grayscale luma coefficients
+#
+# Patches the BT.601 luma coefficients (R, G, B) the engine uses for any
+# RGB→Y conversion. Halo 2 uses these for screen-effect desaturation
+# (damage flash, near-death vignette, etc.). With all three set to 1/3,
+# any read-back-to-luma path produces a flat grayscale output instead of
+# colorimetric luminance.
+#
+# Cosmetic mod — should not affect gameplay.
+
+schema = 1
+name = "Halo 2 — grayscale BT.601 luma"
+author = "x1-box"
+description = "All three luma coefficients set to 1/3 — desat effects render as plain grayscale."
+
+[match]
+title_id = 0x4D530064
+
+# Optional: restrict to a particular xbe build by SHA1 of the 256-byte
+# digital signature. Uncomment + populate to lock to a known build.
+# xbe_code_sha1 = ["0000000000000000000000000000000000000000"]
+
+[[patch]]
+kind = "bytes"
+description = "luma R: 0.299 -> 1/3"
+address = 0x0045DCB4
+expected = "87 16 99 3E"
+replace  = "AB AA AA 3E"
+
+[[patch]]
+kind = "bytes"
+description = "luma G: 0.587 -> 1/3"
+address = 0x0045DCB8
+expected = "A2 45 16 3F"
+replace  = "AB AA AA 3E"
+
+[[patch]]
+kind = "bytes"
+description = "luma B: 0.114 -> 1/3"
+address = 0x0045DCBC
+expected = "D5 78 E9 3D"
+replace  = "AB AA AA 3E"

@@ -472,6 +472,14 @@
 
           </LinearLayout>
 
+          <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_manage_xpacks"
+            style="?attr/materialButtonOutlinedStyle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:text="Manage Mods (xpacks)" />
+
           <!-- ── PERFORMANCE ── -->
           <View
             android:layout_width="match_parent"

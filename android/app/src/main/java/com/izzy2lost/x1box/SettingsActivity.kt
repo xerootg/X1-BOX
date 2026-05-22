@@ -438,6 +438,10 @@ class SettingsActivity : AppCompatActivity() {
     btnSelectDriver.setOnClickListener { showDriverSelectionDialog() }
     btnResetDriver.setOnClickListener { confirmResetDriver() }
 
+    findViewById<MaterialButton>(R.id.btn_manage_xpacks)?.setOnClickListener {
+      startActivity(android.content.Intent(this, XPackActivity::class.java))
+    }
+
     val tcgThread = prefs.getString("setting_tcg_thread", "multi") ?: "multi"
     if (tcgThread == "single") {
       toggleThread.check(R.id.btn_thread_single)

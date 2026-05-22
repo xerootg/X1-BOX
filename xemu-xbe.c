@@ -27,6 +27,7 @@
 #include "system/hw_accel.h"
 #include "cpu.h"
 #include "exec/target_page.h"
+#include "hw/xbox/xpacks.h"
 
 static int virt_to_phys(vaddr vaddr, hwaddr *phys_addr)
 {
@@ -132,6 +133,11 @@ struct xbe *xemu_get_xbe_info(void)
         return NULL;
     }
     xbe.cert = (struct xbe_certificate *)(xbe.headers + cert_addr_virt - hdr_addr_virt);
+
+    /* xpacks: apply any enabled byte-patches the first time we see a
+     * given title. Idempotent — subsequent calls for the same title id
+     * are no-ops. */
+    xpacks_apply_for_xbe(&xbe);
 
     return &xbe;
 }
