@@ -528,6 +528,182 @@ static void gen_3dnow(DisasContext *s, X86DecodedInsn *decode)
     }
 }
 
+#if defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__))
+/*
+ * Inline emission of SSE scalar SS/SD ops (ADD/SUB/MUL/DIV/SQRT) when
+ * fp_jit is enabled. Skips the helper_##op##ss/sd call by:
+ *   1. loading v's bottom 32/64 bits (the scalar slot),
+ *   2. running the native TCG FP op (lowered to fmul/fadd/etc. on aarch64
+ *      and x86_64 — see HARD_FPU_HAS_TCG_FP_OPS),
+ *   3. storing back to d's bottom 32/64 bits,
+ *   4. copying v's upper lanes to d only when d != v (the form
+ *      `MULSS XMMa, XMMb`; the common `XMMa *= XMMb` writes back to
+ *      itself and skips the copy entirely).
+ *
+ * Cranelift tier-2 lowers these via [fpvec.rs] indices 7/8/25/26/33/34/37-40.
+ *
+ * Returns true if it emitted inline TCG; false to fall through to the
+ * caller's helper_*() path. MIN/MAX deliberately stay on the helper path
+ * because their NaN/signed-zero semantics aren't captured by plain TCG
+ * fop nodes.
+ */
+typedef enum {
+    SSE_FPS_NONE = 0,
+    SSE_FPS_ADD,
+    SSE_FPS_SUB,
+    SSE_FPS_MUL,
+    SSE_FPS_DIV,
+    SSE_FPS_SQRT,
+} SseFpScalarKind;
+
+/*
+ * Per-op gating env vars so the Bungie-screen regression can be bisected:
+ *   X1BOX_SSE_INLINE=1      — enables all five ops at once
+ *   X1BOX_SSE_INLINE_ADD=1  — just ADDSS/ADDSD
+ *   X1BOX_SSE_INLINE_SUB=1  — just SUBSS/SUBSD
+ *   X1BOX_SSE_INLINE_MUL=1  — just MULSS/MULSD
+ *   X1BOX_SSE_INLINE_DIV=1  — just DIVSS/DIVSD
+ *   X1BOX_SSE_INLINE_SQRT=1 — just SQRTSS/SQRTSD
+ *
+ * Flip ONE at a time to find the op that breaks Bungie audio + stuck-input.
+ * Default: all OFF → helper path, byte-identical to pre-inline build.
+ * See [[project_sse_scalar_inline_gated]] for context.
+ */
+static int sse_scalar_inline_mask(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        int m = 0;
+        const char *all = getenv("X1BOX_SSE_INLINE");
+        if (all && *all && *all != '0') {
+            m = (1u << SSE_FPS_ADD) | (1u << SSE_FPS_SUB) | (1u << SSE_FPS_MUL)
+              | (1u << SSE_FPS_DIV) | (1u << SSE_FPS_SQRT);
+        }
+        struct { const char *name; int bit; } per[] = {
+            { "X1BOX_SSE_INLINE_ADD",  SSE_FPS_ADD  },
+            { "X1BOX_SSE_INLINE_SUB",  SSE_FPS_SUB  },
+            { "X1BOX_SSE_INLINE_MUL",  SSE_FPS_MUL  },
+            { "X1BOX_SSE_INLINE_DIV",  SSE_FPS_DIV  },
+            { "X1BOX_SSE_INLINE_SQRT", SSE_FPS_SQRT },
+        };
+        for (size_t i = 0; i < sizeof(per) / sizeof(per[0]); i++) {
+            const char *v = getenv(per[i].name);
+            if (v && *v && *v != '0') {
+                m |= 1u << per[i].bit;
+            }
+        }
+        cached = m;
+    }
+    return cached;
+}
+
+static bool gen_sse_scalar_inline(DisasContext *s, X86DecodedInsn *decode,
+                                  SseFpScalarKind kind, bool is_sd)
+{
+    if (kind == SSE_FPS_NONE || !g_use_fp_jit || !HARD_FPU_HAS_TCG_FP_OPS
+        || !((sse_scalar_inline_mask() >> kind) & 1)) {
+        return false;
+    }
+
+    int d_off = decode->op[0].offset;
+    int v_off = decode->op[1].offset;
+    int s_off = decode->op[2].offset;
+
+    if (is_sd) {
+        TCGv_i64 ai = tcg_temp_new_i64();
+        TCGv_i64 bi = tcg_temp_new_i64();
+        TCGv_i64 ri = tcg_temp_new_i64();
+        TCGv_f64 af = tcg_temp_new_f64();
+        TCGv_f64 bf = tcg_temp_new_f64();
+        TCGv_f64 rf = tcg_temp_new_f64();
+
+        tcg_gen_ld_i64(ai, tcg_env, v_off);
+        tcg_gen_mov64i_f64(af, ai);
+
+        if (kind != SSE_FPS_SQRT) {
+            tcg_gen_ld_i64(bi, tcg_env, s_off);
+            tcg_gen_mov64i_f64(bf, bi);
+        }
+
+        switch (kind) {
+        case SSE_FPS_ADD:  tcg_gen_add_f64(rf, af, bf); break;
+        case SSE_FPS_SUB:  tcg_gen_sub_f64(rf, af, bf); break;
+        case SSE_FPS_MUL:  tcg_gen_mul_f64(rf, af, bf); break;
+        case SSE_FPS_DIV:  tcg_gen_div_f64(rf, af, bf); break;
+        case SSE_FPS_SQRT: {
+            /* VSQRTSD: d.q0 = sqrt(s.q0); d.q1 = v.q1 (note: v != s) */
+            TCGv_i64 si = tcg_temp_new_i64();
+            TCGv_f64 sf = tcg_temp_new_f64();
+            tcg_gen_ld_i64(si, tcg_env, s_off);
+            tcg_gen_mov64i_f64(sf, si);
+            tcg_gen_sqrt_f64(rf, sf);
+            break;
+        }
+        default: g_assert_not_reached();
+        }
+        tcg_gen_mov64f_i64(ri, rf);
+        tcg_gen_st_i64(ri, tcg_env, d_off);
+
+        if (d_off != v_off) {
+            TCGv_i64 hi = tcg_temp_new_i64();
+            tcg_gen_ld_i64(hi, tcg_env, v_off + 8);
+            tcg_gen_st_i64(hi, tcg_env, d_off + 8);
+        }
+    } else {
+        TCGv_i32 ai = tcg_temp_new_i32();
+        TCGv_i32 bi = tcg_temp_new_i32();
+        TCGv_i32 ri = tcg_temp_new_i32();
+        TCGv_f32 af = tcg_temp_new_f32();
+        TCGv_f32 bf = tcg_temp_new_f32();
+        TCGv_f32 rf = tcg_temp_new_f32();
+
+        tcg_gen_ld_i32(ai, tcg_env, v_off);
+        tcg_gen_mov32i_f32(af, ai);
+
+        if (kind != SSE_FPS_SQRT) {
+            tcg_gen_ld_i32(bi, tcg_env, s_off);
+            tcg_gen_mov32i_f32(bf, bi);
+        }
+
+        switch (kind) {
+        case SSE_FPS_ADD:  tcg_gen_add_f32(rf, af, bf); break;
+        case SSE_FPS_SUB:  tcg_gen_sub_f32(rf, af, bf); break;
+        case SSE_FPS_MUL:  tcg_gen_mul_f32(rf, af, bf); break;
+        case SSE_FPS_DIV:  tcg_gen_div_f32(rf, af, bf); break;
+        case SSE_FPS_SQRT: {
+            /* VSQRTSS: d.s0 = sqrt(s.s0); d.s1..3 = v.s1..3 (v != s) */
+            TCGv_i32 si = tcg_temp_new_i32();
+            TCGv_f32 sf = tcg_temp_new_f32();
+            tcg_gen_ld_i32(si, tcg_env, s_off);
+            tcg_gen_mov32i_f32(sf, si);
+            tcg_gen_sqrt_f32(rf, sf);
+            break;
+        }
+        default: g_assert_not_reached();
+        }
+        tcg_gen_mov32f_i32(ri, rf);
+        tcg_gen_st_i32(ri, tcg_env, d_off);
+
+        if (d_off != v_off) {
+            TCGv_i32 hi = tcg_temp_new_i32();
+            for (int i = 1; i < 4; i++) {
+                tcg_gen_ld_i32(hi, tcg_env, v_off + 4 * i);
+                tcg_gen_st_i32(hi, tcg_env, d_off + 4 * i);
+            }
+        }
+    }
+    g_fpu_profile.sse_arith_scalar++;
+    return true;
+}
+#else
+typedef enum { SSE_FPS_NONE = 0, SSE_FPS_ADD, SSE_FPS_SUB,
+               SSE_FPS_MUL, SSE_FPS_DIV, SSE_FPS_SQRT } SseFpScalarKind;
+static inline bool gen_sse_scalar_inline(DisasContext *s, X86DecodedInsn *decode,
+                                         SseFpScalarKind kind, bool is_sd) {
+    return false;
+}
+#endif
+
 /*
  * 00 = v*ps Vps, Hps, Wpd
  * 66 = v*pd Vpd, Hpd, Wps
@@ -537,9 +713,14 @@ static void gen_3dnow(DisasContext *s, X86DecodedInsn *decode)
 static inline void gen_unary_fp_sse(DisasContext *s, X86DecodedInsn *decode,
                               SSEFunc_0_epp pd_xmm, SSEFunc_0_epp ps_xmm,
                               SSEFunc_0_epp pd_ymm, SSEFunc_0_epp ps_ymm,
-                              SSEFunc_0_eppp sd, SSEFunc_0_eppp ss)
+                              SSEFunc_0_eppp sd, SSEFunc_0_eppp ss,
+                              SseFpScalarKind scalar_kind)
 {
     if ((s->prefix & (PREFIX_REPZ | PREFIX_REPNZ)) != 0) {
+        bool is_sd = !(s->prefix & PREFIX_REPZ);
+        if (gen_sse_scalar_inline(s, decode, scalar_kind, is_sd)) {
+            return;
+        }
         SSEFunc_0_eppp fn = s->prefix & PREFIX_REPZ ? ss : sd;
         if (!fn) {
             gen_illegal_opcode(s);
@@ -564,7 +745,7 @@ static inline void gen_unary_fp_sse(DisasContext *s, X86DecodedInsn *decode,
 #endif
     }
 }
-#define UNARY_FP_SSE(uname, lname)                                                 \
+#define UNARY_FP_SSE(uname, lname, scalar_kind)                                    \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
 {                                                                                  \
     gen_unary_fp_sse(s, decode,                                                    \
@@ -573,9 +754,10 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                      gen_helper_##lname##pd_ymm,                                   \
                      gen_helper_##lname##ps_ymm,                                   \
                      gen_helper_##lname##sd,                                       \
-                     gen_helper_##lname##ss);                                      \
+                     gen_helper_##lname##ss,                                       \
+                     (scalar_kind));                                               \
 }
-UNARY_FP_SSE(VSQRT, sqrt)
+UNARY_FP_SSE(VSQRT, sqrt, SSE_FPS_SQRT)
 
 /*
  * 00 = v*ps Vps, Hps, Wpd
@@ -586,10 +768,15 @@ UNARY_FP_SSE(VSQRT, sqrt)
 static inline void gen_fp_sse(DisasContext *s, X86DecodedInsn *decode,
                               SSEFunc_0_eppp pd_xmm, SSEFunc_0_eppp ps_xmm,
                               SSEFunc_0_eppp pd_ymm, SSEFunc_0_eppp ps_ymm,
-                              SSEFunc_0_eppp sd, SSEFunc_0_eppp ss)
+                              SSEFunc_0_eppp sd, SSEFunc_0_eppp ss,
+                              SseFpScalarKind scalar_kind)
 {
     SSEFunc_0_eppp ps, pd, fn;
     if ((s->prefix & (PREFIX_REPZ | PREFIX_REPNZ)) != 0) {
+        bool is_sd = !(s->prefix & PREFIX_REPZ);
+        if (gen_sse_scalar_inline(s, decode, scalar_kind, is_sd)) {
+            return;
+        }
         fn = s->prefix & PREFIX_REPZ ? ss : sd;
 #if defined(XBOX)
         g_fpu_profile.sse_arith_scalar++;
@@ -609,7 +796,7 @@ static inline void gen_fp_sse(DisasContext *s, X86DecodedInsn *decode,
     }
 }
 
-#define FP_SSE(uname, lname)                                                       \
+#define FP_SSE(uname, lname, scalar_kind)                                          \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
 {                                                                                  \
     gen_fp_sse(s, decode,                                                          \
@@ -618,14 +805,15 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                gen_helper_##lname##pd_ymm,                                         \
                gen_helper_##lname##ps_ymm,                                         \
                gen_helper_##lname##sd,                                             \
-               gen_helper_##lname##ss);                                            \
+               gen_helper_##lname##ss,                                             \
+               (scalar_kind));                                                     \
 }
-FP_SSE(VADD, add)
-FP_SSE(VMUL, mul)
-FP_SSE(VSUB, sub)
-FP_SSE(VMIN, min)
-FP_SSE(VDIV, div)
-FP_SSE(VMAX, max)
+FP_SSE(VADD, add, SSE_FPS_ADD)
+FP_SSE(VMUL, mul, SSE_FPS_MUL)
+FP_SSE(VSUB, sub, SSE_FPS_SUB)
+FP_SSE(VMIN, min, SSE_FPS_NONE)
+FP_SSE(VDIV, div, SSE_FPS_DIV)
+FP_SSE(VMAX, max, SSE_FPS_NONE)
 
 #define FMA_SSE_PACKED(uname, ptr0, ptr1, ptr2, even, odd)                         \
 static void gen_##uname##Px(DisasContext *s, X86DecodedInsn *decode)               \
@@ -682,7 +870,7 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                gen_helper_##lname##dq_xmm,                                         \
                gen_helper_##lname##qdq_ymm,                                        \
                gen_helper_##lname##dq_ymm,                                         \
-               NULL, NULL);                                                        \
+               NULL, NULL, SSE_FPS_NONE);                                          \
 }
 FP_UNPACK_SSE(VUNPCKLPx, punpckl)
 FP_UNPACK_SSE(VUNPCKHPx, punpckh)
@@ -4285,8 +4473,92 @@ static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
 #endif
 }
 
+#if defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__))
+/*
+ * Inline COMISS/COMISD (and UCOMISS/UCOMISD) via `tcg_gen_com_f32/64`,
+ * which the aarch64 backend lowers to FCMP + NZCV->x86-EFLAGS conversion
+ * (tcg/aarch64/tcg-target.c.inc:3119 `tcg_out_fp_com`). The result is
+ * already in x86 CC_SRC bit positions (CF=bit0, PF=bit2, ZF=bit6), so we
+ * just stash it into cc_src and call assume_cc_op(CC_OP_EFLAGS) — same
+ * effect as the helper.
+ *
+ * Off by default (X1BOX_SSE_INLINE_COMI=1; covered by master
+ * X1BOX_SSE_INLINE=1). Separate codepath from the gated VADD/MUL/etc.
+ * inline, so it doesn't share that audio regression.
+ *
+ * Worth ~0.34% TCG on Halo 2 Pixel 10a with hard FPU on (helper_comiss
+ * 0.29% + helper_ucomiss 0.05%). Quiet vs signaling NaN distinction
+ * collapses under XEMU_OPT_NATIVE_FLOAT=1 — the helper itself drops to
+ * the same float32_compare_native, so this inline is bit-equivalent.
+ */
+static int sse_comi_inline_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *all = getenv("X1BOX_SSE_INLINE");
+        const char *comi = getenv("X1BOX_SSE_INLINE_COMI");
+        int on = (all && *all && *all != '0') || (comi && *comi && *comi != '0');
+        cached = on ? 1 : 0;
+    }
+    return cached;
+}
+
+static bool gen_VCOMI_inline(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (!g_use_fp_jit || !HARD_FPU_HAS_TCG_FP_OPS || !sse_comi_inline_enabled()) {
+        return false;
+    }
+
+    bool is_sd = !!(s->prefix & PREFIX_DATA);
+    /*
+     * gen_VCOMI passes OP_PTR1/OP_PTR2 to the helper (env, d, s). The
+     * decoder entry is X86_OP_ENTRY3(VxCOMISx, None,None, V,x, W,x, vex3
+     * p_00_66) so op[0] is unused; the LHS is op[1] (V) and RHS is op[2]
+     * (W). Read scalar slots directly from env at their offsets.
+     */
+    int a_off = decode->op[1].offset;
+    int b_off = decode->op[2].offset;
+
+    TCGv_i64 res = tcg_temp_new_i64();
+    if (is_sd) {
+        TCGv_i64 ai = tcg_temp_new_i64();
+        TCGv_i64 bi = tcg_temp_new_i64();
+        TCGv_f64 af = tcg_temp_new_f64();
+        TCGv_f64 bf = tcg_temp_new_f64();
+        tcg_gen_ld_i64(ai, tcg_env, a_off);
+        tcg_gen_ld_i64(bi, tcg_env, b_off);
+        tcg_gen_mov64i_f64(af, ai);
+        tcg_gen_mov64i_f64(bf, bi);
+        tcg_gen_com_f64(res, af, bf);
+    } else {
+        TCGv_i32 ai = tcg_temp_new_i32();
+        TCGv_i32 bi = tcg_temp_new_i32();
+        TCGv_f32 af = tcg_temp_new_f32();
+        TCGv_f32 bf = tcg_temp_new_f32();
+        tcg_gen_ld_i32(ai, tcg_env, a_off);
+        tcg_gen_ld_i32(bi, tcg_env, b_off);
+        tcg_gen_mov32i_f32(af, ai);
+        tcg_gen_mov32i_f32(bf, bi);
+        tcg_gen_com_f32(res, af, bf);
+    }
+    /*
+     * cpu_cc_src is `TCGv` = TCGv_i32 on 32-bit guest (i386). Truncate the
+     * i64 result (which only ever uses the low byte for CC_C|CC_P|CC_Z).
+     */
+    tcg_gen_extrl_i64_i32(cpu_cc_src, res);
+    assume_cc_op(s, CC_OP_EFLAGS);
+    g_fpu_profile.sse_cmp++;
+    return true;
+}
+#endif
+
 static void gen_VCOMI(DisasContext *s, X86DecodedInsn *decode)
 {
+#if defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__))
+    if (gen_VCOMI_inline(s, decode)) {
+        return;
+    }
+#endif
     SSEFunc_0_epp fn;
     fn = s->prefix & PREFIX_DATA ? gen_helper_comisd : gen_helper_comiss;
     fn(tcg_env, OP_PTR1, OP_PTR2);
@@ -4706,6 +4978,16 @@ static void gen_VSHUF(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VUCOMI(DisasContext *s, X86DecodedInsn *decode)
 {
+#if defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__))
+    /*
+     * Under XEMU_OPT_NATIVE_FLOAT=1 both helper_comiss and helper_ucomiss
+     * fold to the same float32_compare_native — the quiet/signaling NaN
+     * distinction collapses on the host. Reuse the VCOMI inline path.
+     */
+    if (gen_VCOMI_inline(s, decode)) {
+        return;
+    }
+#endif
     SSEFunc_0_epp fn;
     fn = s->prefix & PREFIX_DATA ? gen_helper_ucomisd : gen_helper_ucomiss;
     fn(tcg_env, OP_PTR1, OP_PTR2);
