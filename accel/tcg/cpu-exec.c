@@ -1118,6 +1118,17 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
         tcg_ctx->gen_tb = NULL;
     }
 #endif
+    /*
+     * cranelift_chain_continue sets cranelift_in_chain=true on entry and
+     * relies on the function-end clear at line 922. A longjmp from inside
+     * the inner tcg_qemu_tb_exec (guest exception / page fault) bypasses
+     * that clear, leaving the __thread flag stuck true for the lifetime
+     * of the vCPU thread. From then on, every chain_continue early-exits
+     * at the re-entry check and the dispatcher never chains tier-2 TBs —
+     * observable as chain stats freezing at `runs=N iters=N` while tier2
+     * shim count keeps growing. Clear it here.
+     */
+    cranelift_in_chain = false;
     if (bql_locked()) {
         bql_unlock();
     }
