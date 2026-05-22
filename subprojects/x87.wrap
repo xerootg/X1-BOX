@@ -1,0 +1,8 @@
+[wrap-git]
+url = https://github.com/xerootg/x87.git
+revision = 61a46b9bcc4ca741d4af03daa812afaafacb494e
+depth = 1
+patch_directory = x87
+
+[provide]
+x87 = x87_dep

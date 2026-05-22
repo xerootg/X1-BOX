@@ -120,6 +120,8 @@ extern "C" void xemu_set_fast_fences(bool enable);
 extern "C" bool xemu_get_fast_fences(void);
 extern "C" void xemu_set_fp_jit(bool enable);
 extern "C" bool xemu_get_fp_jit(void);
+extern "C" void xemu_set_x87_lib(bool enable);
+extern "C" bool xemu_get_x87_lib(void);
 extern "C" void xemu_set_draw_reorder(bool enable);
 extern "C" bool xemu_get_draw_reorder(void);
 extern "C" void xemu_set_draw_merge(bool enable);
@@ -1002,6 +1004,22 @@ static SetupFiles SyncSetupFiles() {
   xemu_set_fp_jit(fp_jit);
   __android_log_print(ANDROID_LOG_INFO, "xemu-android",
                       "FP JIT (native storage + inline ops): %s", fp_jit ? "ON" : "OFF");
+
+  /* x87 lib: route soft-path x87 transcendentals through Aaron Giles'
+   * purpose-built library (100% Intel-match on arith/scale/remainder;
+   * 77-92% mantissa-exact on transcendentals). Off by default — opt in
+   * via env var X1BOX_X87_LIB=1 or pref setting_x87_lib. Only takes
+   * effect when hardware FPU is OFF (the soft helper path). */
+  bool x87_lib_default = false;
+  if (const char *env_x87 = SDL_getenv("X1BOX_X87_LIB")) {
+    x87_lib_default = (env_x87[0] != '0');
+  }
+  bool x87_lib = GetPrefBool(env, activity, "setting_x87_lib", x87_lib_default);
+  xemu_set_x87_lib(x87_lib);
+  __android_log_print(ANDROID_LOG_INFO, "xemu-android",
+                      "x87 lib (Aaron Giles fp80_t soft path): %s",
+                      x87_lib ? "ON" : "OFF");
+
 
   bool fast_fences = GetPrefBool(env, activity, "fast_fences", false);
   xemu_set_fast_fences(fast_fences);

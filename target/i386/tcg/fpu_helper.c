@@ -28,6 +28,9 @@
 #include "fpu/softfloat-macros.h"
 #include "helper-tcg.h"
 #include "access.h"
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+#include "x87_lib_shim.h"
+#endif
 
 /* float macros */
 #if defined(USE_HARD_FPU) && defined(__aarch64__)
@@ -1649,6 +1652,16 @@ static const struct f2xm1_data f2xm1_table[65] = {
 void helper_f2xm1(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        floatx80 r;
+        uint16_t sw = x87lib_f2xm1(ST0, &r, &env->fp_status);
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
 #if USE_NATIVE_DOUBLE_STORAGE
     ST0 = exp2(ST0) - 1.0;
 #else
@@ -1815,6 +1828,23 @@ void helper_f2xm1(CPUX86State *env)
 
 void helper_fptan(CPUX86State *env)
 {
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        floatx80 t, one;
+        uint16_t sw = x87lib_fptan(ST0, &t, &one, &env->fp_status);
+        if (sw & 0x400) {
+            x87lib_apply_status_flags(sw, &env->fp_status);
+            env->fpus |= 0x400;
+            return;
+        }
+        ST0 = t;
+        fpush(env);
+        ST0 = one;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        env->fpus &= ~0x400;
+        return;
+    }
+#endif
     double fptemp = floatx80_to_double(env, ST0);
 
     if ((fptemp > MAXTAN) || (fptemp < -MAXTAN)) {
@@ -1888,6 +1918,21 @@ static const struct fpatan_data fpatan_table[9] = {
 void helper_fpatan(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        floatx80 r;
+        /* Intel FPATAN: ST(1) = atan(ST(1)/ST(0)); pop. Lib's
+         * x87_fpatan(src1, src2) computes atan2(src2, src1) — i.e.
+         * src1 maps to ST(0) and src2 maps to ST(1), matching the
+         * order in test/x87testasm.asm (fld src2; fld src1; fpatan). */
+        uint16_t sw = x87lib_fpatan(ST0, ST1, &r, &env->fp_status);
+        ST1 = r;
+        fpop(env);
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
 #if USE_NATIVE_DOUBLE_STORAGE
     ST1 = atan2(ST1, ST0);
     fpop(env);
@@ -2334,6 +2379,18 @@ void helper_fpatan(CPUX86State *env)
 void helper_fxtract(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        floatx80 exp_val, sig_val;
+        uint16_t sw = x87lib_fxtract(ST0, &exp_val, &sig_val, &env->fp_status);
+        ST0 = exp_val;
+        fpush(env);
+        ST0 = sig_val;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
 
     if (floatx80_is_zero(ST0)) {
         ST0 = floatx80_div(floatx80_chs(floatx80_one), floatx80_zero,
@@ -2398,6 +2455,27 @@ static void helper_fprem_common(CPUX86State *env, bool mod)
 {
     int old_flags = save_exception_flags(env);
     uint64_t quotient;
+
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        floatx80 r;
+        uint16_t sw;
+        /* mod=true → fprem (truncated quotient), mod=false → fprem1 (nearest). */
+        if (mod) {
+            sw = x87lib_fprem(ST0, ST1, &r, &env->fp_status);
+        } else {
+            sw = x87lib_fprem1(ST0, ST1, &r, &env->fp_status);
+        }
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        /* C0/C1/C2/C3 are load-bearing for FPREM partial-reduction loops:
+         * the guest re-issues FPREM until C2=0. The lib's SW bit positions
+         * (C0=0x100, C1=0x200, C2=0x400, C3=0x4000) match env->fpus exactly. */
+        env->fpus = (env->fpus & ~0x4700) | (sw & 0x4700);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
 
 #if USE_NATIVE_DOUBLE_STORAGE
     int exp0, exp1, expdiff;
@@ -2614,6 +2692,17 @@ static void helper_fyl2x_common(CPUX86State *env, floatx80 arg, int32_t *exp,
 void helper_fyl2xp1(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        floatx80 r;
+        uint16_t sw = x87lib_fyl2xp1(ST0, ST1, &r, &env->fp_status);
+        ST1 = r;
+        fpop(env);
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
 #if USE_NATIVE_DOUBLE_STORAGE
     ST1 = ST1 * log2(ST0 + 1.0);
     fpop(env);
@@ -2719,6 +2808,19 @@ void helper_fyl2xp1(CPUX86State *env)
 void helper_fyl2x(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        floatx80 r;
+        /* Intel FYL2X: ST(1) = ST(1) * log2(ST(0)); pop.
+         * Lib signature x87_fyl2x(src1=x, src2=y, dst) → log2(x)*y. */
+        uint16_t sw = x87lib_fyl2x(ST0, ST1, &r, &env->fp_status);
+        ST1 = r;
+        fpop(env);
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
 #if USE_NATIVE_DOUBLE_STORAGE
     ST1 = ST1 * log2(ST0);
     fpop(env);
@@ -2871,6 +2973,20 @@ void helper_fyl2x(CPUX86State *env)
 void helper_fsqrt(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        if (floatx80_is_neg(ST0)) {
+            env->fpus &= ~0x4700;
+            env->fpus |= 0x400;
+        }
+        floatx80 r;
+        uint16_t sw = x87lib_fsqrt(ST0, &r, &env->fp_status);
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     if (floatx80_is_neg(ST0)) {
         env->fpus &= ~0x4700;  /* (C3,C2,C1,C0) <-- 0000 */
         env->fpus |= 0x400;
@@ -2881,6 +2997,25 @@ void helper_fsqrt(CPUX86State *env)
 
 void helper_fsincos(CPUX86State *env)
 {
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        floatx80 s, c;
+        uint16_t sw = x87lib_fsincos(ST0, &s, &c, &env->fp_status);
+        /* If C2 set, lib didn't compute: leave stack alone (no push), source
+         * unchanged in ST0, and signal arg-out-of-range. */
+        if (sw & 0x400) {
+            x87lib_apply_status_flags(sw, &env->fp_status);
+            env->fpus |= 0x400;
+            return;
+        }
+        ST0 = s;
+        fpush(env);
+        ST0 = c;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        env->fpus &= ~0x400;
+        return;
+    }
+#endif
     double fptemp = floatx80_to_double(env, ST0);
 
     if ((fptemp > MAXTAN) || (fptemp < -MAXTAN)) {
@@ -2897,6 +3032,16 @@ void helper_fsincos(CPUX86State *env)
 void helper_frndint(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        floatx80 r;
+        uint16_t sw = x87lib_frndint(ST0, &r, &env->fp_status);
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST0 = floatx80_round_to_int(ST0, &env->fp_status);
     merge_exception_flags(env, old_flags);
 }
@@ -2904,6 +3049,18 @@ void helper_frndint(CPUX86State *env)
 void helper_fscale(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        floatx80 r;
+        /* Intel FSCALE: ST(0) = ST(0) * 2^trunc(ST(1)). Lib expects
+         * src1 = base (ST(0)), src2 = exponent (ST(1)). */
+        uint16_t sw = x87lib_fscale(ST0, ST1, &r, &env->fp_status);
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     if (floatx80_invalid_encoding(ST1, &env->fp_status) ||
         floatx80_invalid_encoding(ST0, &env->fp_status)) {
         float_raise(float_flag_invalid, &env->fp_status);
@@ -2954,6 +3111,18 @@ void helper_fscale(CPUX86State *env)
 
 void helper_fsin(CPUX86State *env)
 {
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        floatx80 r;
+        uint16_t sw = x87lib_fsin(ST0, &r, &env->fp_status);
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        /* Lib sets X87SW_C2 (0x400) when |arg| is too large to reduce
+         * (dst is unchanged); guest re-issues after manual reduction. */
+        env->fpus = (env->fpus & ~0x400) | (sw & 0x400);
+        return;
+    }
+#endif
     double fptemp = floatx80_to_double(env, ST0);
 
     if ((fptemp > MAXTAN) || (fptemp < -MAXTAN)) {
@@ -2967,6 +3136,16 @@ void helper_fsin(CPUX86State *env)
 
 void helper_fcos(CPUX86State *env)
 {
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib()) {
+        floatx80 r;
+        uint16_t sw = x87lib_fcos(ST0, &r, &env->fp_status);
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        env->fpus = (env->fpus & ~0x400) | (sw & 0x400);
+        return;
+    }
+#endif
     double fptemp = floatx80_to_double(env, ST0);
 
     if ((fptemp > MAXTAN) || (fptemp < -MAXTAN)) {

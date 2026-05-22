@@ -164,6 +164,57 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nv2a_vsh_cpu)
 
+# --- x87 (Aaron Giles' x87 accuracy library) ---
+# Consumed by target/i386/tcg/x87_lib_shim.cpp to optionally route x87
+# transcendentals through bit-exact implementations of the Intel x87
+# ISA, with a runtime toggle (xemu_set_x87_lib / setting_x87_lib).
+# Upstream has no CMakeLists; we build the .cpp files into a static lib
+# and link it into xemu_core.
+set(X87_GIT_REV "06813043aeac40d34a522bc3137cbf3338179385")
+FetchContent_Declare(
+  x87
+  GIT_REPOSITORY "https://github.com/xerootg/x87.git"
+  GIT_TAG "${X87_GIT_REV}"
+  GIT_SHALLOW FALSE
+)
+FetchContent_GetProperties(x87)
+if(NOT x87_POPULATED)
+  if(POLICY CMP0169)
+    cmake_policy(PUSH)
+    cmake_policy(SET CMP0169 OLD)
+  endif()
+  FetchContent_Populate(x87)
+  if(POLICY CMP0169)
+    cmake_policy(POP)
+  endif()
+endif()
+
+add_library(x87 STATIC
+  "${x87_SOURCE_DIR}/x87fp64trans.cpp"
+  "${x87_SOURCE_DIR}/x87fp80.cpp"
+  "${x87_SOURCE_DIR}/x87fp80trans.cpp"
+)
+set_target_properties(x87 PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  POSITION_INDEPENDENT_CODE ON
+)
+target_include_directories(x87 PUBLIC "${x87_SOURCE_DIR}")
+target_compile_options(x87 PRIVATE
+  # Force-include <array>: upstream x87fp80trans.cpp uses std::array<>
+  # without #include <array>; relies on transitive STL header pulls that
+  # libstdc++ honors but Android NDK libc++ does not.
+  -include array
+  -Wno-unused-function
+  -Wno-unused-variable
+  -Wno-unused-parameter
+  -Wno-sign-compare
+  -Wno-implicit-fallthrough
+  -Wno-missing-field-initializers
+  -Wno-reorder-ctor
+  -Wno-error
+)
+
 if(XEMU_ENABLE_VULKAN)
   # --- adrenotools (custom GPU driver loading on Adreno) ---
   FetchContent_Declare(
@@ -1202,6 +1253,9 @@ target_include_directories(xemu_core PRIVATE
   $<$<BOOL:${XEMU_ENABLE_VULKAN}>:${vma_SOURCE_DIR}/include>
   $<$<BOOL:${XEMU_ENABLE_VULKAN}>:${volk_SOURCE_DIR}>
 )
+
+target_include_directories(xemu_core PRIVATE "${x87_SOURCE_DIR}")
+target_link_libraries(xemu_core PRIVATE x87)
 
 add_dependencies(xemu_core glib_ep xemu_gdb_static_features)
 

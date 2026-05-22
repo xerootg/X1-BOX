@@ -540,6 +540,14 @@
             android:textColor="@color/xemu_text_muted" />
 
           <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/switch_x87_lib"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/settings_x87_lib"
+            android:textColor="@color/xemu_text_muted" />
+
+          <com.google.android.material.materialswitch.MaterialSwitch
             android:id="@+id/switch_cache_shaders"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

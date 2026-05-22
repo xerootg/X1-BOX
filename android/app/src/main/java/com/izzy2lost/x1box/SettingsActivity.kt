@@ -315,6 +315,7 @@ class SettingsActivity : AppCompatActivity() {
     val switchHrtf        = findViewById<MaterialSwitch>(R.id.switch_hrtf)
     val switchShaders     = findViewById<MaterialSwitch>(R.id.switch_cache_shaders)
     val switchFpu         = findViewById<MaterialSwitch>(R.id.switch_hard_fpu)
+    val switchX87Lib      = findViewById<MaterialSwitch>(R.id.switch_x87_lib)
     val switchVsync       = findViewById<MaterialSwitch>(R.id.switch_vsync)
     val switchSkipBootAnim = findViewById<MaterialSwitch>(R.id.switch_skip_boot_anim)
     val switchDrawReorder  = findViewById<MaterialSwitch>(R.id.switch_draw_reorder)
@@ -454,6 +455,7 @@ class SettingsActivity : AppCompatActivity() {
     switchHrtf.isChecked    = prefs.getBoolean(PREF_HRTF, false)
     switchShaders.isChecked = prefs.getBoolean("setting_cache_shaders", true)
     switchFpu.isChecked     = prefs.getBoolean("setting_hard_fpu", true)
+    switchX87Lib.isChecked  = prefs.getBoolean("setting_x87_lib", false)
     switchVsync.isChecked   = prefs.getBoolean("setting_vsync", false)
     switchSkipBootAnim.isChecked =
       prefs.getBoolean("setting_skip_boot_anim", true)
@@ -566,6 +568,7 @@ class SettingsActivity : AppCompatActivity() {
         .putBoolean(PREF_HRTF, switchHrtf.isChecked)
         .putBoolean("setting_cache_shaders", switchShaders.isChecked)
         .putBoolean("setting_hard_fpu", switchFpu.isChecked)
+        .putBoolean("setting_x87_lib", switchX87Lib.isChecked)
         .putBoolean("setting_vsync", switchVsync.isChecked)
         .putBoolean("setting_skip_boot_anim", switchSkipBootAnim.isChecked)
         .putBoolean("draw_reorder", switchDrawReorder.isChecked)
@@ -668,6 +671,7 @@ class SettingsActivity : AppCompatActivity() {
     if (!prefs.contains("frame_skip")) editor.putBoolean("frame_skip", false)
     if (!prefs.contains("setting_cache_shaders")) editor.putBoolean("setting_cache_shaders", true)
     if (!prefs.contains("setting_hard_fpu")) editor.putBoolean("setting_hard_fpu", true)
+    if (!prefs.contains("setting_x87_lib")) editor.putBoolean("setting_x87_lib", false)
     if (!prefs.contains("setting_vsync")) editor.putBoolean("setting_vsync", false)
     if (!prefs.contains("setting_use_dsp")) editor.putBoolean("setting_use_dsp", false)
     if (!prefs.contains("setting_hrtf")) editor.putBoolean("setting_hrtf", false)
@@ -1178,6 +1182,8 @@ class SettingsActivity : AppCompatActivity() {
     (parseTomlBoolean(sections, "perf", "fp_jit")
       ?: parseTomlBoolean(sections, "perf", "hard_fpu"))
       ?.let { editor.putBoolean("setting_hard_fpu", it) }
+    parseTomlBoolean(sections, "perf", "x87_lib")
+      ?.let { editor.putBoolean("setting_x87_lib", it) }
     parseTomlString(sections, "android", "tcg_thread")
       ?.lowercase(Locale.US)
       ?.takeIf { it == "single" || it == "multi" }

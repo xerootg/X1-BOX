@@ -166,6 +166,7 @@
   <string name="settings_tcg_thread_multi">Multi-thread</string>
   <string name="settings_tcg_thread_single">Single-thread</string>
   <string name="settings_hard_fpu">Hardware FPU</string>
+  <string name="settings_x87_lib">x87 Accuracy Library (soft FPU only)</string>
   <string name="settings_cache_shaders">Shader Cache</string>
   <string name="settings_skip_boot_anim">Skip startup animation</string>
   <string name="settings_draw_reorder">Draw Call Reordering</string>
