@@ -17,6 +17,7 @@ specific_ss.add(files(
 	'xblc.c',
 	'xid-gamepad.c',
 	'xpacks.c',
+	'xbox-hle.c',
 	))
 subdir('nv2a')
 subdir('mcpx')

@@ -49,6 +49,9 @@
 #include "internal-common.h"
 #include "tb-cache-hints.h"
 #include "cranelift-bridge.h"
+#ifdef XBOX
+#include "hw/xbox/xbox-hle.h"
+#endif
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -318,6 +321,8 @@ static inline void tier1_maybe_reset_budget(void)
                         (unsigned long)g_tier1_promotions_dropped);
             /* Surface tier-2 stats on the same cadence. */
             cranelift_bridge_log_stats();
+            /* Surface Xbox HLE telemetry too. No-op when HLE is off. */
+            xbox_hle_log_stats();
         }
         /* Drain tier-2 results on the same cadence we reset the
          * tier-1 budget. This is once per ~100K TB executions so the
@@ -1415,6 +1420,20 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * code instead of the tier-1 blob.
              */
             cranelift_bridge_try_swap(tb);
+
+#ifdef XBOX
+            /*
+             * Xbox kernel HLE. If this TB's PC matches a registered
+             * kernel hook (RtlMoveMemory, KfAcquireSpinLock, etc.) the
+             * handler runs in host C, mutates env to simulate the
+             * stdcall/fastcall return, and we skip TB execution
+             * entirely. Default OFF; enabled via X1BOX_HLE=1.
+             */
+            if (xbox_hle_check(cpu, (uint32_t)s.pc)) {
+                last_tb = NULL;
+                continue;
+            }
+#endif
 
 #ifdef XBOX
             {
