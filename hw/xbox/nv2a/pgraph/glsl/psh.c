@@ -1625,7 +1625,16 @@ static MString* psh_convert(struct PixelShader *ps)
      * depth_clipping discard alive on color-only RPs, but suppresses the
      * actual gl_FragDepth store when no depth attachment is bound. See the
      * full comment in pgraph_glsl_set_psh_state for why this split matters
-     * (UB write into missing attachment hangs Mali's tile-resolve). */
+     * (UB write into missing attachment hangs Mali's tile-resolve).
+     *
+     * NB: an earlier attempt vendor-gated this on Mali to recover Mali's
+     * early-Z (the +1 ULP bump prevents the driver from proving a
+     * monotonic depth-write relationship). Reverted 2026-05-21 because
+     * Halo 2 exhibits visible shader corruption without the explicit
+     * D24 rounding — the precision delta vs the Vulkan rasterizer's
+     * FP24 interpolation is large enough to flip depth-test outcomes
+     * for co-planar / decal geometry. The GPU win wasn't worth the
+     * correctness cost. */
     if (ps->state->depth_output_enabled) {
         switch (ps->state->depth_format) {
         case DEPTH_FORMAT_D16:

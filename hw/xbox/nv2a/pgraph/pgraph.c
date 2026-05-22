@@ -26,6 +26,8 @@
 #endif
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "qemu/adpf-android.h"
+#include "qemu/android-paths.h"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
 #include "util.h"
@@ -1838,6 +1840,172 @@ DEF_METHOD(NV097, FLIP_STALL)
         } else {
             d->avg_frame_ns = (d->avg_frame_ns * 15 + d->last_frame_ns) / 16;
         }
+        /* Feed the per-frame guest work duration to ADPF, splitting CPU
+         * vs GPU when the backend supports it. The Vulkan renderer's
+         * gpu_ts_readback bumps a per-flip accumulator from
+         * vkCmdWriteTimestamp pairs around each submit's command
+         * buffer; we drain it here and let ADPF target DVFS boost at
+         * the binding side. gpu_ns=0 is the legitimate signal for
+         * backends that don't measure GPU time (GL renderer / pre-
+         * Vulkan-timestamp Mali drivers) — ADPF reads that as "no GPU
+         * work pending" and concentrates thermal budget on CPU. */
+        int64_t gpu_ns = 0;
+        if (d->pgraph.renderer && d->pgraph.renderer->ops.consume_last_frame_gpu_ns) {
+            gpu_ns = d->pgraph.renderer->ops.consume_last_frame_gpu_ns(d);
+        }
+        int64_t cpu_ns = d->last_frame_ns - gpu_ns;
+        if (cpu_ns < 0) cpu_ns = d->last_frame_ns;
+        adpf_android_report_frame_split(cpu_ns, gpu_ns, d->last_flip_ns);
+
+        /* Optional frame-stats dumper. Once-per-second histogram of
+         * frame-time percentiles + GPU share, gated on either
+         * $X1BOX_FRAME_STATS=1 or the existence of
+         * <ext>/x1box/frame_stats.flag (Android: `am start` doesn't
+         * propagate env vars so the flag is the practical knob).
+         * Tag: hakuX-frame-stats. Cheap: ring-buffer push + an
+         * insertion-sort over 60 elements once per second. */
+#ifdef __ANDROID__
+        {
+            static int   fs_enabled_cached = -1;
+            if (fs_enabled_cached < 0) {
+                const char *e = getenv("X1BOX_FRAME_STATS");
+                if (e && e[0] && e[0] != '0') {
+                    fs_enabled_cached = 1;
+                } else {
+                    const char *base = android_x1box_ext_dir();
+                    if (base) {
+                        char p[512];
+                        snprintf(p, sizeof(p), "%s/frame_stats.flag", base);
+                        struct stat st;
+                        fs_enabled_cached = (stat(p, &st) == 0) ? 1 : 0;
+                    } else {
+                        fs_enabled_cached = 0;
+                    }
+                }
+            }
+            if (fs_enabled_cached) {
+                #define FS_WINDOW 60
+                static int64_t fs_frame_ns[FS_WINDOW];
+                static int64_t fs_gpu_ns[FS_WINDOW];
+                static int     fs_idx;
+                static int     fs_count;
+                static int64_t fs_last_dump_ns;
+
+                fs_frame_ns[fs_idx] = d->last_frame_ns;
+                fs_gpu_ns[fs_idx]   = gpu_ns;
+                fs_idx = (fs_idx + 1) % FS_WINDOW;
+                if (fs_count < FS_WINDOW) fs_count++;
+
+                if (fs_last_dump_ns == 0) fs_last_dump_ns = now;
+                if (now - fs_last_dump_ns >= 1000000000LL && fs_count >= 8) {
+                    /* Copy + insertion-sort frame_ns. 60 elements, tiny. */
+                    int64_t sorted[FS_WINDOW];
+                    for (int i = 0; i < fs_count; i++) sorted[i] = fs_frame_ns[i];
+                    for (int i = 1; i < fs_count; i++) {
+                        int64_t v = sorted[i]; int j = i;
+                        while (j > 0 && sorted[j-1] > v) {
+                            sorted[j] = sorted[j-1]; j--;
+                        }
+                        sorted[j] = v;
+                    }
+                    int64_t mn  = sorted[0];
+                    int64_t p50 = sorted[fs_count / 2];
+                    int64_t p95 = sorted[(fs_count * 95) / 100];
+                    int64_t p99 = sorted[(fs_count * 99) / 100];
+                    int64_t mx  = sorted[fs_count - 1];
+
+                    /* GPU share — sum/sum, robust to outliers in either. */
+                    int64_t sum_frame = 0, sum_gpu = 0;
+                    for (int i = 0; i < fs_count; i++) {
+                        sum_frame += fs_frame_ns[i];
+                        sum_gpu   += fs_gpu_ns[i];
+                    }
+                    int gpu_pct = (sum_frame > 0)
+                                ? (int)((sum_gpu * 100) / sum_frame) : 0;
+
+                    /* User-visible FPS ≈ count / window-wallclock. We
+                     * use the sum-of-frame-times as the window length;
+                     * close enough for what this log is for. */
+                    double fps_avg = (sum_frame > 0)
+                        ? (double)fs_count * 1e9 / (double)sum_frame : 0.0;
+
+                    __android_log_print(
+                        ANDROID_LOG_INFO, "hakuX-frame-stats",
+                        "n=%d  fps=%.1f  ms{min=%.1f p50=%.1f p95=%.1f p99=%.1f max=%.1f}  gpu_share=%d%%",
+                        fs_count, fps_avg,
+                        mn  / 1e6, p50 / 1e6, p95 / 1e6,
+                        p99 / 1e6, mx  / 1e6, gpu_pct);
+
+                    fs_last_dump_ns = now;
+                }
+            }
+        }
+#endif
+
+        /* Adaptive ADPF target — auto-tune the target work duration to
+         * the guest's actual framerate target. Hardcoding 30 FPS hurts
+         * 60-FPS titles (we under-request boost when struggling) and
+         * 25-FPS PAL titles (we over-request, costing battery). We use
+         * the rolling MIN of recent frame intervals as a proxy for the
+         * game's best-case (= intended) frame time, then snap to the
+         * nearest standard target bucket above it. Updating only on
+         * bucket change avoids churn on noise.
+         *
+         * Static state because there's exactly one ADPF session per
+         * process and the FLIP_STALL handler is the canonical fire
+         * point. */
+        static int64_t s_recent_ns[32];
+        static int     s_ring_idx;
+        static int     s_warmup_frames;
+        static int64_t s_last_set_target_ns;
+
+        s_recent_ns[s_ring_idx] = d->last_frame_ns;
+        s_ring_idx = (s_ring_idx + 1) % 32;
+        if (s_warmup_frames < 32) s_warmup_frames++;
+
+        if (s_warmup_frames >= 32) {
+            /* Rolling min over the last 32 FLIP_STALLs. ~1s of history
+             * at 30 FPS, ~0.5s at 60. Cheap (32 compares). */
+            int64_t min_ns = s_recent_ns[0];
+            for (int i = 1; i < 32; i++) {
+                if (s_recent_ns[i] < min_ns) min_ns = s_recent_ns[i];
+            }
+            /* Snap min to the smallest standard target ≥ min_ns. Order
+             * matters — first hit wins. */
+            static const int64_t buckets_ns[] = {
+                16666666LL,    /* 60 FPS */
+                20000000LL,    /* 50 FPS */
+                25000000LL,    /* 40 FPS */
+                33333333LL,    /* 30 FPS */
+                40000000LL,    /* 25 FPS — PAL */
+                50000000LL,    /* 20 FPS — last-resort */
+            };
+            int64_t bucket_ns = buckets_ns[5];
+            for (size_t i = 0; i < ARRAY_SIZE(buckets_ns); i++) {
+                if (min_ns <= buckets_ns[i]) { bucket_ns = buckets_ns[i]; break; }
+            }
+            /* Only re-arm the ADPF target when the bucket actually
+             * changes, AND wait for a few frames of agreement before
+             * promoting / demoting (cheap hysteresis: re-confirm 4
+             * frames in a row). */
+            static int64_t s_candidate_target_ns;
+            static int     s_candidate_streak;
+            if (bucket_ns != s_last_set_target_ns) {
+                if (bucket_ns == s_candidate_target_ns) {
+                    s_candidate_streak++;
+                } else {
+                    s_candidate_target_ns = bucket_ns;
+                    s_candidate_streak = 1;
+                }
+                if (s_candidate_streak >= 4) {
+                    adpf_android_set_target(bucket_ns);
+                    s_last_set_target_ns = bucket_ns;
+                    s_candidate_streak = 0;
+                }
+            } else {
+                s_candidate_streak = 0;
+            }
+        }
     }
     d->last_flip_ns = now;
 
@@ -3027,6 +3195,7 @@ DEF_METHOD_INC(NV097, SET_VERTEX3F)
     pgraph_allocate_inline_buffer_vertices(pg, NV2A_VERTEX_ATTR_POSITION);
     attribute->inline_value[slot] = *(float*)&parameter;
     attribute->inline_value[3] = 1.0f;
+    pg->any_reg_gen++;
     if (slot == 2) {
         pgraph_finish_inline_buffer_vertex(pg);
     }
@@ -3148,6 +3317,7 @@ DEF_METHOD_INC(NV097, SET_VERTEX4F)
         &pg->vertex_attributes[NV2A_VERTEX_ATTR_POSITION];
     pgraph_allocate_inline_buffer_vertices(pg, NV2A_VERTEX_ATTR_POSITION);
     attribute->inline_value[slot] = *(float*)&parameter;
+    pg->any_reg_gen++;
     if (slot == 3) {
         pgraph_finish_inline_buffer_vertex(pg);
     }
@@ -3161,6 +3331,7 @@ DEF_METHOD(NV097, SET_FOG_COORD)
     attribute->inline_value[1] = attribute->inline_value[0];
     attribute->inline_value[2] = attribute->inline_value[0];
     attribute->inline_value[3] = attribute->inline_value[0];
+    pg->any_reg_gen++;
 }
 
 DEF_METHOD(NV097, SET_WEIGHT1F)
@@ -3171,6 +3342,7 @@ DEF_METHOD(NV097, SET_WEIGHT1F)
     attribute->inline_value[1] = 0.f;
     attribute->inline_value[2] = 0.f;
     attribute->inline_value[3] = 1.f;
+    pg->any_reg_gen++;
 }
 
 DEF_METHOD_INC(NV097, SET_NORMAL3S)
@@ -3184,6 +3356,7 @@ DEF_METHOD_INC(NV097, SET_NORMAL3S)
     attribute->inline_value[part * 2 + 0] = MAX(-1.0f, (float)val / 32767.0f);
     val = parameter >> 16;
     attribute->inline_value[part * 2 + 1] = MAX(-1.0f, (float)val / 32767.0f);
+    pg->any_reg_gen++;
 }
 
 #define SET_VERTEX_ATTRIBUTE_4S(command, attr_index)                     \
@@ -3196,6 +3369,7 @@ DEF_METHOD_INC(NV097, SET_NORMAL3S)
             (float)(int16_t)(parameter & 0xFFFF);                          \
         attribute->inline_value[part * 2 + 1] =                            \
             (float)(int16_t)(parameter >> 16);                             \
+        pg->any_reg_gen++;                                                 \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_TEXCOORD0_4S)
@@ -3228,6 +3402,7 @@ DEF_METHOD_INC(NV097, SET_TEXCOORD3_4S)
         attribute->inline_value[1] = (float)(int16_t)(parameter >> 16);    \
         attribute->inline_value[2] = 0.0f;                                 \
         attribute->inline_value[3] = 1.0f;                                 \
+        pg->any_reg_gen++;                                                 \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_TEXCOORD0_2S)
@@ -3259,6 +3434,7 @@ DEF_METHOD_INC(NV097, SET_TEXCOORD3_2S)
         pgraph_allocate_inline_buffer_vertices(pg, (attr_index));          \
         attribute->inline_value[slot] = *(float*)&parameter;               \
         attribute->inline_value[3] = 1.0f;                                 \
+        pg->any_reg_gen++;                                                 \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_DIFFUSE_COLOR3F)
@@ -3279,6 +3455,7 @@ DEF_METHOD_INC(NV097, SET_SPECULAR_COLOR3F)
         VertexAttribute *attribute = &pg->vertex_attributes[(attr_index)]; \
         pgraph_allocate_inline_buffer_vertices(pg, (attr_index));          \
         attribute->inline_value[slot] = *(float*)&parameter;               \
+        pg->any_reg_gen++;                                                 \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_NORMAL3F)
@@ -3333,6 +3510,7 @@ DEF_METHOD_INC(NV097, SET_WEIGHT2F)
     attribute->inline_value[slot] = *(float*)&parameter;
     attribute->inline_value[2] = 0.0f;
     attribute->inline_value[3] = 1.0f;
+    pg->any_reg_gen++;
 }
 
 DEF_METHOD_INC(NV097, SET_WEIGHT3F)
@@ -3343,6 +3521,7 @@ DEF_METHOD_INC(NV097, SET_WEIGHT3F)
     pgraph_allocate_inline_buffer_vertices(pg, NV2A_VERTEX_ATTR_WEIGHT);
     attribute->inline_value[slot] = *(float*)&parameter;
     attribute->inline_value[3] = 1.0f;
+    pg->any_reg_gen++;
 }
 
 #define SET_VERTEX_ATRIBUTE_TEX_2F(command, attr_index)                    \
@@ -3353,6 +3532,7 @@ DEF_METHOD_INC(NV097, SET_WEIGHT3F)
         attribute->inline_value[slot] = *(float*)&parameter;               \
         attribute->inline_value[2] = 0.0f;                                 \
         attribute->inline_value[3] = 1.0f;                                 \
+        pg->any_reg_gen++;                                                 \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_TEXCOORD0_2F)
@@ -3389,6 +3569,7 @@ DEF_METHOD_INC(NV097, SET_TEXCOORD3_2F)
         attribute->inline_value[1] = ((parameter >> 8) & 0xFF) / 255.0f;   \
         attribute->inline_value[2] = ((parameter >> 16) & 0xFF) / 255.0f;  \
         attribute->inline_value[3] = ((parameter >> 24) & 0xFF) / 255.0f;  \
+        pg->any_reg_gen++;                                                 \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_DIFFUSE_COLOR4UB)

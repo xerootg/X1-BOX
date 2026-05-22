@@ -123,6 +123,12 @@ typedef struct PGRAPHRenderer {
         void (*set_surface_scale_factor)(NV2AState *d, unsigned int scale);
         unsigned int (*get_surface_scale_factor)(NV2AState *d);
         int (*get_framebuffer_surface)(NV2AState *d);
+        /* Optional: atomically read + clear the per-flip GPU
+         * accumulator. NULL on backends that don't measure GPU time
+         * (or when running without timestamp support). Used by the
+         * NV097_FLIP_STALL handler to feed gpu_ns into ADPF's split
+         * report. */
+        int64_t (*consume_last_frame_gpu_ns)(NV2AState *d);
     } ops;
 } PGRAPHRenderer;
 

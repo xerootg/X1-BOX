@@ -369,6 +369,13 @@ typedef struct ShaderBinding {
     struct ShaderModuleCacheEntry *pending_geom_entry;
     struct ShaderModuleCacheEntry *pending_psh_entry;
 #endif
+    /*
+     * True once apply_uniform_updates has populated this binding's
+     * vsh/psh layout->allocation at least once. Used together with the
+     * fast-skip in pgraph_vk_update_shader_uniforms; cleared in
+     * shader_cache_entry_init when an LRU slot is recycled.
+     */
+    bool uniforms_layout_populated;
     struct {
         ShaderModuleInfo *module_info;
         VshUniformLocs uniform_locs;
@@ -1211,6 +1218,14 @@ typedef struct PGRAPHVkState {
     QTAILQ_HEAD(, SurfaceBinding) surfaces;
     QTAILQ_HEAD(, SurfaceBinding) invalid_surfaces;
     QTAILQ_HEAD(, SurfaceBinding) shelved_surfaces;
+    /*
+     * expire/prune is per-draw at the call site but the eviction predicate
+     * (frame_time - s->frame_time >= max_surface_frame_time_delta) cannot
+     * change inside a frame — so cache the frame_time at which we last ran
+     * the walks and skip on every subsequent draw in the same frame.
+     * Initialized to -1 so the first draw of frame 0 still runs once.
+     */
+    int last_expire_frame_time;
     GHashTable *surface_addr_map;
     bool surfaces_finalizing;
     uint32_t surface_list_gen;
@@ -1294,6 +1309,17 @@ typedef struct PGRAPHVkState {
     bool uniforms_changed;
     uint64_t last_vsh_uniform_hash;
     uint64_t last_psh_uniform_hash;
+    /*
+     * Fast-skip state for update_shader_uniforms: if these match on a new
+     * call we can prove the ShaderBinding's layout->allocation is already
+     * current and skip both set_*_uniform_values (12-15 KB of input memcpy)
+     * and apply_uniform_updates (12-15 KB of output uniform_copy). The
+     * gating is conservative — same binding, no constant dirty bits, and
+     * pg->any_reg_gen unchanged since last apply — so anything that could
+     * possibly change a uniform input invalidates the skip.
+     */
+    struct ShaderBinding *last_uniforms_binding;
+    uint32_t last_uniforms_reg_gen;
 
     /* Cached uniform state for dirty tracking */
     float cached_material_alpha;
@@ -1323,6 +1349,15 @@ typedef struct PGRAPHVkState {
     int gpu_ts_rp_index;
     int gpu_ts_rp_counts[NUM_SUBMIT_FRAMES];
     uint64_t gpu_ts_results[GPU_TS_QUERIES_PER_CB];
+    /* Sum of per-submit total_ns since the last NV097_FLIP_STALL. The
+     * gpu_ts_readback() path bumps it after each fence completes; the
+     * pgraph FLIP_STALL handler reads + resets it via the
+     * consume_last_frame_gpu_ns() op and feeds the value to ADPF's
+     * split-duration report so the system knows the GPU's actual
+     * share of per-frame work. Touched from the render thread and
+     * (optionally) the FLIP_STALL handler thread, hence accessed via
+     * __atomic_exchange_n for the consume side. */
+    int64_t gpu_ns_since_flip;
     bool new_query_needed;
     bool query_in_flight;
     bool queries_reset_in_cb;
@@ -1497,6 +1532,10 @@ void pgraph_vk_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta);
 void pgraph_vk_set_surface_scale_factor(NV2AState *d, unsigned int scale);
 unsigned int pgraph_vk_get_surface_scale_factor(NV2AState *d);
 void pgraph_vk_reload_surface_scale_factor(PGRAPHState *pg);
+
+// nan_probe.c — one-shot Vulkan compute probe for driver NaN/Inf semantics,
+// gated behind $X1BOX_PROBE_NAN. See project_halo2_mali_specular_white.md.
+void pgraph_vk_run_nan_probe(PGRAPHVkState *r);
 
 // surface-compute.c
 void pgraph_vk_init_compute(PGRAPHState *pg);

@@ -966,6 +966,14 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
     ShaderBinding *binding = container_of(node, ShaderBinding, node);
     memcpy(&binding->state, state, sizeof(ShaderState));
 
+    /* Fresh slot from the LRU free list — its layout->allocation has
+     * never been populated for this state, so the uniform fast-skip
+     * must run the full set+apply path on first use. */
+    binding->uniforms_layout_populated = false;
+    if (r->last_uniforms_binding == binding) {
+        r->last_uniforms_binding = NULL;
+    }
+
     NV2A_VK_DPRINTF("cache miss");
     nv2a_profile_inc_counter(NV2A_PROF_SHADER_GEN);
     g_nv2a_stats.shader_stats.shader_cache_misses++;
@@ -1041,6 +1049,14 @@ static void shader_cache_entry_post_evict(Lru *lru, LruNode *node)
 {
     PGRAPHVkState *r = container_of(lru, PGRAPHVkState, shader_cache);
     ShaderBinding *snode = container_of(node, ShaderBinding, node);
+
+    /* If our uniform fast-skip's last-applied pointer was this entry,
+     * clear it so we don't dereference a freed/recycled module on the
+     * next call. */
+    if (r->last_uniforms_binding == snode) {
+        r->last_uniforms_binding = NULL;
+    }
+    snode->uniforms_layout_populated = false;
 
     ShaderModuleInfo *modules[] = {
         snode->vsh.module_info,
@@ -1314,6 +1330,36 @@ void pgraph_vk_update_shader_uniforms(PGRAPHState *pg)
                            pg->ltctxb_any_dirty ||
                            pg->ltc1_any_dirty;
 
+    /*
+     * Fast skip: when nothing that feeds uniform values has changed since
+     * we last applied them to this binding's layout->allocation, we don't
+     * need to run set_*_uniform_values (~12-15 KB of input memcpy from
+     * pg state) OR apply_uniform_updates (~12-15 KB of output uniform_copy
+     * into the layout allocation). On Halo 2's title screen those two
+     * paths combined showed up as ~5-8% of all data-cache misses on the
+     * pfifo thread (call-graph: pgraph_vk_bind_shaders →
+     * pgraph_vk_update_shader_uniforms → memmove).
+     *
+     * Conservative gate — any of the following invalidates the skip:
+     *   - constant/light dirty bits set since last clear
+     *   - any register write since last apply (any_reg_gen ticks on every
+     *     pg register touch, covering fogParam / surfaceSize / etc.)
+     *   - different binding than last apply (uniform layout differs)
+     *   - this binding hasn't been populated yet (LRU-fresh slot)
+     *
+     * r->uniforms_changed is left untouched: it was cleared after the
+     * previous draw's staging-append in pgraph_vk_update_descriptor_sets,
+     * and the layout->allocation hasn't moved, so the previous staging
+     * slot is still valid for re-binding.
+     */
+    if (!constants_dirty
+        && binding == r->last_uniforms_binding
+        && binding->uniforms_layout_populated
+        && pg->any_reg_gen == r->last_uniforms_reg_gen) {
+        NV2A_VK_DGROUP_END();
+        return;
+    }
+
     VshUniformValues vsh_values;
     pgraph_glsl_set_vsh_uniform_values(pg, &binding->state.vsh,
                                   binding->vsh.uniform_locs, &vsh_values);
@@ -1367,6 +1413,17 @@ void pgraph_vk_update_shader_uniforms(PGRAPHState *pg)
         r->last_vsh_uniform_hash = vsh_hash;
         r->last_psh_uniform_hash = psh_hash;
     }
+
+    /*
+     * Update fast-skip tracking. From this point until any of (a) a
+     * constant/light dirty bit being set, (b) a register write bumping
+     * any_reg_gen, (c) a different shader binding being selected, or (d)
+     * this binding's LRU slot being recycled, we can safely skip the
+     * set_*_uniform_values + apply_uniform_updates path.
+     */
+    binding->uniforms_layout_populated = true;
+    r->last_uniforms_binding = binding;
+    r->last_uniforms_reg_gen = pg->any_reg_gen;
 
     NV2A_VK_DGROUP_END();
 }

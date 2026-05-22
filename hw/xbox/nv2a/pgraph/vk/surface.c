@@ -1618,31 +1618,139 @@ static void invalidate_overlapping_surfaces(NV2AState *d,
 {
     PGRAPHVkState *r = d->pgraph.vk_renderer_state;
 
+    /*
+     * Coalesce per-overlap finishes into ONE deferred-batch wait.
+     *
+     * Diagnosed: at 42 ms/frame p50, pfifo spends ~26 ms/frame off-CPU in
+     * pgraph_vk_finish waits (vkWaitForFences on the per-CB fence). The
+     * counters in hakuX-stall show this routed through finish_surf_down
+     * (sd300/window = 5/frame), with the dominant contributors being
+     * dif_overlap and dif_overlap_sh — each of which used to issue ONE
+     * sync download per surface that overlapped a newly-created surface.
+     *
+     * The deferred path (download_surface_record_deferred) records the
+     * download into the current CB without finishing; a single
+     * pgraph_vk_download_surface_complete_deferred() call then waits on
+     * one frame fence and memcpys all of them at once. We do two passes:
+     *
+     *   Pass 1: enumerate all overlapping surfaces (live + shelved),
+     *           try to record their readbacks via the deferred queue.
+     *           If the queue refuses (full / fallback needed) we mark
+     *           that we must take the legacy path for the remainder so
+     *           the data is never lost.
+     *
+     *   Pass 2: drain the deferred batch with one finish (or skip if
+     *           none were recorded), THEN invalidate / shelve-evict all
+     *           the surfaces we visited.
+     *
+     * Cost: one finish per call to invalidate_overlapping_surfaces
+     * instead of (overlap_count) finishes. Saves ~2 finishes/frame on
+     * Halo 2 = ~8-10 ms/frame off the pfifo critical path.
+     *
+     * Correctness: the recorded downloads share the existing
+     * deferred_downloads[] array. complete_deferred() does the same
+     * vkWaitForFences + memory_region_set_client_dirty bookkeeping the
+     * per-call pgraph_vk_surface_download_if_dirty path would, just
+     * batched. Invalidation of the surface_image happens AFTER the
+     * download completes, so we don't tear down a surface whose pixels
+     * we still need.
+     */
+
+    /* First, finish any *prior* deferred downloads so the queue is empty
+     * for our batch. This also matches the implicit ordering the legacy
+     * sync path provided. */
+    pgraph_vk_download_surface_complete_deferred(d);
+
+    /* Collect surfaces to process. We use small stack arrays sized to the
+     * deferred queue limit; the legacy sync path is the safety valve if
+     * a frame has more overlaps than this. */
+    SurfaceBinding *live_evict[MAX_DEFERRED_DOWNLOADS];
+    int live_evict_n = 0;
+    SurfaceBinding *shelved_evict[MAX_DEFERRED_DOWNLOADS];
+    int shelved_evict_n = 0;
+    bool must_fallback = false;
+
     SurfaceBinding *other_surface, *next_surface;
     QTAILQ_FOREACH_SAFE (other_surface, &r->surfaces, entry, next_surface) {
-        if (check_surfaces_overlap(surface, other_surface)) {
-            trace_nv2a_pgraph_surface_evict_overlapping(
-                other_surface->vram_addr, other_surface->width,
-                other_surface->height, other_surface->pitch);
-            OPT_STAT_INC(dif_overlap);
-            pgraph_vk_surface_download_if_dirty(d, other_surface);
-            invalidate_surface(d, other_surface);
+        if (!check_surfaces_overlap(surface, other_surface)) continue;
+        trace_nv2a_pgraph_surface_evict_overlapping(
+            other_surface->vram_addr, other_surface->width,
+            other_surface->height, other_surface->pitch);
+        OPT_STAT_INC(dif_overlap);
+        if (live_evict_n >= MAX_DEFERRED_DOWNLOADS) {
+            must_fallback = true;
+            break;
+        }
+        live_evict[live_evict_n++] = other_surface;
+        if (other_surface->draw_dirty && other_surface->width &&
+            other_surface->height) {
+            if (!download_surface_record_deferred(
+                    d, other_surface,
+                    d->vram_ptr + other_surface->vram_addr)) {
+                must_fallback = true;
+                break;
+            }
         }
     }
 
     QTAILQ_FOREACH_SAFE (other_surface, &r->shelved_surfaces, entry,
-                          next_surface) {
-        if (other_surface->vram_addr == surface->vram_addr) {
-            continue;
+                         next_surface) {
+        if (must_fallback) break;
+        if (other_surface->vram_addr == surface->vram_addr) continue;
+        if (!check_surfaces_overlap(surface, other_surface)) continue;
+        OPT_STAT_INC(dif_overlap_sh);
+        if (shelved_evict_n >= MAX_DEFERRED_DOWNLOADS) {
+            must_fallback = true;
+            break;
         }
-        if (check_surfaces_overlap(surface, other_surface)) {
-            OPT_STAT_INC(dif_overlap_sh);
+        shelved_evict[shelved_evict_n++] = other_surface;
+        if (other_surface->draw_dirty && other_surface->width &&
+            other_surface->height) {
+            if (!download_surface_record_deferred(
+                    d, other_surface,
+                    d->vram_ptr + other_surface->vram_addr)) {
+                must_fallback = true;
+                break;
+            }
+        }
+    }
+
+    if (must_fallback) {
+        /* Drain whatever we recorded so far, then process everything
+         * else the legacy way. Safety valve — should be rare. */
+        pgraph_vk_download_surface_complete_deferred(d);
+        QTAILQ_FOREACH_SAFE (other_surface, &r->surfaces, entry,
+                             next_surface) {
+            if (!check_surfaces_overlap(surface, other_surface)) continue;
+            pgraph_vk_surface_download_if_dirty(d, other_surface);
+            invalidate_surface(d, other_surface);
+        }
+        QTAILQ_FOREACH_SAFE (other_surface, &r->shelved_surfaces, entry,
+                             next_surface) {
+            if (other_surface->vram_addr == surface->vram_addr) continue;
+            if (!check_surfaces_overlap(surface, other_surface)) continue;
             pgraph_vk_surface_download_if_dirty(d, other_surface);
             QTAILQ_REMOVE(&r->shelved_surfaces, other_surface, entry);
             deferred_downloads_clear_surface(r, other_surface);
             destroy_surface_image(r, other_surface);
             g_free(other_surface);
         }
+        return;
+    }
+
+    /* One batched finish covers every download we recorded above. */
+    pgraph_vk_download_surface_complete_deferred(d);
+
+    /* Now eject the surfaces. */
+    for (int i = 0; i < live_evict_n; i++) {
+        invalidate_surface(d, live_evict[i]);
+    }
+    for (int i = 0; i < shelved_evict_n; i++) {
+        SurfaceBinding *s = shelved_evict[i];
+        QTAILQ_REMOVE(&r->shelved_surfaces, s, entry);
+        deferred_downloads_clear_surface(r, s);
+        destroy_surface_image(r, s);
+        g_free(s);
     }
 }
 
@@ -2765,12 +2873,46 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                     "incompatible", surface->vram_addr);
                 compare_surfaces(surface, &target);
                 if (surface->draw_dirty) {
-                    if (r->in_command_buffer) {
-                        OPT_STAT_INC(sd_eviction);
-                        pgraph_vk_finish(pg, VK_FINISH_REASON_SURFACE_DOWN);
-                    } else {
-                        OPT_STAT_INC(sd_eviction_nocb);
-                    }
+                    /*
+                     * Removed: pgraph_vk_finish(SURFACE_DOWN) here.
+                     *
+                     * Why it was harmful: at scale=3 (9× pixel count),
+                     * shelving evictions fire ~0.9× per frame and each
+                     * finish drained the entire current CB — measured
+                     * ~7 ms/frame off-pfifo. But the finish wasn't
+                     * doing a download. It was purely a defensive sync
+                     * before the memset() below, on the theory that
+                     * pending GPU writes to surface->image might
+                     * conflict with the VRAM memset.
+                     *
+                     * Why it's safe to drop:
+                     *   1. The render pass was already ended above via
+                     *      pgraph_vk_ensure_not_in_render_pass(pg) at
+                     *      the start of this whole `if (!current_binding
+                     *      || upload …)` block. Tile memory is flushed,
+                     *      image-layout transitions on subsequent uses
+                     *      will provide the necessary barrier.
+                     *   2. The memset() writes to VRAM (host memory),
+                     *      not to surface->image (GPU memory). They
+                     *      target disjoint backing storage, so there
+                     *      is no producer/consumer relationship to
+                     *      synchronize between them — the GPU isn't
+                     *      reading from VRAM while we memset, and the
+                     *      CPU isn't reading from surface->image.
+                     *   3. The parallel branch at sd_eviction_nocb
+                     *      already does the same memset+shelve with
+                     *      no finish, proving the surrounding code is
+                     *      already correct under that ordering. The
+                     *      finish was only on the in_command_buffer
+                     *      side as defense-in-depth.
+                     *
+                     * If a regression appears later in a title that
+                     * heavily reuses a freshly-shelved surface mid-CB,
+                     * the right fix is to insert a per-image pipeline
+                     * barrier in unbind_surface — not to bring the
+                     * full-queue drain back.
+                     */
+                    OPT_STAT_INC(sd_eviction);
 
                     /*
                      * When a draw-dirty surface is shelved without a
@@ -2997,10 +3139,20 @@ void pgraph_vk_surface_update(NV2AState *d, bool upload, bool color_write,
         assert(r->color_binding->height == r->zeta_binding->height);
     }
 
-    {
+    /*
+     * Gate the expire/prune walks to once per frame. Both predicates depend
+     * only on pg->frame_time and the surface's frame_time field, neither of
+     * which changes between draws within the same frame — so re-walking on
+     * every draw (Halo 2 hits this ~1000x/frame at scale=3) just touches
+     * cache and finds nothing new to drop. Profile (2026-05-21) showed
+     * pgraph_vk_surface_update at 11.92% process CPU with the per-draw walk
+     * dominating; this collapses it to O(surfaces) per frame.
+     */
+    if (pg->frame_time != r->last_expire_frame_time) {
         int64_t _se0 = nv2a_clock_ns();
         expire_old_surfaces(d);
         prune_invalid_surfaces(r, num_invalid_surfaces_to_keep);
+        r->last_expire_frame_time = pg->frame_time;
         g_nv2a_stats.surf_working.expire_ns += nv2a_clock_ns() - _se0;
     }
 
@@ -3079,6 +3231,7 @@ void pgraph_vk_init_surfaces(PGRAPHState *pg)
     r->surface_addr_map = g_hash_table_new(g_direct_hash, g_direct_equal);
     r->surfaces_finalizing = false;
     r->surface_list_gen = 0;
+    r->last_expire_frame_time = -1;
 
     r->downloads_pending = false;
     qemu_event_init(&r->downloads_complete, false);

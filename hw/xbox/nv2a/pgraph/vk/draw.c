@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/fast-hash.h"
 #include "qemu/error-report.h"
+#include "qemu/android-paths.h"
 #include "renderer.h"
 #include "system/physmem.h"
 #include "ui/xemu-settings.h"
@@ -1288,39 +1289,37 @@ static void create_pipeline(PGRAPHState *pg)
 
 #ifdef __ANDROID__
     /*
-     * Mali killer-shader SPIR-V/GLSL dump. Identified via per-draw logging
-     * (see begin_draw): the shader_state hash 0x76632dd7f6845143 (TRIANGLE_
-     * STRIP, ~37 draws into a color-only RP) consistently kills Mali's
-     * kcpu fence at Halo 2's Bungie fade-in. Captures both SPIR-V blobs
-     * and GLSL source to disk so we can run them through Mali's offline
-     * compiler / spirv-dis to find the offending instruction.
+     * Per-pipeline-create shader dump. Originated as a killer-shader hunt
+     * for the Mali kcpu-fence stall at Halo 2's Bungie fade-in (shader_state
+     * hash 0x76632dd7f6845143, TRIANGLE_STRIP on a color-only RP) and grew
+     * into a general SPIR-V/GLSL archive used by the malioc + spirv-dis
+     * audit loop. Dump lives in the public files dir so adb / MCP can pull
+     * without root.
      *
-     * Dump is one-shot per process (idempotent across pipeline create calls
-     * for the same shader). Lives in the public files dir so adb / MCP can
-     * pull without root. */
+     * Dedupe is disk-backed: we stat the destination .spv path before
+     * writing, so a hash already on disk from a prior run is skipped and
+     * we accumulate breadth across launches without a per-process cap.
+     */
     {
-        /* Dump every unique shader_state hash we see, up to a cap. Useful
-         * for diagnosing pgraph_vk rendering bugs in simpler ROMs (the
-         * xemu-dashboard text-atlas corruption is the current target).
-         * Each shader goes to shader_dump/<hash>_{vsh,psh,geom}.{spv,glsl}.
-         * Cap at 32 to keep disk usage bounded across long sessions. */
-        #define SHADER_DUMP_HASH_TABLE_SIZE 32
-        static uint64_t s_dumped_hashes[SHADER_DUMP_HASH_TABLE_SIZE];
-        static int s_dumped_count;
         uint64_t shader_hash =
             pgraph_glsl_hash_shader_state(&key.shader_state);
-        bool already_dumped = false;
-        for (int di = 0; di < s_dumped_count; di++) {
-            if (s_dumped_hashes[di] == shader_hash) {
-                already_dumped = true; break;
-            }
-        }
-        if (!already_dumped && s_dumped_count < SHADER_DUMP_HASH_TABLE_SIZE) {
-            s_dumped_hashes[s_dumped_count++] = shader_hash;
-            char dir[256];
-            snprintf(dir, sizeof(dir),
-                "/storage/emulated/0/Android/data/com.izzy2lost.x1box"
-                "/files/x1box/shader_dump/%016" PRIx64, shader_hash);
+
+        const char *ext_base = android_x1box_ext_dir();
+        if (ext_base) {
+        char dir[384];
+        snprintf(dir, sizeof(dir),
+            "%s/shader_dump/%016" PRIx64, ext_base, shader_hash);
+
+        /* Probe vsh.spv for existence — the vsh is always present when a
+         * pipeline reaches this point, so its absence is a reliable
+         * "never dumped" signal. Cheap stat() avoids redundant writes
+         * for the cumulative on-disk set. */
+        char probe[512];
+        snprintf(probe, sizeof(probe), "%s/killer_vsh.spv", dir);
+        struct stat st;
+        bool already_dumped = stat(probe, &st) == 0;
+
+        if (!already_dumped) {
             g_mkdir_with_parents(dir, 0755);
             __android_log_print(ANDROID_LOG_WARN, "hakuX-vk-shaderdump",
                 "shader 0x%016" PRIx64 " seen at pipeline-create — "
@@ -1372,8 +1371,8 @@ static void create_pipeline(PGRAPHState *pg)
                     }
                 }
             }
-            /* s_dumped_hashes[] tracks this hash; no separate flag. */
         }
+        } /* if (ext_base) */
     }
 #endif
 
@@ -2348,6 +2347,18 @@ static void gpu_ts_readback(PGRAPHVkState *r, int frame)
     g_nv2a_stats.phase_working.gpu_render_ns += render_ns;
     g_nv2a_stats.phase_working.gpu_nonrender_ns += nonrender_ns;
     g_nv2a_stats.phase_working.gpu_rp_count += rp_count;
+
+    /* Per-flip accumulator: pgraph_vk_consume_last_frame_gpu_ns() reads
+     * and clears this at NV097_FLIP_STALL time so adpf-android can
+     * report the GPU's actual share of per-frame work via the split
+     * AWorkDuration path. We use the *total* command-buffer time here
+     * (not just render passes) because that's what counts against
+     * thermal/DVFS budget on the GPU side. __atomic so the consume
+     * side can race against multiple readbacks within one flip. */
+    if (total_ns > 0) {
+        __atomic_fetch_add(&r->gpu_ns_since_flip, total_ns,
+                           __ATOMIC_RELAXED);
+    }
 }
 
 const enum NV2A_PROF_COUNTERS_ENUM finish_reason_to_counter_enum[] = {
@@ -6205,8 +6216,21 @@ void pgraph_vk_flush_draw(NV2AState *d)
     r->num_vertex_ram_buffer_syncs = 0;
 
 #ifndef NDEBUG
-    RenderCommandSnapshot snap;
-    pgraph_vk_snapshot_state(pg, &snap);
+    /*
+     * End-of-draw consistency checks. The old form took a full
+     * pgraph_vk_snapshot_state copy (~50 KB / draw — the regs[0x2000]
+     * array alone is 32 KB) just to feed four assertions at the bottom
+     * of this function. That memcpy alone was 17.6% of all
+     * pgraph_vk_flush_draw cache misses on Pixel (Tensor G4 cache
+     * hierarchy doesn't hold the working set as cleanly as Snapdragon's).
+     * The RenderCommandSnapshot struct still exists for the planned
+     * async render thread; this callsite just doesn't need it. Capture
+     * only the four pre-draw values the asserts compare against.
+     */
+    const uint32_t pre_primitive_mode = pg->primitive_mode;
+    const bool     pre_clearing       = pg->clearing;
+    const uint32_t pre_control_0      = pgraph_vk_reg_r(pg, NV_PGRAPH_CONTROL_0);
+    const uint32_t pre_setupraster    = pgraph_vk_reg_r(pg, NV_PGRAPH_SETUPRASTER);
 #endif
 
     PrimAssemblyState assembly = {
@@ -6569,12 +6593,10 @@ inline_array_done:
     }
 
 #ifndef NDEBUG
-    assert(snap.primitive_mode == pg->primitive_mode);
-    assert(snap.clearing == pg->clearing);
-    assert(snapshot_reg_r(&snap, NV_PGRAPH_CONTROL_0) ==
-           pgraph_vk_reg_r(pg, NV_PGRAPH_CONTROL_0));
-    assert(snapshot_reg_r(&snap, NV_PGRAPH_SETUPRASTER) ==
-           pgraph_vk_reg_r(pg, NV_PGRAPH_SETUPRASTER));
+    assert(pre_primitive_mode == pg->primitive_mode);
+    assert(pre_clearing       == pg->clearing);
+    assert(pre_control_0      == pgraph_vk_reg_r(pg, NV_PGRAPH_CONTROL_0));
+    assert(pre_setupraster    == pgraph_vk_reg_r(pg, NV_PGRAPH_SETUPRASTER));
 #endif
 
     NV2A_PHASE_TIMER_END(draw_dispatch);

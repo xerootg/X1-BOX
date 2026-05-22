@@ -19,6 +19,8 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "renderer.h"
+#include "probe_runner.h"
+#include "qemu/adpf-android.h"
 #include "qemu/error-report.h"
 #include "qemu/fast-hash.h"
 #include "ui/xemu-settings.h"
@@ -295,6 +297,24 @@ static void pgraph_vk_init(NV2AState *d, Error **errp)
 
     VK_LOG_ERROR("init: compute");
     pgraph_vk_init_compute(pg);
+
+    /* Optional one-shot driver-divergence probe — gated on
+     * X1BOX_PROBE_NAN=1. See nan_probe.c / project_halo2_mali_specular_white.
+     * Runs before display init so logs land before the first frame. */
+    pgraph_vk_run_nan_probe(pg->vk_renderer_state);
+
+    /* Generic GPU probe runner — runs user-supplied SPIR-V from a
+     * request file written by the gpu_probe() MCP tool. No-op if
+     * the request file is absent. See probe_runner.h. */
+    pgraph_vk_probe_runner_init(pg->vk_renderer_state);
+
+    /* ADPF (Android Dynamic Performance Framework). Opt-in via
+     * X1BOX_ADPF_ENABLED=1 in sched_config.txt. Sidesteps the
+     * EPERM uclamp.min limit by routing through system_server.
+     * Called here so the perf threads (TCG, pfifo, voice workers,
+     * apu, render) are already alive for enumeration. */
+    adpf_android_init();
+
     VK_LOG_ERROR("init: display");
     pgraph_vk_init_display(pg);
 
@@ -1286,6 +1306,20 @@ void nv2a_diag_log_draw_call(NV2AState *d, PGRAPHState *pg,
     diag_json_append("        }");
 }
 
+static int64_t pgraph_vk_consume_last_frame_gpu_ns(NV2AState *d)
+{
+    /* Atomically swap the accumulator to 0 and return the prior value.
+     * The bump side in gpu_ts_readback uses __atomic_fetch_add; both
+     * sides serialise on RELAXED ordering — exact accuracy isn't
+     * critical, ADPF treats this as a hint. */
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+    if (!r || !r->gpu_ts_supported) {
+        return 0;
+    }
+    return __atomic_exchange_n(&r->gpu_ns_since_flip, (int64_t)0,
+                               __ATOMIC_RELAXED);
+}
+
 static void pgraph_vk_flip_stall(NV2AState *d)
 {
     if (qatomic_read(&diag_frame_pending) || qatomic_read(&diag_frame_active)) {
@@ -1599,6 +1633,7 @@ static PGRAPHRenderer pgraph_vk_renderer = {
         .set_surface_scale_factor = pgraph_vk_set_surface_scale_factor,
         .get_surface_scale_factor = pgraph_vk_get_surface_scale_factor,
         .get_framebuffer_surface = pgraph_vk_get_framebuffer_surface,
+        .consume_last_frame_gpu_ns = pgraph_vk_consume_last_frame_gpu_ns,
     }
 };
 
