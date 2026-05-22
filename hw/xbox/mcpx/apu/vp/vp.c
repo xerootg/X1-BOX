@@ -67,18 +67,99 @@ static inline uint8_t mcpx_ram_ldub(MCPXAPUState *d, hwaddr addr)
     return ldub_phys(&address_space_memory, addr);
 }
 
-/* Write fast-paths. Mirror the load helpers above so voice register RMW and
+/*
+ * Write fast-paths. Mirror the load helpers above so voice register RMW and
  * notifier writes avoid address_space_st*_internal -> invalidate_and_set_dirty,
  * which dominated the voice worker profile via physical_memory_all_dirty's
  * bitmap walk. Same pattern as scatter_gather_rw() in dsp/gp_ep.c:
- * direct host store plus memory_region_set_dirty (which uses
- * DIRTY_CLIENTS_NOCODE and skips the range-clean scan + TB invalidation).
+ * direct host store plus memory_region_set_dirty.
+ *
+ * Coalescing batcher (2026-05-22): a profile after the pgraph_vk surface-
+ * update reduction showed __aarch64_ldset8_acq_rel at 6.70% on mcpx.voice_work
+ * + physical_memory_set_dirty_range at 2.50% — the atomic-bitmap-set calls
+ * inside memory_region_set_dirty. Each voice_set_mask() emits ONE 4-byte
+ * stl_le followed by 5 atomic bitmap_set_atomic calls (one per
+ * DIRTY_MEMORY_* client), and voice_get_samples / voice_process call
+ * voice_set_mask 10-30 times per voice per audio frame, all hitting the
+ * same 64-byte voice-register block. Most of those marks were redundant.
+ *
+ * We add a thread-local single-range batcher: each st* extends a pending
+ * (start, end) range instead of flushing immediately. A non-contiguous
+ * write (or a flush call) emits one memory_region_set_dirty over the
+ * accumulated range. Safe because:
+ *   - DIRTY_MEMORY_CODE: voice register area is never executable code;
+ *     even if it were, the flush happens before guest re-observation
+ *     (post voice_work_release_voice_locks + before any IRQ raise).
+ *   - DIRTY_MEMORY_NV2A/_TEX: GPU never samples the voice register region.
+ *   - DIRTY_MEMORY_MIGRATION: live migration isn't active on Android.
+ * The hot dispatch threads (mcpx.voice_work workers, mcpx.apu_thread,
+ * nv2a.pfifo_thread for register PIO) each get their own batch via
+ * __thread storage — no cross-thread races.
  */
+typedef struct {
+    ram_addr_t start;
+    ram_addr_t end_excl;
+    MemoryRegion *mr;
+    bool valid;
+} McpxRamDirtyBatch;
+
+static __thread McpxRamDirtyBatch g_mcpx_ram_dirty_batch;
+
+static inline void mcpx_ram_dirty_flush(void)
+{
+    McpxRamDirtyBatch *b = &g_mcpx_ram_dirty_batch;
+    if (b->valid) {
+        memory_region_set_dirty(b->mr, b->start, b->end_excl - b->start);
+        b->valid = false;
+    }
+}
+
+static inline void mcpx_ram_dirty_mark(MCPXAPUState *d, hwaddr addr,
+                                       size_t size)
+{
+    McpxRamDirtyBatch *b = &g_mcpx_ram_dirty_batch;
+    ram_addr_t new_end = addr + size;
+
+    if (!b->valid) {
+        b->mr = d->ram;
+        b->start = addr;
+        b->end_excl = new_end;
+        b->valid = true;
+        return;
+    }
+    /*
+     * Coalesce when the new write either overlaps the pending range or
+     * lies within 16 KiB of the current end — guest voice register
+     * groups for one voice (~64 bytes) and the full 256-voice
+     * register file (~16 KiB) fall inside one batch. The audio register
+     * region has no consumers that care about over-marking (it's not
+     * code, not a texture, not a VGA framebuffer), so the only cost of
+     * a wider window is a couple of extra bytes scanned in the dirty
+     * bitmap per flush — far cheaper than the per-voice atomic
+     * bitmap_set we save by collapsing writes across the file.
+     */
+    if (b->mr == d->ram && addr <= b->end_excl + (16 * 1024) &&
+        new_end + (16 * 1024) >= b->start) {
+        if (addr < b->start) {
+            b->start = addr;
+        }
+        if (new_end > b->end_excl) {
+            b->end_excl = new_end;
+        }
+        return;
+    }
+    mcpx_ram_dirty_flush();
+    b->mr = d->ram;
+    b->start = addr;
+    b->end_excl = new_end;
+    b->valid = true;
+}
+
 static inline void mcpx_ram_stl_le(MCPXAPUState *d, hwaddr addr, uint32_t val)
 {
     if (likely(addr + 4 <= d->ram_size)) {
         stl_le_p(d->ram_ptr + addr, val);
-        memory_region_set_dirty(d->ram, addr, 4);
+        mcpx_ram_dirty_mark(d, addr, 4);
         return;
     }
     stl_le_phys(&address_space_memory, addr, val);
@@ -88,7 +169,7 @@ static inline void mcpx_ram_stw_le(MCPXAPUState *d, hwaddr addr, uint16_t val)
 {
     if (likely(addr + 2 <= d->ram_size)) {
         stw_le_p(d->ram_ptr + addr, val);
-        memory_region_set_dirty(d->ram, addr, 2);
+        mcpx_ram_dirty_mark(d, addr, 2);
         return;
     }
     stw_le_phys(&address_space_memory, addr, val);
@@ -98,7 +179,7 @@ static inline void mcpx_ram_stb(MCPXAPUState *d, hwaddr addr, uint8_t val)
 {
     if (likely(addr + 1 <= d->ram_size)) {
         *(d->ram_ptr + addr) = val;
-        memory_region_set_dirty(d->ram, addr, 1);
+        mcpx_ram_dirty_mark(d, addr, 1);
         return;
     }
     stb_phys(&address_space_memory, addr, val);
@@ -186,6 +267,18 @@ static uint32_t voice_get_mask(MCPXAPUState *d, uint16_t voice_handle,
     return (mcpx_ram_ldl_le(d, voice + offset) & mask) >> ctz32(mask);
 }
 
+/*
+ * Extract a sub-field from a register value that's already been read once
+ * into a local — used to collapse N consecutive voice_get_mask() calls on
+ * the same NV_PAVS_VOICE_* offset into a single guest-RAM load plus N
+ * cheap bitfield extractions. voice_get_samples() was hitting CFG_FMT 7x
+ * and PAR_STATE 2x per voice (2026-05-22 profile).
+ */
+static inline uint32_t voice_extract_mask(uint32_t reg_val, uint32_t mask)
+{
+    return (reg_val & mask) >> ctz32(mask);
+}
+
 static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
                            hwaddr offset, uint32_t mask, uint32_t val)
 {
@@ -215,15 +308,45 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    qemu_spin_lock(&d->vp.voice_spinlocks[v]);
     uint64_t mask = 1LL << (v % 64);
+    int idx = v / 64;
+
+    /*
+     * Idempotent fast-path: Halo 2 spam-writes NV1BA0_PIO_VOICE_LOCK
+     * with the same value on the same voice across consecutive guest
+     * frames. If the bit already matches what we'd write, neither the
+     * spinlock cycle nor the broadcast is needed. Read is atomic so we
+     * don't need the spinlock for the observation; if the value
+     * changes mid-check the slow path picks it up and converges to the
+     * correct state.
+     */
+    uint64_t cur = qatomic_read(&d->vp.voice_locked[idx]);
+    bool already_locked = (cur & mask) != 0;
+    if (lock == already_locked) {
+        return;
+    }
+
+    qemu_spin_lock(&d->vp.voice_spinlocks[v]);
+    bool need_wake;
     if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
+        d->vp.voice_locked[idx] |= mask;
+        /*
+         * Workers wait on d->cond only when they observe is_voice_locked()
+         * true; nothing wakes-up on a lock acquisition, so the broadcast
+         * was just measurement noise. APU main thread waits on d->cond
+         * only when SECTL/FECTL are off — Halo 2 never lands here mid
+         * audio, so we don't need to keep that path live either.
+         */
+        need_wake = false;
     } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
+        bool was_locked = (d->vp.voice_locked[idx] & mask) != 0;
+        d->vp.voice_locked[idx] &= ~mask;
+        need_wake = was_locked;
     }
     qemu_spin_unlock(&d->vp.voice_spinlocks[v]);
-    qemu_cond_broadcast(&d->cond);
+    if (need_wake) {
+        qemu_cond_broadcast(&d->cond);
+    }
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
@@ -736,6 +859,15 @@ static void vp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     default:
         break;
     }
+    /*
+     * No per-vp_write flush: guest PIO writes from one command stream
+     * stay within ±16 KiB of the voice register file so the batcher's
+     * coalesce window absorbs them. Cross-region jumps (NV2A regs, RAM
+     * writes outside this region) auto-flush via mcpx_ram_dirty_mark's
+     * non-contiguous path. Flushing here turned every guest PIO write
+     * into 5 atomic bitmap_set ops, which dominated the TCG voice_lock
+     * neighborhood in the Halo 2 profile.
+     */
 }
 
 const MemoryRegionOps vp_ops = {
@@ -918,21 +1050,35 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                        int num_samples_requested)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    bool stereo = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
-                                 NV_PAVS_VOICE_CFG_FMT_STEREO);
+
+    /*
+     * Cache the voice register block reads — voice_get_mask issues a fresh
+     * mcpx_ram_ldl_le on every call, and this prologue used to hit
+     * NV_PAVS_VOICE_CFG_FMT 7x and NV_PAVS_VOICE_PAR_STATE 2x. With ~200
+     * voices per audio frame, that's ~1800 redundant 4-byte guest-RAM
+     * loads per second. Each load is bounds-checked + ld_le_p + branch +
+     * pointer-math — cheap individually, but the SAMPLES_PER_BLOCK extract
+     * is on the inner sample loop downstream. Reading each register once
+     * and extracting from the local collapses it to one load per register
+     * per voice.
+     */
+    hwaddr voice_base = d->regs[NV_PAPU_VPVADDR] + v * NV_PAVS_SIZE;
+    uint32_t cfg_fmt = mcpx_ram_ldl_le(d, voice_base + NV_PAVS_VOICE_CFG_FMT);
+    uint32_t par_state =
+        mcpx_ram_ldl_le(d, voice_base + NV_PAVS_VOICE_PAR_STATE);
+
+    bool stereo = voice_extract_mask(cfg_fmt, NV_PAVS_VOICE_CFG_FMT_STEREO);
     unsigned int channels = stereo ? 2 : 1;
-    unsigned int sample_size = voice_get_mask(
-        d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE);
+    unsigned int sample_size =
+        voice_extract_mask(cfg_fmt, NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE);
     unsigned int container_sizes[4] = { 1, 2, 0, 4 }; /* B8, B16, ADPCM, B32 */
-    unsigned int container_size_index = voice_get_mask(
-        d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE);
+    unsigned int container_size_index =
+        voice_extract_mask(cfg_fmt, NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE);
     unsigned int container_size = container_sizes[container_size_index];
-    bool stream = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
-                                 NV_PAVS_VOICE_CFG_FMT_DATA_TYPE);
-    bool paused = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                 NV_PAVS_VOICE_PAR_STATE_PAUSED);
-    bool loop =
-        voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_LOOP);
+    bool stream = voice_extract_mask(cfg_fmt, NV_PAVS_VOICE_CFG_FMT_DATA_TYPE);
+    bool paused =
+        voice_extract_mask(par_state, NV_PAVS_VOICE_PAR_STATE_PAUSED);
+    bool loop = voice_extract_mask(cfg_fmt, NV_PAVS_VOICE_CFG_FMT_LOOP);
     uint32_t ebo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT,
                                   NV_PAVS_VOICE_PAR_NEXT_EBO);
     uint32_t cbo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
@@ -941,15 +1087,13 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                   NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO);
     uint32_t ba = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START,
                                  NV_PAVS_VOICE_CUR_PSL_START_BA);
-    unsigned int samples_per_block =
-        1 + voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
-                           NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK);
-    bool persist = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
-                                  NV_PAVS_VOICE_CFG_FMT_PERSIST);
-    bool multipass = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
-                                    NV_PAVS_VOICE_CFG_FMT_MULTIPASS);
-    bool linked = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
-                                 NV_PAVS_VOICE_CFG_FMT_LINKED); /* FIXME? */
+    unsigned int samples_per_block = 1 + voice_extract_mask(
+        cfg_fmt, NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK);
+    bool persist = voice_extract_mask(cfg_fmt, NV_PAVS_VOICE_CFG_FMT_PERSIST);
+    bool multipass =
+        voice_extract_mask(cfg_fmt, NV_PAVS_VOICE_CFG_FMT_MULTIPASS);
+    bool linked =
+        voice_extract_mask(cfg_fmt, NV_PAVS_VOICE_CFG_FMT_LINKED); /* FIXME? */
 
     assert(!multipass); // Multipass is handled before this
 
@@ -1471,52 +1615,39 @@ static void voice_process(MCPXAPUState *d,
     assert(ea_value <= 1.0f);
 
     /*
-     * Silent-voice fast-path #1: envelope amplitude is below a
-     * conservative inaudibility floor. -72 dB (~1/4096) is comfortably
-     * below typical game audio's quietest ambient layer. Halo 2 keeps
-     * many voices "active" in their release tail, all running the
-     * full voice_resample → libsamplerate → LPF → mix chain to
-     * contribute samples that round to zero. State machine state is
-     * already advanced via voice_step_envelope above.
+     * Read mixbin volumes early so the silent-voice check below can use
+     * them. Cache the three TAR_VOL* registers (one per A/B/C) into
+     * locals — each was being re-fetched from guest RAM 3x via
+     * voice_get_mask. Guest-set, immutable across voice_process.
      */
-    if (ea_value < 1.0f / 4096.0f) {
-        return;
-    }
+    hwaddr voice_base_vp = d->regs[NV_PAPU_VPVADDR] + v * NV_PAVS_SIZE;
+    uint32_t tar_vola =
+        mcpx_ram_ldl_le(d, voice_base_vp + NV_PAVS_VOICE_TAR_VOLA);
+    uint32_t tar_volb =
+        mcpx_ram_ldl_le(d, voice_base_vp + NV_PAVS_VOICE_TAR_VOLB);
+    uint32_t tar_volc =
+        mcpx_ram_ldl_le(d, voice_base_vp + NV_PAVS_VOICE_TAR_VOLC);
 
-    /*
-     * Read mixbin volumes early (the values are static reg reads, no
-     * side effects). This lets us short-circuit before voice_resample
-     * — the dominant cost in this function — when the voice is fully
-     * attenuated by the guest's per-bin volume settings even though
-     * its envelope is non-zero (common for sound effects that have
-     * been positioned far away in 3D or hidden behind a wall).
-     */
     uint16_t vol[8];
-    vol[0] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA,
-                            NV_PAVS_VOICE_TAR_VOLA_VOLUME0);
-    vol[1] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA,
-                            NV_PAVS_VOICE_TAR_VOLA_VOLUME1);
-    vol[2] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB,
-                            NV_PAVS_VOICE_TAR_VOLB_VOLUME2);
-    vol[3] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB,
-                            NV_PAVS_VOICE_TAR_VOLB_VOLUME3);
-    vol[4] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLC,
-                            NV_PAVS_VOICE_TAR_VOLC_VOLUME4);
-    vol[5] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLC,
-                            NV_PAVS_VOICE_TAR_VOLC_VOLUME5);
+    vol[0] = voice_extract_mask(tar_vola, NV_PAVS_VOICE_TAR_VOLA_VOLUME0);
+    vol[1] = voice_extract_mask(tar_vola, NV_PAVS_VOICE_TAR_VOLA_VOLUME1);
+    vol[2] = voice_extract_mask(tar_volb, NV_PAVS_VOICE_TAR_VOLB_VOLUME2);
+    vol[3] = voice_extract_mask(tar_volb, NV_PAVS_VOICE_TAR_VOLB_VOLUME3);
+    vol[4] = voice_extract_mask(tar_volc, NV_PAVS_VOICE_TAR_VOLC_VOLUME4);
+    vol[5] = voice_extract_mask(tar_volc, NV_PAVS_VOICE_TAR_VOLC_VOLUME5);
 
-    vol[6] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLC,
-                            NV_PAVS_VOICE_TAR_VOLC_VOLUME6_B11_8) << 8;
-    vol[6] |= voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB,
-                             NV_PAVS_VOICE_TAR_VOLB_VOLUME6_B7_4) << 4;
-    vol[6] |= voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA,
-                             NV_PAVS_VOICE_TAR_VOLA_VOLUME6_B3_0);
-    vol[7] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLC,
-                            NV_PAVS_VOICE_TAR_VOLC_VOLUME7_B11_8) << 8;
-    vol[7] |= voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB,
-                             NV_PAVS_VOICE_TAR_VOLB_VOLUME7_B7_4) << 4;
-    vol[7] |= voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA,
-                             NV_PAVS_VOICE_TAR_VOLA_VOLUME7_B3_0);
+    vol[6] = voice_extract_mask(tar_volc,
+                                NV_PAVS_VOICE_TAR_VOLC_VOLUME6_B11_8) << 8;
+    vol[6] |= voice_extract_mask(tar_volb,
+                                 NV_PAVS_VOICE_TAR_VOLB_VOLUME6_B7_4) << 4;
+    vol[6] |= voice_extract_mask(tar_vola,
+                                 NV_PAVS_VOICE_TAR_VOLA_VOLUME6_B3_0);
+    vol[7] = voice_extract_mask(tar_volc,
+                                NV_PAVS_VOICE_TAR_VOLC_VOLUME7_B11_8) << 8;
+    vol[7] |= voice_extract_mask(tar_volb,
+                                 NV_PAVS_VOICE_TAR_VOLB_VOLUME7_B7_4) << 4;
+    vol[7] |= voice_extract_mask(tar_vola,
+                                 NV_PAVS_VOICE_TAR_VOLA_VOLUME7_B3_0);
 
     uint16_t max_vol = 0;
     for (int i = 0; i < 8; i++) {
@@ -1524,16 +1655,33 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /*
-     * Silent-voice fast-path #2: envelope × max-volume product is
-     * below the audibility threshold. `vol[]` values are NV-format
-     * attenuation registers (interpreted by attenuate() later); a
-     * zero literally means "muted on every mixbin". We approximate
-     * the threshold as `ea_value * (max_vol/65535) < 1/4096`, i.e.
-     * the post-attenuation amplitude is below -72 dB.
+     * Silent-voice detection: envelope below audibility (-72 dB), or
+     * envelope × max-volume below the same threshold. The mix chain
+     * (LPF + attenuate + accumulate) for these voices would contribute
+     * samples that round to zero, so the work is wasted.
+     *
+     * BUT we cannot bail before voice_resample(): voice_get_samples()
+     * (called via the resampler callback) is the path that advances
+     * CBO and triggers voice_off() + set_notify_status(DONE_SUCCESS)
+     * when the buffer drains. The BIOS boot-anim DSND wait loop at
+     * kernel 0x8004edd3 spin-polls bit 0x10000000 of the notifier
+     * waiting for the DONE write. Pre-Halo-2 ramp-up envelopes
+     * (attack starting at 0, or vol=0 before guest pokes volume)
+     * trip these checks → no resample → no notifier → kernel deadlock.
+     * Halo 2 gameplay misses the deadlock because by the time the
+     * fast-path triggers (release tail), the voice has already been
+     * playing long enough that the wait loop is no longer active.
+     *
+     * Fix: pump the buffer first, then skip the mix work.
      */
-    if (max_vol == 0 ||
-        ea_value * ((float)max_vol / 65535.0f) < 1.0f / 4096.0f) {
-        return;
+    enum { SILENT_NO, SILENT_ENV, SILENT_VOL } silent_reason;
+    if (ea_value < 1.0f / 4096.0f) {
+        silent_reason = SILENT_ENV;
+    } else if (max_vol == 0 ||
+               ea_value * ((float)max_vol / 65535.0f) < 1.0f / 4096.0f) {
+        silent_reason = SILENT_VOL;
+    } else {
+        silent_reason = SILENT_NO;
     }
 
     float samples[NUM_SAMPLES_PER_FRAME][2] = { 0 };
@@ -1543,6 +1691,16 @@ static void voice_process(MCPXAPUState *d,
     dbg->multipass = multipass;
 
     if (multipass) {
+        /* Multipass voices have no sample buffer to advance — they
+         * re-mix from a mixbin sub-bus. Safe to bail immediately. */
+        if (silent_reason != SILENT_NO) {
+            if (silent_reason == SILENT_ENV) {
+                d->vp.voice_work_dispatch.trace_silent_env++;
+            } else {
+                d->vp.voice_work_dispatch.trace_silent_vol++;
+            }
+            return;
+        }
         get_multipass_samples(d, mixbins, v, samples);
     } else {
         for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
@@ -1568,23 +1726,37 @@ static void voice_process(MCPXAPUState *d,
         return;
     }
 
+    if (silent_reason != SILENT_NO) {
+        if (silent_reason == SILENT_ENV) {
+            d->vp.voice_work_dispatch.trace_silent_env++;
+        } else {
+            d->vp.voice_work_dispatch.trace_silent_vol++;
+        }
+        return;
+    }
+
+    d->vp.voice_work_dispatch.trace_processed++;
+
+    /*
+     * Cache CFG_VBIN (6 reads → 1) and CFG_FMT (additional 2 reads for
+     * V6BIN/V7BIN folded into one read alongside the earlier MULTIPASS
+     * fetch). Both are guest-set config registers, immutable across
+     * voice_process.
+     */
+    uint32_t cfg_vbin =
+        mcpx_ram_ldl_le(d, voice_base_vp + NV_PAVS_VOICE_CFG_VBIN);
+    uint32_t cfg_fmt_vp =
+        mcpx_ram_ldl_le(d, voice_base_vp + NV_PAVS_VOICE_CFG_FMT);
+
     int bin[8];
-    bin[0] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN,
-                            NV_PAVS_VOICE_CFG_VBIN_V0BIN);
-    bin[1] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN,
-                            NV_PAVS_VOICE_CFG_VBIN_V1BIN);
-    bin[2] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN,
-                            NV_PAVS_VOICE_CFG_VBIN_V2BIN);
-    bin[3] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN,
-                            NV_PAVS_VOICE_CFG_VBIN_V3BIN);
-    bin[4] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN,
-                            NV_PAVS_VOICE_CFG_VBIN_V4BIN);
-    bin[5] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN,
-                            NV_PAVS_VOICE_CFG_VBIN_V5BIN);
-    bin[6] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
-                            NV_PAVS_VOICE_CFG_FMT_V6BIN);
-    bin[7] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
-                            NV_PAVS_VOICE_CFG_FMT_V7BIN);
+    bin[0] = voice_extract_mask(cfg_vbin, NV_PAVS_VOICE_CFG_VBIN_V0BIN);
+    bin[1] = voice_extract_mask(cfg_vbin, NV_PAVS_VOICE_CFG_VBIN_V1BIN);
+    bin[2] = voice_extract_mask(cfg_vbin, NV_PAVS_VOICE_CFG_VBIN_V2BIN);
+    bin[3] = voice_extract_mask(cfg_vbin, NV_PAVS_VOICE_CFG_VBIN_V3BIN);
+    bin[4] = voice_extract_mask(cfg_vbin, NV_PAVS_VOICE_CFG_VBIN_V4BIN);
+    bin[5] = voice_extract_mask(cfg_vbin, NV_PAVS_VOICE_CFG_VBIN_V5BIN);
+    bin[6] = voice_extract_mask(cfg_fmt_vp, NV_PAVS_VOICE_CFG_FMT_V6BIN);
+    bin[7] = voice_extract_mask(cfg_fmt_vp, NV_PAVS_VOICE_CFG_FMT_V7BIN);
 
     if (v < MCPX_HW_MAX_3D_VOICES) {
         bin[0] = d->vp.hrtf_submix[0];
@@ -1809,6 +1981,10 @@ static void *voice_worker_thread(void *arg)
                 voice_process(d, self->mixbins, self->sample_buf,
                               self->queue[i].voice, self->queue[i].list);
             }
+            /* Flush coalesced guest-RAM dirty marks accumulated by the
+             * mcpx_ram_st* helpers across this batch of voice_process
+             * calls. See the batcher comment near mcpx_ram_dirty_mark. */
+            mcpx_ram_dirty_flush();
 
             qemu_mutex_lock(&vwd->lock);
 
@@ -1933,6 +2109,15 @@ static void voice_work_schedule(MCPXAPUState *d)
     }
 }
 
+#include "../audio_trace.h"
+
+/* Forward decl for the audio-trace emit helper at the bottom of this
+ * file. Inline to keep the disabled-path cheap (single load). */
+#ifdef __ANDROID__
+static void audio_trace_emit_vdisp(VoiceWorkDispatch *vwd, int total_voices,
+                                   int64_t start_us, const char *mode);
+#endif
+
 static void
 voice_work_dispatch(MCPXAPUState *d,
                     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
@@ -1943,7 +2128,24 @@ voice_work_dispatch(MCPXAPUState *d,
 
     qemu_mutex_lock(&vwd->lock);
 
+    /* Reset audio-trace counters BEFORE the frame's work so they
+     * accumulate over exactly one dispatch period. Cheap; same cache
+     * line we just locked. */
+    vwd->trace_silent_env = 0;
+    vwd->trace_silent_vol = 0;
+    vwd->trace_processed  = 0;
+    int trace_queue_len_start = vwd->queue_len;
+
     if (vwd->queue_len) {
+        /*
+         * Inline-threshold removed 2026-05-21: with wider tier-2
+         * Cranelift coverage giving the vCPU more headroom, the audio
+         * thread was running enough voices per frame that the inline
+         * path held vwd->lock long enough to slip frame production
+         * cadence (audible gaps). Fall back to the original
+         * num_workers==1 inline path (used only on tiny SoCs) and
+         * fanout-always for num_workers>1.
+         */
         if (vwd->num_workers == 1) {
             VoiceWorker *worker = &vwd->workers[0];
             int voice_count = vwd->queue_len;
@@ -1957,6 +2159,8 @@ voice_work_dispatch(MCPXAPUState *d,
                 voice_process(d, worker->mixbins, worker->sample_buf,
                               vwd->queue[i].voice, vwd->queue[i].list);
             }
+            /* Inline-path flush: same rationale as the worker-thread one. */
+            mcpx_ram_dirty_flush();
 
             voice_work_release_voice_locks(d);
             vwd->queue_len = 0;
@@ -1977,6 +2181,10 @@ voice_work_dispatch(MCPXAPUState *d,
             g_dbg.vp.workers[0].time_us =
                 qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_time;
             g_dbg.vp.total_worker_time_us = g_dbg.vp.workers[0].time_us;
+#ifdef __ANDROID__
+            audio_trace_emit_vdisp(vwd, trace_queue_len_start,
+                                   start_time, "inline");
+#endif
             qemu_mutex_unlock(&vwd->lock);
             return;
         }
@@ -2002,8 +2210,53 @@ voice_work_dispatch(MCPXAPUState *d,
     int64_t end_time = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     g_dbg.vp.total_worker_time_us = end_time - start_time;
 
+#ifdef __ANDROID__
+    audio_trace_emit_vdisp(vwd, trace_queue_len_start, start_time,
+                           vwd->num_workers == 1 ? "inline" : "fanout");
+#endif
+
     qemu_mutex_unlock(&vwd->lock);
 }
+
+#ifdef __ANDROID__
+/*
+ * audio-trace per-frame voice-dispatch summary.
+ *
+ * Called once per audio frame (~187 Hz) after vwd->queue_len has been
+ * drained. Reads the trace counters that voice_process incremented and
+ * emits a hakuX-apu-vdisp logcat line so the audio_trace_analyze MCP
+ * tool can correlate voice-count bursts with audio FIFO underruns.
+ *
+ * Format mirrors the prod/cons/throt lines:
+ *   hakuX-apu-vdisp: t=<ns> total=<n> silent_env=<n> silent_vol=<n>
+ *                    processed=<n> work_us=<us> mode=<inline|fanout>
+ *
+ * - total       : voices enqueued for this frame (vwd->queue_len at entry)
+ * - silent_env  : early-out via fast-path #1 (ea_value < 1/4096)
+ * - silent_vol  : early-out via fast-path #2 (ea * max_vol < 1/4096)
+ * - processed   : made it through both gates (silent_env + silent_vol +
+ *                 processed need not equal total — voice_lock waiters
+ *                 might be skipped and re-counted on a later frame)
+ *
+ * Gated by audio_trace_enabled(); single-load fast-path when off.
+ */
+/* audio_trace_enabled() / audio_trace_now_ns() come from audio_trace.h
+ * (included at the top of this TU). They are static-inline so the
+ * disabled fast-path is a single load. */
+static void audio_trace_emit_vdisp(VoiceWorkDispatch *vwd, int total_voices,
+                                   int64_t start_us, const char *mode)
+{
+    if (!audio_trace_enabled()) return;
+    int64_t now_ns = audio_trace_now_ns();
+    int64_t work_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us;
+    __android_log_print(ANDROID_LOG_INFO, "hakuX-apu-vdisp",
+        "t=%lld total=%d silent_env=%u silent_vol=%u processed=%u "
+        "work_us=%lld mode=%s",
+        (long long)now_ns, total_voices,
+        vwd->trace_silent_env, vwd->trace_silent_vol, vwd->trace_processed,
+        (long long)work_us, mode);
+}
+#endif
 
 static int mcpx_apu_default_vp_worker_count(void)
 {

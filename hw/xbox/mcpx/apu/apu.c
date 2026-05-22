@@ -24,10 +24,13 @@
 #include <android/log.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
 MCPXAPUState *g_state; // Used via debug handlers
+
+#include "audio_trace.h"
 
 static void update_irq(MCPXAPUState *d)
 {
@@ -138,6 +141,11 @@ static void throttle(MCPXAPUState *d)
     int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     int queued_bytes = monitor_num_used_bytes(d);
 
+#ifdef __ANDROID__
+    int64_t _ffwait_t0 = audio_trace_enabled() ? audio_trace_now_ns() : 0;
+    int _ffwait_qb_entry = queued_bytes;
+    int _ffwait_iters = 0;
+#endif
     while (!qatomic_read(&d->exiting) &&
            queued_bytes >= d->monitor.queued_bytes_high) {
         qemu_cond_timedwait(&d->cond, &d->lock, EP_FRAME_US / 1000);
@@ -145,7 +153,28 @@ static void throttle(MCPXAPUState *d)
             break;
         }
         queued_bytes = monitor_num_used_bytes(d);
+#ifdef __ANDROID__
+        _ffwait_iters++;
+#endif
     }
+#ifdef __ANDROID__
+    /* If we spent more than one EP_FRAME_US (5.33ms) in the FIFO-full
+     * wait, the consumer is draining slower than the producer wants to
+     * push. That's the upstream stall when audio backend gates the
+     * callback. Log entry queue depth + iteration count + total time so
+     * the analyzer can correlate with consumer-gap events. */
+    if (audio_trace_enabled() && _ffwait_iters > 0) {
+        int64_t wait_us = (audio_trace_now_ns() - _ffwait_t0) / 1000;
+        if (wait_us > 5000) {
+            __android_log_print(ANDROID_LOG_WARN, "hakuX-apu-bql",
+                "t=%lld kind=ffwait wait_us=%lld qb_entry=%d "
+                "qb_exit=%d iters=%d",
+                (long long)audio_trace_now_ns(),
+                (long long)wait_us, _ffwait_qb_entry,
+                queued_bytes, _ffwait_iters);
+        }
+    }
+#endif
 
 #ifdef __ANDROID__
     /* Allow the deadline to slip by ~8 audio frames (~43 ms) before
@@ -163,6 +192,16 @@ static void throttle(MCPXAPUState *d)
         int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         if (d->next_frame_time_us == 0 ||
             now_us - d->next_frame_time_us > catchup_limit_us) {
+#ifdef __ANDROID__
+            if (audio_trace_enabled() && d->next_frame_time_us != 0) {
+                int64_t slip_us = now_us - d->next_frame_time_us;
+                int64_t now_ns = audio_trace_now_ns();
+                __android_log_print(ANDROID_LOG_WARN, "hakuX-apu-throt",
+                    "t=%lld reason=deadline qb=%d slip_us=%lld limit_us=%lld",
+                    (long long)now_ns, queued_bytes,
+                    (long long)slip_us, (long long)catchup_limit_us);
+            }
+#endif
             d->next_frame_time_us = now_us;
         }
         while (!qatomic_read(&d->exiting)) {
@@ -234,6 +273,22 @@ static void se_frame(MCPXAPUState *d)
         }
 
         if (d->monitor.fifo_capacity_bytes > 0) {
+            /* Compute peak |sample| over the 256-frame buffer BEFORE the
+             * push so the trace records the actual amplitude we're about
+             * to enqueue. Same s16 values regardless of output format,
+             * since float conversion is value-preserving. */
+            int trace_peak = 0;
+            if (audio_trace_enabled()) {
+                for (int i = 0; i < 256; i++) {
+                    int l = d->monitor.frame_buf[i][0];
+                    int r = d->monitor.frame_buf[i][1];
+                    int al = l < 0 ? -l : l;
+                    int ar = r < 0 ? -r : r;
+                    if (al > trace_peak) trace_peak = al;
+                    if (ar > trace_peak) trace_peak = ar;
+                }
+            }
+            int trace_q_pre = 0, trace_q_post = 0;
             if (d->monitor.output_is_float) {
                 /* Convert s16 → float32 in normalized [-1, 1] range to match
                  * AAUDIO_FORMAT_PCM_FLOAT semantics. */
@@ -243,19 +298,41 @@ static void se_frame(MCPXAPUState *d)
                     fbuf[i][1] = (float)d->monitor.frame_buf[i][1] / 32768.0f;
                 }
                 qemu_spin_lock(&d->monitor.fifo_lock);
+                if (audio_trace_enabled()) {
+                    trace_q_pre = (int)fifo8_num_used(&d->monitor.fifo);
+                }
                 int num_bytes_free = (int)fifo8_num_free(&d->monitor.fifo);
                 assert(num_bytes_free >= sizeof(fbuf));
                 fifo8_push_all(&d->monitor.fifo, (uint8_t *)fbuf, sizeof(fbuf));
+                if (audio_trace_enabled()) {
+                    trace_q_post = (int)fifo8_num_used(&d->monitor.fifo);
+                }
                 qemu_spin_unlock(&d->monitor.fifo_lock);
             } else {
                 qemu_spin_lock(&d->monitor.fifo_lock);
+                if (audio_trace_enabled()) {
+                    trace_q_pre = (int)fifo8_num_used(&d->monitor.fifo);
+                }
                 int num_bytes_free = (int)fifo8_num_free(&d->monitor.fifo);
                 assert(num_bytes_free >= sizeof(d->monitor.frame_buf));
                 fifo8_push_all(&d->monitor.fifo,
                                (uint8_t *)d->monitor.frame_buf,
                                sizeof(d->monitor.frame_buf));
+                if (audio_trace_enabled()) {
+                    trace_q_post = (int)fifo8_num_used(&d->monitor.fifo);
+                }
                 qemu_spin_unlock(&d->monitor.fifo_lock);
             }
+#ifdef __ANDROID__
+            if (audio_trace_enabled()) {
+                int64_t now_ns = audio_trace_now_ns();
+                int64_t work_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us;
+                __android_log_print(ANDROID_LOG_INFO, "hakuX-apu-prod",
+                    "t=%lld q_pre=%d q_post=%d peak=%d work_us=%lld div=%d",
+                    (long long)now_ns, trace_q_pre, trace_q_post,
+                    trace_peak, (long long)work_us, d->ep_frame_div);
+            }
+#endif
         }
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
     }
@@ -305,6 +382,9 @@ static int getenv_int_clamped(const char *name, int min_value, int max_value,
 static void monitor_sink_cb(void *opaque, uint8_t *stream, int free_b)
 {
     MCPXAPUState *s = MCPX_APU_DEVICE(opaque);
+#ifdef __ANDROID__
+    int64_t _cb_entry_ns = audio_trace_enabled() ? audio_trace_now_ns() : 0;
+#endif
 
     if (!runstate_is_running()) {
         memset(stream, 0, free_b);
@@ -343,9 +423,25 @@ static void monitor_sink_cb(void *opaque, uint8_t *stream, int free_b)
      * Hardware audio devices already have anti-click filtering at the
      * output stage; a clean silence gap is less perceptible than a
      * sub-ms ramp imposed on every callback boundary. */
-    if (copied < free_b) {
+    bool trace_underrun = copied < free_b;
+    if (trace_underrun) {
         memset(stream + copied, 0, free_b - copied);
     }
+
+#ifdef __ANDROID__
+    if (audio_trace_enabled()) {
+        int64_t now_ns = audio_trace_now_ns();
+        /* dur_us tells us how long OUR code held the callback. If the
+         * inter-callback gap is long but dur_us is small, the audio
+         * backend isn't calling us. If dur_us itself is large, our
+         * own code (spin_lock, broadcast) is the slow part. */
+        int64_t dur_us = (now_ns - _cb_entry_ns) / 1000;
+        __android_log_print(ANDROID_LOG_INFO, "hakuX-apu-cons",
+            "t=%lld req=%d avail=%d copied=%d underrun=%d dur_us=%lld",
+            (long long)now_ns, free_b, avail, copied,
+            trace_underrun ? 1 : 0, (long long)dur_us);
+    }
+#endif
 
     qemu_cond_broadcast(&s->cond);
 }
@@ -362,10 +458,30 @@ static void monitor_init(MCPXAPUState *d)
     int fifo_frames = 3;
     int audio_samples = 512;
 #ifdef __ANDROID__
-    /* Give Android more audio headroom to ride out scheduling stalls. */
-    fifo_frames = 24;
+    /*
+     * SDL's OpenSL ES backend on Tensor (Pixel 10a) drains the audio device
+     * in tight callback BURSTS rather than one-at-a-time at the per-buffer
+     * rate. Observed pattern (traced via hakuX-apu-cons, 2026-05-21): a
+     * burst of N callbacks fires ~100 µs apart, drains everything in the
+     * FIFO, returns silence for the remaining N - satisfied callbacks,
+     * then sleeps ~340 ms before the next burst. The user-perceived gap
+     * (100 ms per 400 ms cycle, with small pops at the boundary) is the
+     * difference: chunks-we-could-fill vs chunks-the-device-asked-for.
+     *
+     * The previous bump from (16, 512) → (24, 2048) increased the per-
+     * callback request from 2 KiB → 8 KiB (4×) but only grew the FIFO 1.5×,
+     * so the FIFO-to-burst ratio went from ~8 down to ~3 — exactly the
+     * ratio of audible-to-silent chunks in the trace.
+     *
+     * Fix: keep audio_samples=2048 for the 43 ms stall tolerance it
+     * provides, but size the FIFO to hold a full 8-callback burst (8 ×
+     * 8192 = 64 KiB ≈ 64 frames of 1024 B each, or ~1.3 s headroom).
+     * Raise the env clamp ceiling so users can override further if their
+     * device's OpenSL ES queue is even deeper.
+     */
+    fifo_frames = 96;
     audio_samples = 2048;
-    fifo_frames = getenv_int_clamped("XEMU_ANDROID_AUDIO_FIFO_FRAMES", 3, 32,
+    fifo_frames = getenv_int_clamped("XEMU_ANDROID_AUDIO_FIFO_FRAMES", 3, 256,
                                      fifo_frames);
     audio_samples = getenv_int_clamped("XEMU_ANDROID_AUDIO_SAMPLES", 256, 4096,
                                        audio_samples);
@@ -442,7 +558,31 @@ static void monitor_init(MCPXAPUState *d)
     int max_high = MAX(fifo_capacity_bytes - frame_bytes, frame_bytes);
     d->monitor.fifo_capacity_bytes = fifo_capacity_bytes;
     d->monitor.device_buffer_bytes = device_buffer_bytes;
+#ifdef __ANDROID__
+    /*
+     * OpenSL ES on Tensor (Pixel 10a) drains the device in a tight burst
+     * of N callbacks (observed N≈8, each req=8 KiB at audio_samples=2048),
+     * spaced ~340 ms apart. The producer THROTTLE WATERMARK caps the FIFO
+     * fill level — at 3×drain_bytes the producer stops at 24 KiB, so only
+     * ~3 of the 8 callbacks in each burst find samples; the remaining 5
+     * memset to silence (audible as the 100 ms gap per 400 ms cycle).
+     *
+     * Bump the high watermark to 8×drain_bytes so the FIFO can hold an
+     * entire burst worth (≈64 KiB at audio_samples=2048). max_high already
+     * clamps us to fifo_capacity − frame_bytes, so this is safe even on
+     * smaller-FIFO configurations. Once a burst is fully serviced, the
+     * device's internal queue spans the 340 ms gap; the producer refills
+     * during that quiet period and the next burst lands on a full FIFO.
+     *
+     * If audio is still stuttering on a device with a larger OpenSL ES
+     * queue, the next step is the adaptive PI controller — keep the
+     * capacity at 96 frames but learn N from the trace and tune the
+     * watermark to N×drain_bytes at runtime.
+     */
+    d->monitor.queued_bytes_high = MIN(8 * drain_bytes, max_high);
+#else
     d->monitor.queued_bytes_high = MIN(3 * drain_bytes, max_high);
+#endif
     d->monitor.queued_bytes_low = MIN(drain_bytes, d->monitor.queued_bytes_high);
 
     SDL_PauseAudioDevice(sdl_audio_dev, 0);
@@ -746,10 +886,45 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         if (d->set_irq) {
             qemu_mutex_unlock(&d->lock);
+#ifdef __ANDROID__
+            /* Time bql_lock to detect BQL contention. The vCPU often
+             * holds BQL during MMIO emulation or DMA dispatch; if it
+             * hangs onto it for >10ms our apu_thread blocks here. */
+            int64_t _bql_t0 = audio_trace_enabled()
+                              ? audio_trace_now_ns() : 0;
+#endif
             bql_lock();
+#ifdef __ANDROID__
+            if (audio_trace_enabled()) {
+                int64_t bql_acq_ns = audio_trace_now_ns() - _bql_t0;
+                /* Only log slow acquisitions to keep logcat sane —
+                 * sub-ms is the steady-state. */
+                if (bql_acq_ns > 1000000LL) {
+                    __android_log_print(ANDROID_LOG_WARN, "hakuX-apu-bql",
+                        "t=%lld kind=bql_lock acq_us=%lld",
+                        (long long)audio_trace_now_ns(),
+                        (long long)(bql_acq_ns / 1000));
+                }
+            }
+#endif
             update_irq(d);
             bql_unlock();
+#ifdef __ANDROID__
+            int64_t _dlock_t0 = audio_trace_enabled()
+                                ? audio_trace_now_ns() : 0;
+#endif
             qemu_mutex_lock(&d->lock);
+#ifdef __ANDROID__
+            if (audio_trace_enabled()) {
+                int64_t dlock_acq_ns = audio_trace_now_ns() - _dlock_t0;
+                if (dlock_acq_ns > 1000000LL) {
+                    __android_log_print(ANDROID_LOG_WARN, "hakuX-apu-bql",
+                        "t=%lld kind=dlock_post_irq acq_us=%lld",
+                        (long long)audio_trace_now_ns(),
+                        (long long)(dlock_acq_ns / 1000));
+                }
+            }
+#endif
             d->set_irq = false;
         }
 
@@ -785,8 +960,31 @@ static void *mcpx_apu_frame_thread(void *arg)
          *   - DSP state is guarded by the per-DSP locks
          */
         qemu_mutex_unlock(&d->lock);
+#ifdef __ANDROID__
+        int64_t _se_t0 = audio_trace_enabled() ? audio_trace_now_ns() : 0;
+#endif
         se_frame((void *)d);
+#ifdef __ANDROID__
+        int64_t _dlock_t1 = audio_trace_enabled() ? audio_trace_now_ns() : 0;
+#endif
         qemu_mutex_lock(&d->lock);
+#ifdef __ANDROID__
+        if (audio_trace_enabled()) {
+            int64_t now_ns = audio_trace_now_ns();
+            int64_t se_ns = _dlock_t1 - _se_t0;
+            int64_t dlock_acq_ns = now_ns - _dlock_t1;
+            /* Only emit when slow — keeps the log signal clean. >5ms is
+             * already past the audio frame budget so anything over that
+             * is interesting. */
+            if (se_ns > 5000000LL || dlock_acq_ns > 1000000LL) {
+                __android_log_print(ANDROID_LOG_WARN, "hakuX-apu-bql",
+                    "t=%lld kind=se_or_dlock se_us=%lld dlock_us=%lld",
+                    (long long)now_ns,
+                    (long long)(se_ns / 1000),
+                    (long long)(dlock_acq_ns / 1000));
+            }
+        }
+#endif
     }
     qemu_mutex_unlock(&d->lock);
     return NULL;

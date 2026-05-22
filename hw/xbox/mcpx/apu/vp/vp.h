@@ -74,6 +74,19 @@ typedef struct VoiceWorkDispatch {
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     VoiceWorkItem queue[MCPX_HW_MAX_VOICES];
     int queue_len;
+    /* Audio-trace counters, incremented per-voice from voice_process and
+     * read+reset from voice_work_dispatch each frame. All increments
+     * happen on worker threads (or the inline-mode apu_thread); the read
+     * is single-threaded under vwd->lock so a non-atomic uint32 is fine.
+     * Numbers are best-effort; the trace consumer doesn't need them to be
+     * race-free, only consistently within an order-of-magnitude.
+     *
+     *   silent_env  = early-out via fast-path #1 (ea_value < 1/4096)
+     *   silent_vol  = early-out via fast-path #2 (ea * max_vol < 1/4096)
+     *   processed   = made it through both gates into voice_resample */
+    uint32_t trace_silent_env;
+    uint32_t trace_silent_vol;
+    uint32_t trace_processed;
 } VoiceWorkDispatch;
 
 typedef struct {
