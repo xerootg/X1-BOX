@@ -112,6 +112,186 @@ void x87lib_apply_status_flags(uint16_t sw, float_status *status)
     *dst = from_lib(out);                                            \
     return sw
 
+/* Basic arithmetic — bit-exact mantissa match against real Intel x87
+ * hardware (per lib readme: 100% on these ops). Caller MUST OR the
+ * returned SW bits into env->fp_status via x87lib_apply_status_flags
+ * if it cares about exception/inexact flags. */
+uint16_t x87lib_fadd(floatx80 src1, floatx80 src2, floatx80 *dst,
+                     float_status *st)
+{
+    LIB_BINARY(x87_fadd);
+}
+
+uint16_t x87lib_fsub(floatx80 src1, floatx80 src2, floatx80 *dst,
+                     float_status *st)
+{
+    LIB_BINARY(x87_fsub);
+}
+
+uint16_t x87lib_fsubr(floatx80 src1, floatx80 src2, floatx80 *dst,
+                      float_status *st)
+{
+    LIB_BINARY(x87_fsubr);
+}
+
+uint16_t x87lib_fmul(floatx80 src1, floatx80 src2, floatx80 *dst,
+                     float_status *st)
+{
+    LIB_BINARY(x87_fmul);
+}
+
+uint16_t x87lib_fdiv(floatx80 src1, floatx80 src2, floatx80 *dst,
+                     float_status *st)
+{
+    LIB_BINARY(x87_fdiv);
+}
+
+uint16_t x87lib_fdivr(floatx80 src1, floatx80 src2, floatx80 *dst,
+                      float_status *st)
+{
+    LIB_BINARY(x87_fdivr);
+}
+
+uint16_t x87lib_fxam(floatx80 src)
+{
+    return x87::fp80_t::x87_fxam(to_lib(src));
+}
+
+uint16_t x87lib_ftst(floatx80 src)
+{
+    return x87::fp80_t::x87_ftst(to_lib(src));
+}
+
+uint16_t x87lib_fcom(floatx80 src1, floatx80 src2)
+{
+    return x87::fp80_t::x87_fcom(to_lib(src1), to_lib(src2));
+}
+
+uint16_t x87lib_fucom(floatx80 src1, floatx80 src2)
+{
+    return x87::fp80_t::x87_fucom(to_lib(src1), to_lib(src2));
+}
+
+uint16_t x87lib_fcomi(floatx80 src1, floatx80 src2)
+{
+    return x87::fp80_t::x87_fcomi(to_lib(src1), to_lib(src2));
+}
+
+uint16_t x87lib_fucomi(floatx80 src1, floatx80 src2)
+{
+    return x87::fp80_t::x87_fucomi(to_lib(src1), to_lib(src2));
+}
+
+/* --- Conversions ---
+ *
+ * The lib's load helpers (x87_fld32 / fld64 / fild16/32/64) take cw+sw via
+ * reference + dst by reference + src by void*. We marshal in our own
+ * scope-installed rounding mode and discard the lib's sw output (fpu_helper
+ * conversion helpers don't propagate exception flags except where they
+ * already raised them manually). Pattern mirrors the as_*() member helpers
+ * in x87fp80.h that the lib uses internally. */
+
+#define LIB_LOAD_FROM(SrcT, LIB_OP)                                  \
+    rounding_scope _scope(st);                                       \
+    x87::fp80_t out;                                                 \
+    x87::x87sw_t sw;                                                 \
+    x87::fp80_t::LIB_OP(x87::fpround_t::get(), sw, out, &val);       \
+    (void)sw;                                                        \
+    return from_lib(out)
+
+#define LIB_STORE_TO(DstT, LIB_OP)                                   \
+    rounding_scope _scope(st);                                       \
+    DstT out;                                                        \
+    x87::x87sw_t sw;                                                 \
+    x87::fp80_t::LIB_OP(x87::fpround_t::get(), sw, &out, to_lib(src)); \
+    (void)sw;                                                        \
+    return out
+
+floatx80 x87lib_float32_to_floatx80(float32 val, float_status *st)
+{
+    LIB_LOAD_FROM(float32, x87_fld32);
+}
+
+floatx80 x87lib_float64_to_floatx80(float64 val, float_status *st)
+{
+    LIB_LOAD_FROM(float64, x87_fld64);
+}
+
+floatx80 x87lib_int16_to_floatx80(int16_t val, float_status *st)
+{
+    LIB_LOAD_FROM(int16_t, x87_fild16);
+}
+
+floatx80 x87lib_int32_to_floatx80(int32_t val, float_status *st)
+{
+    LIB_LOAD_FROM(int32_t, x87_fild32);
+}
+
+floatx80 x87lib_int64_to_floatx80(int64_t val, float_status *st)
+{
+    LIB_LOAD_FROM(int64_t, x87_fild64);
+}
+
+float32 x87lib_floatx80_to_float32(floatx80 src, float_status *st)
+{
+    LIB_STORE_TO(float32, x87_fst32);
+}
+
+float64 x87lib_floatx80_to_float64(floatx80 src, float_status *st)
+{
+    LIB_STORE_TO(float64, x87_fst64);
+}
+
+int16_t x87lib_floatx80_to_int16(floatx80 src, float_status *st)
+{
+    LIB_STORE_TO(int16_t, x87_fist16);
+}
+
+int32_t x87lib_floatx80_to_int32(floatx80 src, float_status *st)
+{
+    LIB_STORE_TO(int32_t, x87_fist32);
+}
+
+int64_t x87lib_floatx80_to_int64(floatx80 src, float_status *st)
+{
+    LIB_STORE_TO(int64_t, x87_fist64);
+}
+
+/* Truncating int stores (FISTT* opcode group): force round-toward-zero
+ * for the duration of this call regardless of the guest's float_status. */
+int16_t x87lib_floatx80_to_int16_trunc(floatx80 src, float_status *st)
+{
+    (void)st;
+    x87::fpround_t guard(X87CW_ROUNDING_ZERO);
+    int16_t out;
+    x87::x87sw_t sw;
+    x87::fp80_t::x87_fist16(x87::fpround_t::get(), sw, &out, to_lib(src));
+    (void)sw;
+    return out;
+}
+
+int32_t x87lib_floatx80_to_int32_trunc(floatx80 src, float_status *st)
+{
+    (void)st;
+    x87::fpround_t guard(X87CW_ROUNDING_ZERO);
+    int32_t out;
+    x87::x87sw_t sw;
+    x87::fp80_t::x87_fist32(x87::fpround_t::get(), sw, &out, to_lib(src));
+    (void)sw;
+    return out;
+}
+
+int64_t x87lib_floatx80_to_int64_trunc(floatx80 src, float_status *st)
+{
+    (void)st;
+    x87::fpround_t guard(X87CW_ROUNDING_ZERO);
+    int64_t out;
+    x87::x87sw_t sw;
+    x87::fp80_t::x87_fist64(x87::fpround_t::get(), sw, &out, to_lib(src));
+    (void)sw;
+    return out;
+}
+
 uint16_t x87lib_f2xm1(floatx80 src, floatx80 *dst, float_status *st)
 {
     LIB_UNARY(x87_f2xm1);

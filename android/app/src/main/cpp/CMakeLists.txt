@@ -170,7 +170,7 @@ FetchContent_MakeAvailable(nv2a_vsh_cpu)
 # ISA, with a runtime toggle (xemu_set_x87_lib / setting_x87_lib).
 # Upstream has no CMakeLists; we build the .cpp files into a static lib
 # and link it into xemu_core.
-set(X87_GIT_REV "06813043aeac40d34a522bc3137cbf3338179385")
+set(X87_GIT_REV "4b7806824f35df894ba643110c4ca17f27e55dd9")
 FetchContent_Declare(
   x87
   GIT_REPOSITORY "https://github.com/xerootg/x87.git"

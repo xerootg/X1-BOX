@@ -33,6 +33,52 @@ void xemu_set_x87_lib(bool enable);
 /* Translate x87 SW exception bits to softfloat float_flag_* mask. */
 void x87lib_apply_status_flags(uint16_t sw, float_status *status);
 
+/* Basic arithmetic. Return x87 SW exception bits.
+ * Hot in SS2 (Serious Engine 2 hits floatx80_mul / floatx80_addsub
+ * for ~5% combined CPU) — wiring these through the bit-exact lib lets
+ * fpu_helper.c skip the soft-float path when xemu_get_x87_lib() is on. */
+uint16_t x87lib_fadd    (floatx80 src1, floatx80 src2, floatx80 *dst,
+                         float_status *st);
+uint16_t x87lib_fsub    (floatx80 src1, floatx80 src2, floatx80 *dst,
+                         float_status *st);
+uint16_t x87lib_fsubr   (floatx80 src1, floatx80 src2, floatx80 *dst,
+                         float_status *st);
+uint16_t x87lib_fmul    (floatx80 src1, floatx80 src2, floatx80 *dst,
+                         float_status *st);
+uint16_t x87lib_fdiv    (floatx80 src1, floatx80 src2, floatx80 *dst,
+                         float_status *st);
+uint16_t x87lib_fdivr   (floatx80 src1, floatx80 src2, floatx80 *dst,
+                         float_status *st);
+
+/* Compares. Return x87 SW C0/C2/C3 bits (no dst). */
+uint16_t x87lib_fxam    (floatx80 src);
+uint16_t x87lib_ftst    (floatx80 src);
+uint16_t x87lib_fcom    (floatx80 src1, floatx80 src2);
+uint16_t x87lib_fucom   (floatx80 src1, floatx80 src2);
+uint16_t x87lib_fcomi   (floatx80 src1, floatx80 src2);
+uint16_t x87lib_fucomi  (floatx80 src1, floatx80 src2);
+
+/* Float / int <-> floatx80 conversions. Equivalent to the
+ * float32_to_floatx80 / floatx80_to_float32 / int32_to_floatx80 /
+ * floatx80_to_int32 family in fpu_helper.c — wires the conversion
+ * helpers (hot SS2 bridge symbols, 0.86% + 0.78% of TCG) through the
+ * lib's bit-exact x87_fld* / x87_fst* / x87_fild* / x87_fist* ops.
+ * Truncating variants exist for the FISTT* opcode group. */
+floatx80 x87lib_float32_to_floatx80 (float32 val, float_status *st);
+floatx80 x87lib_float64_to_floatx80 (float64 val, float_status *st);
+floatx80 x87lib_int16_to_floatx80   (int16_t val, float_status *st);
+floatx80 x87lib_int32_to_floatx80   (int32_t val, float_status *st);
+floatx80 x87lib_int64_to_floatx80   (int64_t val, float_status *st);
+
+float32 x87lib_floatx80_to_float32  (floatx80 src, float_status *st);
+float64 x87lib_floatx80_to_float64  (floatx80 src, float_status *st);
+int16_t x87lib_floatx80_to_int16    (floatx80 src, float_status *st);
+int32_t x87lib_floatx80_to_int32    (floatx80 src, float_status *st);
+int64_t x87lib_floatx80_to_int64    (floatx80 src, float_status *st);
+int16_t x87lib_floatx80_to_int16_trunc(floatx80 src, float_status *st);
+int32_t x87lib_floatx80_to_int32_trunc(floatx80 src, float_status *st);
+int64_t x87lib_floatx80_to_int64_trunc(floatx80 src, float_status *st);
+
 /* Transcendentals. Return x87 SW exception bits. */
 uint16_t x87lib_f2xm1   (floatx80 src, floatx80 *dst, float_status *st);
 uint16_t x87lib_fyl2x   (floatx80 src1, floatx80 src2, floatx80 *dst,
