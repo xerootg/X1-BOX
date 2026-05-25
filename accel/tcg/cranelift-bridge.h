@@ -202,6 +202,13 @@ void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
                                 unsigned *chain_max, uint32_t *jitter);
 
 /*
+ * Per-thread 2-slot LRU stats for helper_lookup_tb_ptr.
+ * Hit/miss counters across all vCPU threads (best-effort, racey writes
+ * tolerated; reader sees one of the in-flight values).
+ */
+void cranelift_get_helper_lookup_tb_lru_stats(uint64_t *hits, uint64_t *misses);
+
+/*
  * Target-side helper: returns the top 16 bits of the guest stack pointer
  * (ESP & ~0xFFFFu on x86). Used by the chain-continue thread fingerprint.
  * Defined in target/i386/cpu.c so the accel-side stays target-opaque

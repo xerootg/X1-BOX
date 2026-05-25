@@ -1657,6 +1657,15 @@ void cranelift_bridge_log_stats(void)
            runs, iters,
            avg_iters_x100 / 100, avg_iters_x100 % 100,
            spins, irq_exits, chain_max, jitter, thread_count);
+
+    uint64_t lru_hits = 0, lru_misses = 0;
+    cranelift_get_helper_lookup_tb_lru_stats(&lru_hits, &lru_misses);
+    uint64_t lru_total = lru_hits + lru_misses;
+    uint64_t lru_pct_x100 = lru_total ? (lru_hits * 10000 / lru_total) : 0;
+    CL_LOG("helper_lookup_tb_ptr LRU: hits=%" PRIu64 " misses=%" PRIu64
+           " hit_rate=%" PRIu64 ".%02" PRIu64 "%%",
+           lru_hits, lru_misses,
+           lru_pct_x100 / 100, lru_pct_x100 % 100);
 }
 
 void cranelift_bridge_blacklist(uint64_t pc_lo, uint64_t pc_hi)

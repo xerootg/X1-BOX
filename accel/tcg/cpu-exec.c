@@ -671,6 +671,52 @@ static inline bool check_for_breakpoints(CPUState *cpu, vaddr pc,
         check_for_breakpoints_slow(cpu, pc, cflags);
 }
 
+#if XEMU_HAVE_CRANELIFT
+/*
+ * Per-thread 2-slot LRU for helper_lookup_tb_ptr.
+ *
+ * helper_lookup_tb_ptr is the slow-path used by TCG codegen for indirect
+ * jumps and by chains that exit back into the dispatcher. Profile (2026-
+ * 05-24 Halo 2 gameplay) had it at 3.62% + qht_lookup_custom at 2.76%
+ * even with the chain LRU absorbing the hot self-loops.
+ *
+ * MRU pattern: hottest TBs go in slot 0, second-hottest in slot 1, and
+ * slot-1 hits promote to slot 0. On a comparable scene the 2-slot LRU
+ * lands ~20% hit rate but absorbs ~50% of helper_lookup_tb_ptr cost and
+ * ~65% of qht_lookup_custom cost — combined 6.4% → 3.4% CPU.
+ *
+ * A 16-slot direct-mapped variant tested 2026-05-24 was no better and
+ * sometimes worse: the dispatch PC distribution at this layer collided
+ * badly enough on Fibonacci hash that hot entries evicted each other,
+ * defeating the cache. Keeping the 2-slot LRU for now.
+ *
+ * Staleness: tb_flush invalidates all TBs. We cache tb_flush_count and
+ * drop the cache when it changes — single qatomic_read per call. The
+ * CF_INVALID check we still run on cache hits catches per-TB async
+ * invalidation that tb_flush_count alone wouldn't see.
+ */
+struct helper_tb_lru_slot {
+    vaddr pc;
+    uint64_t cs_base;
+    uint32_t flags;
+    uint32_t cflags;
+    TranslationBlock *tb;
+};
+static __thread struct {
+    struct helper_tb_lru_slot slots[2];
+    unsigned last_flush_count;
+} helper_tb_lru;
+
+static uint64_t helper_lookup_tb_lru_hits;
+static uint64_t helper_lookup_tb_lru_misses;
+
+void cranelift_get_helper_lookup_tb_lru_stats(uint64_t *hits, uint64_t *misses)
+{
+    if (hits)   *hits = qatomic_read(&helper_lookup_tb_lru_hits);
+    if (misses) *misses = qatomic_read(&helper_lookup_tb_lru_misses);
+}
+#endif
+
 /**
  * helper_lookup_tb_ptr: quick check for next tb
  * @env: current cpu state
@@ -693,17 +739,65 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
      */
     cpu->neg.can_do_io = true;
 
+#if XEMU_HAVE_CRANELIFT
+    /* Direct target-side call avoids the cc->tcg_ops vtable hop. */
+    TCGTBCPUState s = xemu_chain_get_tb_cpu_state(env);
+#else
     TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
+#endif
     s.cflags = curr_cflags(cpu);
 
     if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
         cpu_loop_exit(cpu);
     }
 
+#if XEMU_HAVE_CRANELIFT
+    {
+        unsigned cur_flush = qatomic_read(&tb_ctx.tb_flush_count);
+        if (unlikely(cur_flush != helper_tb_lru.last_flush_count)) {
+            helper_tb_lru.slots[0].tb = NULL;
+            helper_tb_lru.slots[1].tb = NULL;
+            helper_tb_lru.last_flush_count = cur_flush;
+        } else {
+            struct helper_tb_lru_slot *s0 = &helper_tb_lru.slots[0];
+            if (likely(s0->tb && s0->pc == s.pc &&
+                       s0->cs_base == s.cs_base &&
+                       s0->flags == s.flags &&
+                       s0->cflags == s.cflags &&
+                       !(tb_cflags(s0->tb) & CF_INVALID))) {
+                helper_lookup_tb_lru_hits++;
+                return s0->tb->tc.ptr;
+            }
+            struct helper_tb_lru_slot *s1 = &helper_tb_lru.slots[1];
+            if (s1->tb && s1->pc == s.pc &&
+                s1->cs_base == s.cs_base &&
+                s1->flags == s.flags &&
+                s1->cflags == s.cflags &&
+                !(tb_cflags(s1->tb) & CF_INVALID)) {
+                struct helper_tb_lru_slot tmp = *s1;
+                *s1 = *s0;
+                *s0 = tmp;
+                helper_lookup_tb_lru_hits++;
+                return s0->tb->tc.ptr;
+            }
+        }
+    }
+#endif
+
     tb = tb_lookup(cpu, s);
     if (tb == NULL) {
         return tcg_code_gen_epilogue;
     }
+
+#if XEMU_HAVE_CRANELIFT
+    helper_lookup_tb_lru_misses++;
+    helper_tb_lru.slots[1] = helper_tb_lru.slots[0];
+    helper_tb_lru.slots[0].pc = s.pc;
+    helper_tb_lru.slots[0].cs_base = s.cs_base;
+    helper_tb_lru.slots[0].flags = s.flags;
+    helper_tb_lru.slots[0].cflags = s.cflags;
+    helper_tb_lru.slots[0].tb = tb;
+#endif
 
     BURST_DIAG_BUMP_TB_LOOKUP_PC(s.pc);
 
