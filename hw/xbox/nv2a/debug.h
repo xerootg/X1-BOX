@@ -357,8 +357,26 @@ void nv2a_profile_get_vsync_timing_str(char *buf, int bufsize);
 void nv2a_profile_get_surf_timing_str(char *buf, int bufsize);
 void nv2a_profile_get_workload_str(char *buf, int bufsize);
 
+/*
+ * NV2A_PERF_LOG: per-draw / per-shader / per-texture stats counters and
+ * phase timers that populate the in-app debug overlay.
+ *
+ * Real cost: 143 inline sites across the pgraph_vk render path. Each
+ * nv2a_profile_inc_counter is a load+add+store on g_nv2a_stats; each
+ * NV2A_PHASE_TIMER_BEGIN/END pair reads cntvct_el0 twice. The flip-
+ * stall fps counter (g_nv2a_stats.increment_fps) is in
+ * nv2a_profile_increment() which is NOT gated — show_fps continues to
+ * work with NV2A_PERF_LOG=0.
+ *
+ * Default OFF on Android shipping builds. Set -DNV2A_PERF_LOG=1 at
+ * build time when you need the debug-overlay phase timing detail.
+ */
 #ifndef NV2A_PERF_LOG
+#if defined(__ANDROID__) && !defined(XEMU_DEBUG_OVERLAY)
+#define NV2A_PERF_LOG 0
+#else
 #define NV2A_PERF_LOG 1
+#endif
 #endif
 
 /*

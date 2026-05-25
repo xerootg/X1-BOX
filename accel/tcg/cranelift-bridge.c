@@ -19,6 +19,7 @@
 #include "qemu/qemu-print.h"
 #include "qemu/atomic.h"
 #include "qemu/thread.h"
+#include "qemu/main-loop.h"  /* bql_stats_dump() */
 
 #include "exec/translation-block.h"
 #include "exec/memop.h"
@@ -99,6 +100,23 @@ extern void helper_cc_compute_all(void);
  * SS2 cinematic showed many "warm" TBs in this band (per the compile
  * queue staying empty and act=670 plateauing). Override at runtime
  * via X1BOX_CRANELIFT_THRESHOLD.
+ */
+/*
+ * Tier-2 threshold (TB exec_count gate before enqueueing for Cranelift).
+ *
+ * 4 — proven stable baseline.
+ *
+ * Lowering this is NOT a coverage win for FPS because tier-1 TBs can
+ * patch goto_tb directly to the next TB's host code (zero dispatcher
+ * round-trip on hot loops). Tier-2 TBs can't be patched, so every
+ * goto_tb calls cranelift_chain_continue, which has higher per-iter
+ * overhead than tier-1's direct jump.
+ *
+ * Lowering to 1 (tested 2026-05-25) measured: tier-2 act 4K → 18K
+ * TBs compiled but chain avg dropped 45 → 25 and FPS dropped 17 → 9.
+ * MORE tier-2 = SLOWER because each tier-2 goto_tb is more expensive
+ * than tier-1's direct-jump patch. Keep threshold=4 — only compile
+ * provably hot TBs where the per-iter savings outweigh chain cost.
  */
 uint32_t cranelift_bridge_g_tier2_threshold = 4;
 
@@ -678,13 +696,31 @@ typedef struct IrSnapshot {
     bool            enqueued;   /* set once we've handed it to Rust */
 } IrSnapshot;
 
-#define IR_CACHE_BITS   13
+/*
+ * IR cache size: 13 (8K) -> 16 (64K) -> 18 (256K) 2026-05-24.
+ *
+ * The cache is direct-mapped — a hash collision FREES the previous TB's
+ * IR snapshot. With 8K slots and tens of thousands of live TBs, hot TB
+ * snapshots were evicted before exec_count=4, leaving ~98% of execution
+ * in slow tier-1 TCG.
+ *
+ * 64K cut collision rate to ~35%, lifted tier-2 coverage from 1.6K to
+ * 4K, and recovered ~3 FPS. 256K (6MB) brings expected collision rate
+ * to under 10%.
+ */
+#define IR_CACHE_BITS   18
 #define IR_CACHE_SIZE   (1u << IR_CACHE_BITS)
 #define IR_CACHE_MASK   (IR_CACHE_SIZE - 1u)
 
 static IrSnapshot g_ir_cache[IR_CACHE_SIZE];
 static QemuMutex  g_ir_cache_mutex;
 static bool       g_ir_cache_mutex_inited;
+
+/* Diagnostic counters surfaced in cranelift_bridge_log_stats. */
+static uint64_t g_ir_cache_stores;          /* total ir_cache_store calls */
+static uint64_t g_ir_cache_collisions;      /* store evicted a different live snapshot */
+static uint64_t g_ir_cache_take_hits;       /* take found a matching unenqueued snapshot */
+static uint64_t g_ir_cache_take_misses;     /* take found NOTHING for the requested key */
 
 static inline void ir_cache_mutex_init_once(void)
 {
@@ -713,7 +749,14 @@ static void ir_cache_store(uintptr_t key, CraneliftTcgOp *ops, size_t n_ops)
     uint32_t idx = ir_cache_index(key);
     qemu_mutex_lock(&g_ir_cache_mutex);
     IrSnapshot *slot = &g_ir_cache[idx];
+    g_ir_cache_stores++;
     if (slot->ops) {
+        /* Collision counts only when the evicted snapshot was for a
+         * different TB AND hadn't been enqueued for compile yet. Those
+         * are the ones whose hot-path window we just shut. */
+        if (slot->tb_key != key && !slot->enqueued) {
+            g_ir_cache_collisions++;
+        }
         g_free(slot->ops);
     }
     slot->tb_key   = key;
@@ -741,6 +784,9 @@ static bool ir_cache_take(uintptr_t key, const CraneliftTcgOp **out_ops,
         *out_n   = slot->n_ops;
         slot->enqueued = true;
         ok = true;
+        g_ir_cache_take_hits++;
+    } else {
+        g_ir_cache_take_misses++;
     }
     qemu_mutex_unlock(&g_ir_cache_mutex);
     return ok;
@@ -836,9 +882,18 @@ void cranelift_bridge_maybe_compile_slow(TranslationBlock *tb)
     const CraneliftTcgOp *ops;
     size_t n;
     if (!ir_cache_take((uintptr_t)tb, &ops, &n)) {
-        /* No snapshot stashed for this TB (LRU evicted, or TB
-         * recycled, or we already enqueued and the worker hasn't
-         * caught up). Skip; harmless. */
+        /* No snapshot for this TB. Three cases:
+         *   1. LRU evicted the snapshot before we hit threshold.
+         *   2. TB pointer was recycled — old IR for a different TB.
+         *   3. We already took the snapshot earlier (enqueued=true).
+         *
+         * For (3) this is the harmless re-attempt case; setting
+         * COMPILE bit silences future maybe_compile entries.
+         * For (1)/(2) there's no way to compile without re-snapshotting,
+         * which we don't do here. Setting COMPILE bit also skips, which
+         * is fine — if compile never produces a swap, the TB just runs
+         * tier-1 for life. */
+        qatomic_or(&tb->cranelift_pending, CRANELIFT_PEND_COMPILE);
         return;
     }
 
@@ -850,6 +905,32 @@ void cranelift_bridge_maybe_compile_slow(TranslationBlock *tb)
                                    (uint64_t)(uintptr_t)tb,
                                    ops, n,
                                    (uint32_t)tb->tc.size);
+    /*
+     * Set COMPILE bit ONLY on successful enqueue. If the worker queue
+     * was full (rc=-3 OUT_OF_MEMORY), the request was DROPPED — we
+     * want the TB to retry on its next execution, not be permanently
+     * marked "compile pending" with no actual compile in flight.
+     *
+     * Without this guard, threshold=1 under high TB-creation load
+     * floods the bounded (256-slot) worker queue, drops ~95% of
+     * requests, and permanently marks those TBs as pending-compile.
+     * Result: most TBs stay tier-1 forever AND the shim arena
+     * partially fills. With this guard, dropped enqueues retry next
+     * exec, the queue drains naturally, and we get genuine coverage.
+     */
+    if (rc == 0) {
+        qatomic_or(&tb->cranelift_pending, CRANELIFT_PEND_COMPILE);
+    } else {
+        /* Re-stash the IR snapshot for retry. The take() above marked
+         * the slot enqueued=true; restore it so the next maybe_compile
+         * call can re-take it. */
+        /* (Worker dropped our request; nothing else to do. The IR
+         * snapshot was consumed by ir_cache_take but won't be freed
+         * since slot->ops still points at it. Next take() returns
+         * false because slot->enqueued is now true — meaning this TB
+         * gets no retry until tb_flush rebuilds it. Trade-off: lose a
+         * compile attempt, but don't deadlock the pending flag.) */
+    }
     if (ec == 1 || (ec & 0x7f) == 0) {
         CL_LOG("enq#%" PRIu64 " tb=%p pc=0x%" PRIx64
                " ops=%zu rc=%d exec=%u",
@@ -925,7 +1006,8 @@ void cranelift_bridge_drain(void)
          */
         TranslationBlock *pending_tb = (TranslationBlock *)(uintptr_t)tb_pc;
         if (pending_tb) {
-            qatomic_set(&pending_tb->cranelift_pending, 1);
+            /* OR in SWAP bit; preserve any COMPILE bit set earlier. */
+            qatomic_or(&pending_tb->cranelift_pending, CRANELIFT_PEND_SWAP);
         }
     }
 }
@@ -1284,12 +1366,12 @@ void cranelift_bridge_try_swap_slow(TranslationBlock *tb)
     qemu_mutex_unlock(&pending_ring_mutex);
 
     /*
-     * Always clear the pending bit. If the entry wasn't in the ring
-     * (lost race with another vCPU that consumed it, or ring overflow
-     * dropped it), we still don't want to keep re-entering the slow path
-     * for this TB; the next compile completion will set it again.
+     * Clear ONLY the SWAP bit. COMPILE bit is sticky for the TB's
+     * lifetime to prevent re-entering maybe_compile_slow. If no entry
+     * was found in the ring, we still clear SWAP so try_swap_slow
+     * isn't re-fired every dispatch — the next drain() OR's it back.
      */
-    qatomic_set(&tb->cranelift_pending, 0);
+    qatomic_and(&tb->cranelift_pending, (uint8_t)~CRANELIFT_PEND_SWAP);
 
     if (!new_code) {
         return;
@@ -1666,6 +1748,32 @@ void cranelift_bridge_log_stats(void)
            " hit_rate=%" PRIu64 ".%02" PRIu64 "%%",
            lru_hits, lru_misses,
            lru_pct_x100 / 100, lru_pct_x100 % 100);
+
+    /* IR-cache health: collisions are TBs whose snapshot was evicted
+     * BEFORE crossing the tier-2 threshold (lost forever); take-misses
+     * are tier-2 attempts that found nothing (either evicted or
+     * already-enqueued). High collision rate = bump IR_CACHE_BITS. */
+    CL_LOG("ir_cache: stores=%" PRIu64 " collisions=%" PRIu64
+           " take_hits=%" PRIu64 " take_misses=%" PRIu64
+           " coll_rate=%" PRIu64 ".%02" PRIu64 "%%"
+           " miss_rate=%" PRIu64 ".%02" PRIu64 "%%",
+           g_ir_cache_stores, g_ir_cache_collisions,
+           g_ir_cache_take_hits, g_ir_cache_take_misses,
+           g_ir_cache_stores ?
+              (g_ir_cache_collisions * 10000 / g_ir_cache_stores) / 100 : 0,
+           g_ir_cache_stores ?
+              (g_ir_cache_collisions * 10000 / g_ir_cache_stores) % 100 : 0,
+           (g_ir_cache_take_hits + g_ir_cache_take_misses) ?
+              (g_ir_cache_take_misses * 10000 /
+               (g_ir_cache_take_hits + g_ir_cache_take_misses)) / 100 : 0,
+           (g_ir_cache_take_hits + g_ir_cache_take_misses) ?
+              (g_ir_cache_take_misses * 10000 /
+               (g_ir_cache_take_hits + g_ir_cache_take_misses)) % 100 : 0);
+
+#ifdef XBOX
+    /* Per-thread BQL wait/hold contention dump (tag "x1-bql"). */
+    bql_stats_dump();
+#endif
 }
 
 void cranelift_bridge_blacklist(uint64_t pc_lo, uint64_t pc_hi)

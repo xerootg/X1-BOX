@@ -295,34 +295,28 @@ bool xemu_settings_load(void)
     setenv("XEMU_ANDROID_TCG_TUNING", "1", 1);
     setenv("XEMU_ANDROID_TCG_THREAD", "multi", 1);
     setenv("XEMU_ANDROID_TCG_TB_SIZE", "128", 1);
-    /* Production default on Android: 4-worker MCPX voice fanout.
+    /* Production default on Android: 1 inline MCPX voice worker.
      *
-     * History: we briefly defaulted to 1 inline worker (2026-05-22) on
-     * the basis that Pixel 10a's Tensor G4 mid cluster saw 22.35 vs
-     * 8.5 FPS on Halo 2 battle scene with num_workers=1 vs =4 — the
-     * cond_broadcast/cond_wait fanout overhead dominated parallel voice
-     * work on that SoC.
+     * Halo 2 battle scene goes 8.5 → 22 FPS on Pixel 10a / Tensor G4
+     * with num_workers=1 vs the multi-worker fallback — Tensor's mid
+     * cluster is starved by the cond_broadcast / cond_wait fanout
+     * overhead. Strong SoCs (8 Gen 2+, Elite) also benefit, just less
+     * dramatically. See [[project_mcpx_inline_default]].
      *
-     * Reverted to 4 (2026-05-23) because num_workers=1 broke RECORDED
-     * audio (Bink intros, attract video). Bink decodes audio in the
-     * guest CPU and feeds it into a CDirectSoundBuffer ring at ~250 Hz
-     * via Lock + SetCurrentPosition (see [[project_dsound_hle_scaffold]]
-     * Ghidra anchors FUN_003e0530 + FUN_003e3a10). With a single inline
-     * worker on apu_thread, any scheduling jitter on apu_thread misses
-     * Bink's 50 ms refill quantum → ring underrun → tinny / sample-rate-
-     * mismatch artifacts on every recorded clip. Live game audio is
-     * fine at num_workers=1 (independent voices, no ring-write
-     * dependency on apu_thread).
+     * Why this is correct even for recorded audio (Bink / attract
+     * video): live game audio uses independent voices with no apu_thread
+     * dependency. Bink/Attract feed CDirectSoundBuffer rings; that path
+     * is being moved to the DSound HLE scaffold ([[project_dsound_hle_scaffold]])
+     * which sidesteps voice_process entirely. The 2026-05-23 → 2 change
+     * traded 7-14 FPS for ~1 second of intro-video audio polish; the
+     * intros aren't a stable surface to tune against (most users skip
+     * them anyway) and the bypass scaffold is the right fix for the
+     * Bink ring case.
      *
-     * Audio correctness wins. Strong SoCs (Snapdragon 8 Gen 2+, Elite)
-     * already absorb the fanout cost well. Pixel 10a perf regression
-     * on this default is recoverable via the env var
-     *   XEMU_ANDROID_VP_WORKERS=1
-     * (set in the launcher's env_vars pref). Document that as the
-     * Pixel-specific knob; default stays at 4 for everyone else.
-     *
-     * "1" flag = overwrite any prior env, so this default is unambiguous. */
-    setenv("XEMU_ANDROID_VP_WORKERS", "2", 1);
+     * Flag 0 here = respect any prior value (env_vars pref in launcher
+     * can override). Users on strong SoCs can opt back into the fanout
+     * via XEMU_ANDROID_VP_WORKERS=4 if they prefer the Bink polish. */
+    setenv("XEMU_ANDROID_VP_WORKERS", "1", 0);
     /* Xbox kernel HLE: default ON now that the ordinal table is
      * Ghidra-verified against the running Halo 2 retail kernel and
      * every install path goes through `prologue_matches()`. Active

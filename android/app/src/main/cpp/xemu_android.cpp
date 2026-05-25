@@ -847,14 +847,35 @@ static SetupFiles SyncSetupFiles() {
 
   std::string envVars = GetPrefString(env, activity, "env_vars");
   if (!envVars.empty()) {
-    std::istringstream stream(envVars);
-    std::string line;
-    while (std::getline(stream, line)) {
-      if (line.empty()) continue;
-      auto eq = line.find('=');
+    /*
+     * env_vars pref is a `;`-separated list of KEY=VAL pairs (newlines
+     * also work as separators for readability). Splitting only on
+     * newline (the std::getline default) silently absorbs every entry
+     * after the first into that first entry's value — the user's
+     * `KEY1=v1;KEY2=v2` becomes one setenv("KEY1", "v1;KEY2=v2"), and
+     * any flag that downstream code derives from KEY1's value gets
+     * polluted with the rest of the string. We saw that on 2026-05-24
+     * with `XEMU_ANDROID_GDB_PORT=1234;X1BOX_ADPF_ENABLED=1`: -gdb
+     * tcp:: was passed the full polluted port, failed bind, destroyed
+     * a chardev, and FORTIFY aborted on the next lock — looked like a
+     * mystery boot crash.
+     */
+    size_t pos = 0;
+    while (pos < envVars.size()) {
+      size_t next = envVars.find_first_of(";\n\r", pos);
+      if (next == std::string::npos) next = envVars.size();
+      std::string entry = envVars.substr(pos, next - pos);
+      pos = next + 1;
+      /* Trim surrounding whitespace so `A=1 ; B=2` works too. */
+      size_t s = entry.find_first_not_of(" \t");
+      size_t e = entry.find_last_not_of(" \t");
+      if (s == std::string::npos) continue;
+      entry = entry.substr(s, e - s + 1);
+      if (entry.empty()) continue;
+      auto eq = entry.find('=');
       if (eq == std::string::npos || eq == 0) continue;
-      std::string key = line.substr(0, eq);
-      std::string val = line.substr(eq + 1);
+      std::string key = entry.substr(0, eq);
+      std::string val = entry.substr(eq + 1);
       setenv(key.c_str(), val.c_str(), 1);
       __android_log_print(ANDROID_LOG_INFO, kLogTag,
                           "env: %s=%s", key.c_str(), val.c_str());

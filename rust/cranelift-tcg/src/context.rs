@@ -106,7 +106,10 @@ impl Config {
             enabled: AtomicBool::new(true),
             verify_mode: AtomicBool::new(false),
             hot_threshold: AtomicU32::new(1000),
-            max_entries: AtomicU32::new(4096),
+            // 4096 was too small for Halo 2 (saturates instantly, then LRU
+            // thrash on every new hot TB). 32K covers the working set with
+            // headroom and costs ~10MB of compiled Cranelift code.
+            max_entries: AtomicU32::new(32768),
         }
     }
 }

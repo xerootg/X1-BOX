@@ -1751,14 +1751,37 @@ void sdl2_gl_refresh(DisplayChangeListener *dcl)
     android_log_gl_error("refresh-create-texture");
 #endif
 
-    /* FIXME: Finer locking. Event handlers in segments of the code expect
-     * to be running on the main thread with the BQL. For now, acquire the
-     * lock and perform rendering, but release before swap to avoid
-     * possible lengthy blocking (for vsync).
+    /*
+     * BQL hold-time optimization (2026-05-24).
+     *
+     * Measured on Halo 2 gameplay: SDLThread holds BQL ~84ms/sec at
+     * 711µs avg per acquire, blocking the vCPU thread ~7% of wall and
+     * qemu_main ~17%. Only sdl2_poll_events() actually mutates QEMU
+     * state (input event delivery); the rest is GL + xemu-internal
+     * HUD/snapshot bookkeeping that runs on this thread alone, so BQL
+     * isn't load-bearing for it.
+     *
+     * Default: narrow the BQL hold to just sdl2_poll_events. Set
+     * $X1BOX_SDL_BQL_KEEP_RENDER=1 at startup to restore the wide hold
+     * if the narrow version breaks anything (HUD races, snapshot tearing).
      */
+#ifdef __ANDROID__
+    static int s_keep_wide_bql = -1;  /* -1 unresolved, 0=narrow, 1=wide */
+    if (s_keep_wide_bql < 0) {
+        const char *v = getenv("X1BOX_SDL_BQL_KEEP_RENDER");
+        s_keep_wide_bql = (v && (*v == '1' || *v == 'y' || *v == 'Y'));
+    }
+#else
+    const int s_keep_wide_bql = 1;
+#endif
+
     qemu_mutex_lock_main_loop();
     bql_lock();
     sdl2_poll_events(scon);
+    if (!s_keep_wide_bql) {
+        bql_unlock();
+        qemu_mutex_unlock_main_loop();
+    }
 
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -1772,9 +1795,11 @@ void sdl2_gl_refresh(DisplayChangeListener *dcl)
     android_log_gl_error("refresh-blit");
 #endif
 
-    // Release BQL before swapping (which may sleep if swap interval is not immediate)
-    bql_unlock();
-    qemu_mutex_unlock_main_loop();
+    if (s_keep_wide_bql) {
+        // Release BQL before swapping (which may sleep if swap interval is not immediate)
+        bql_unlock();
+        qemu_mutex_unlock_main_loop();
+    }
 
 #ifdef __ANDROID__
     if (g_android_force_finish_before_swap) {
@@ -1816,15 +1841,44 @@ void sdl2_gl_refresh(DisplayChangeListener *dcl)
     }
 #endif
 
-    /* VGA update (see note above) + vblank */
-    qemu_mutex_lock_main_loop();
-    bql_lock();
-    graphic_hw_update(scon->dcl.con);
-    if (scon->updates && scon->surface) {
-        scon->updates = 0;
+    /*
+     * Post-swap VGA update.
+     *
+     * graphic_hw_update walks dirty rectangles on the VGA console — needed
+     * for BIOS / dashboard / software-rendered fallback (when nv2a tex is
+     * unavailable and `use_surface_fallback` ran above). For nv2a guests
+     * in steady-state gameplay, the dcl is inert and graphic_hw_update is
+     * a no-op, but the BQL bracket around it is NOT — it's 1 of 2 holds
+     * per swap, ~350µs each, accounting for half of SDLThread's 84ms/sec
+     * BQL hold pressure (measured 2026-05-24).
+     *
+     * Default: skip the call entirely when we used the nv2a tex path
+     * above (use_surface_fallback was not taken). $X1BOX_SDL_BQL_KEEP_POST_UPDATE=1
+     * restores the unconditional call (the previous behavior).
+     */
+#ifdef __ANDROID__
+    static int s_keep_post_update = -1;
+    if (s_keep_post_update < 0) {
+        const char *v = getenv("X1BOX_SDL_BQL_KEEP_POST_UPDATE");
+        s_keep_post_update = (v && (*v == '1' || *v == 'y' || *v == 'Y'));
     }
-    bql_unlock();
-    qemu_mutex_unlock_main_loop();
+    /* If we used the nv2a fast path above, scon->surface->updates was not
+     * touched and graphic_hw_update is a no-op for our usage. Skip it. */
+    const bool need_post_update = s_keep_post_update ||
+        (scon->updates && scon->surface);
+#else
+    const bool need_post_update = true;
+#endif
+    if (need_post_update) {
+        qemu_mutex_lock_main_loop();
+        bql_lock();
+        graphic_hw_update(scon->dcl.con);
+        if (scon->updates && scon->surface) {
+            scon->updates = 0;
+        }
+        bql_unlock();
+        qemu_mutex_unlock_main_loop();
+    }
 
     /*
      * Throttle to keep swaps at the target frame rate.

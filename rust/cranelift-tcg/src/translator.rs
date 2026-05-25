@@ -231,6 +231,16 @@ impl Translator {
                 &ctx.helpers,
             );
             lower.lower_block(&snap.ops)?;
+            /*
+             * Check the abort flag: lowering helpers (e.g. write_temp
+             * for unknown-size / cross-width vector stores) can't
+             * return Err from their context, so they set this flag
+             * instead. If set, the emitted IR is missing guest
+             * writes — bail to tier-1 cleanly.
+             */
+            if lower.aborted {
+                return Err(TransError::UnsupportedOp(0));
+            }
             lower.terminate_if_needed();
         }
         // finalize() consumes the FunctionBuilder; we created a new
@@ -301,6 +311,14 @@ pub(crate) struct Lowering<'a, 'b> {
     pub(crate) block_terminated: bool,
     #[allow(dead_code)]
     pub(crate) entry_block: cranelift_codegen::ir::Block,
+    /// Sticky flag: set by lowering helpers that encounter a case
+    /// where they CANNOT emit correct IR (e.g. cross-width vector/
+    /// scalar store, unknown global size). Outer translate loop must
+    /// check this after each op and bail the TB to tier-1 if set.
+    /// Previously these sites just `return;`-ed silently, producing
+    /// compiled TBs missing guest writes — a freeze-class bug when
+    /// many such TBs were compiled at threshold=1.
+    pub(crate) aborted: bool,
 }
 
 impl<'a, 'b> Lowering<'a, 'b> {
@@ -326,6 +344,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
             labels: HashMap::new(),
             block_terminated: false,
             entry_block,
+            aborted: false,
         }
     }
 
@@ -439,6 +458,9 @@ impl<'a, 'b> Lowering<'a, 'b> {
         }
 
         // Fast path: pure integer extend / reduce.
+        // Vector↔scalar conversions are handled earlier (lines 435-458)
+        // via scalar_to_vector / extractlane, so by here `cur` and `want`
+        // are both scalars or both vectors of compatible shape.
         if !cur_is_float && !want_is_float {
             if cur.bits() < want.bits() {
                 return self.builder.ins().uextend(want, val);
@@ -557,13 +579,19 @@ impl<'a, 'b> Lowering<'a, 'b> {
             };
             /*
              * Cross-width read between vector storage and scalar
-             * requestor (e.g. MOVD from XMM low → GPR loads 32 bits
-             * from a 16-byte XMM global). Cranelift's `ireduce` on
-             * vector→scalar is unspecified/unsupported; rather than
-             * emit IR that might silently miscompile, bail the TB to
-             * tier-1 where TCG-aarch64's well-tested codegen handles
-             * the partial access. Likewise scalar global → vector
-             * requestor (would need uextend scalar→vector).
+             * requestor (e.g. MOVD from XMM low → GPR).
+             *
+             * 2026-05-25: bail to tier-1 here is FASTER than compiling
+             * to tier-2 with extractlane. TCG-aarch64's tier-1 codegen
+             * for partial-XMM accesses is well-tuned; tier-2's generic
+             * extractlane + ireduce path adds enough per-op overhead
+             * that XMM-heavy TBs run slower in tier-2 than in tier-1.
+             * Measured: removing this bail and going through coerce
+             * dropped Halo 2 title-screen FPS from 17 → 14.
+             *
+             * Keep the bail. The TBs that hit it are usually XMM-heavy
+             * (where partial accesses are common); tier-1's
+             * specialized codegen wins for those workloads.
              */
             if (cty == types::I64X2) != (want == types::I64X2) {
                 return Err(TransError::UnsupportedOp(crate::opc::Opc::Ld as u16));
@@ -632,28 +660,32 @@ impl<'a, 'b> Lowering<'a, 'b> {
                  */
                 16 => types::I64X2,
                 /*
-                 * Unknown size: skip the store rather than silently
-                 * truncate. Loud-failure is preferable to data loss.
+                 * Unknown size: ABORT the TB rather than silently
+                 * skipping the write. A skipped guest store is a
+                 * freeze-class miscompile (guest reads stale state
+                 * indefinitely). Set the abort flag so translate_tb
+                 * bails the TB to tier-1 cleanly.
                  */
-                _ => return,
+                _ => { self.aborted = true; return; }
             };
             /*
              * Cross-width write (scalar value into vector global, or
-             * vector value into scalar global). The needed
-             * uextend/ireduce between scalar and vector is unsupported
-             * by Cranelift; rather than emit IR that may silently
-             * miscompile, drop the global store. The dispatcher's TB
-             * verifier will catch the divergence on the verify pass.
+             * vector value into scalar global).
              *
-             * NOTE: this `return` skips the write entirely — but the
-             * only way we'd legitimately reach here is a TCG-emitted
-             * partial-XMM access, which TCG-aarch64 (tier-1) handles
-             * correctly. The compile-error machinery in the bridge
-             * runs the TB on tier-1 if any op signals UnsupportedOp;
-             * for write_temp we have no error channel back. So skip.
+             * BAIL the TB to tier-1 (via the abort flag). Earlier the
+             * code silently `return;`-ed (wrong: dropped the store),
+             * then I "fixed" it to call coerce → extractlane/
+             * scalar_to_vector. The coerce path is correct but slower
+             * than tier-1's specialised partial-XMM codegen. Bail is
+             * the right answer: TCG-aarch64 handles these correctly
+             * AND faster than tier-2 can.
+             *
+             * Setting aborted makes translate_tb return UnsupportedOp
+             * after lowering, so the bridge falls back to tier-1.
              */
             let val_ty = self.builder.func.dfg.value_type(val);
             if (val_ty == types::I64X2) != (store_ty == types::I64X2) {
+                self.aborted = true;
                 return;
             }
             let flush_val = self.coerce(val, store_ty);
@@ -864,21 +896,13 @@ impl<'a, 'b> Lowering<'a, 'b> {
                  * into a direct jump to the next TB's host code, so a
                  * hot loop body has zero dispatcher round-trip per
                  * iteration. Cranelift TBs can't be patched post-hoc,
-                 * so we instead call cranelift_chain_continue (in
-                 * accel/tcg/cpu-exec.c) which loops dispatching
-                 * successive TBs (shim or tier-1) until it hits an
-                 * interrupt or a non-zero exit reason. The chain
-                 * helper's address is passed in via EnvDesc at init.
-                 * Without this, every Cranelift TB ending in goto_tb
-                 * returned 0 and forced the dispatcher to look up the
-                 * next TB by env->eip — fine for cold paths but for
-                 * audio-mix / video-decode / animation inner loops it
-                 * added enough per-iteration variance to cause
-                 * audible chop and visible stutter.
-                 * env->eip is already updated to the destination by
-                 * the frontend before this op runs.  If the helper
-                 * address wasn't set up, fall back to a plain
-                 * return-to-dispatcher. */
+                 * so we call cranelift_chain_continue (in
+                 * accel/tcg/cpu-exec.c). The FIRST tier-2 TB exit
+                 * bootstraps the chain (recursion guard is false). All
+                 * subsequent tier-2 TBs within that chain hit the guard
+                 * and return 0 immediately — pure CALL overhead BUT
+                 * removing the call entirely breaks chain bootstrapping
+                 * (verified 2026-05-25: chain_runs=0 with no call). */
                 let chain_fn = self.env.chain_continue_fn;
                 if chain_fn != 0 {
                     let mut sig =
@@ -1416,6 +1440,16 @@ impl<'a, 'b> Lowering<'a, 'b> {
         };
         let cur = self.builder.func.dfg.value_type(val);
         let to_store = if cur != store_ty {
+            /*
+             * Vector↔scalar env store. Bail to tier-1 — same rationale
+             * as the read side in read_temp: TCG-aarch64's specialised
+             * partial-XMM codegen outperforms tier-2's generic
+             * scalar_to_vector/extractlane lowering. Routing these
+             * through coerce regressed Halo 2 title FPS by ~3.
+             */
+            if cur.is_vector() != store_ty.is_vector() {
+                return Err(TransError::UnsupportedOp(opc as u16));
+            }
             if cur.bits() > store_ty.bits() {
                 self.builder.ins().ireduce(store_ty, val)
             } else {

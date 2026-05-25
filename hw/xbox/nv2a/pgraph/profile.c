@@ -29,6 +29,13 @@
 #ifdef XBOX
 extern uint64_t tb_cache_stats_lookup_hits;
 extern uint64_t tb_cache_stats_lookup_misses;
+/* Per-frame stall detector — counters from cranelift_bridge_log_stats world. */
+extern void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
+                                       uint64_t *spins, uint64_t *irq_exits,
+                                       uint32_t *thread_count,
+                                       unsigned *chain_max, uint32_t *jitter);
+extern void cranelift_get_helper_lookup_tb_lru_stats(uint64_t *hits,
+                                                      uint64_t *misses);
 #endif
 
 NV2AStats g_nv2a_stats;
@@ -52,6 +59,84 @@ void nv2a_profile_increment(void)
         ts = now;
         frame_count = 0;
     }
+
+#if defined(XBOX) && defined(__ANDROID__)
+    /*
+     * Per-frame stall detector.
+     *
+     * Snapshot interesting counters at every FLIP_STALL (guest frame
+     * boundary). If the current interval is much longer than the
+     * recent median (>2× of a 16-frame moving baseline), log what
+     * changed during that frame. Helps localise which subsystem
+     * caused a "long frame" without needing a profile-grade trace.
+     *
+     * Cost: a few qatomic_reads per FLIP_STALL (~30/sec) — negligible.
+     */
+    static int64_t last_flip_us;
+    static int64_t baseline_us[16];
+    static unsigned baseline_idx;
+    static uint64_t last_chain_runs, last_chain_iters, last_irq_exits;
+    static uint64_t last_lru_hits, last_lru_misses;
+    static int64_t last_long_log_us;
+
+    int64_t interval = last_flip_us ? (now - last_flip_us) : 0;
+    last_flip_us = now;
+
+    if (interval > 0) {
+        /* Update rolling-median baseline (simple ring; medianish via
+         * mean since spike detection doesn't need true median). */
+        baseline_us[baseline_idx++ & 15] = interval;
+        int64_t base_sum = 0;
+        unsigned base_n = 0;
+        for (unsigned i = 0; i < 16; i++) {
+            if (baseline_us[i] > 0) {
+                base_sum += baseline_us[i];
+                base_n++;
+            }
+        }
+        int64_t base_avg = base_n ? base_sum / base_n : 0;
+
+        /* Snapshot deltas regardless — used in log if we trigger. */
+        uint64_t chain_runs = 0, chain_iters = 0, irq_exits = 0;
+        cranelift_chain_get_stats(&chain_runs, &chain_iters, NULL,
+                                  &irq_exits, NULL, NULL, NULL);
+        uint64_t lru_hits = 0, lru_misses = 0;
+        cranelift_get_helper_lookup_tb_lru_stats(&lru_hits, &lru_misses);
+
+        uint64_t d_runs   = chain_runs   - last_chain_runs;
+        uint64_t d_iters  = chain_iters  - last_chain_iters;
+        uint64_t d_irq    = irq_exits    - last_irq_exits;
+        uint64_t d_lhit   = lru_hits     - last_lru_hits;
+        uint64_t d_lmiss  = lru_misses   - last_lru_misses;
+
+        last_chain_runs  = chain_runs;
+        last_chain_iters = chain_iters;
+        last_irq_exits   = irq_exits;
+        last_lru_hits    = lru_hits;
+        last_lru_misses  = lru_misses;
+
+        /* Trigger: this frame > 2× baseline AND >50ms long.
+         * Throttle to one log per 1s so we don't flood. */
+        if (base_avg > 0 && interval > 2 * base_avg && interval > 50000 &&
+            (now - last_long_log_us) > 1000000) {
+            uint64_t avg_chain = d_runs ? (d_iters * 100 / d_runs) : 0;
+            __android_log_print(ANDROID_LOG_INFO, "x1-stall",
+                "long_frame: interval=%lld ms baseline=%lld ms "
+                "chain_runs=%llu chain_iters=%llu avg=%llu.%02llu "
+                "irq_exits=%llu lru_hits=%llu lru_misses=%llu",
+                (long long)(interval / 1000),
+                (long long)(base_avg / 1000),
+                (unsigned long long)d_runs,
+                (unsigned long long)d_iters,
+                (unsigned long long)(avg_chain / 100),
+                (unsigned long long)(avg_chain % 100),
+                (unsigned long long)d_irq,
+                (unsigned long long)d_lhit,
+                (unsigned long long)d_lmiss);
+            last_long_log_us = now;
+        }
+    }
+#endif
 }
 
 static void snapshot_phase_timing(void)

@@ -80,9 +80,24 @@ static inline bool cranelift_bridge_pc_is_hot(uint64_t pc)
     return cranelift_bridge_g_hot_pcs[slot] == pc;
 }
 
+/* cranelift_pending bit definitions:
+ *   bit 0: swap pending — drain() set, try_swap_slow() clear (existing)
+ *   bit 1: compile enqueued — maybe_compile_slow() set, never cleared
+ *                              until tb_flush wipes the whole TB
+ * Keeping them separate stops the cycle where try_swap_slow's "always
+ * clear" of bit 0 re-armed the slow path entry on the next dispatch. */
+#define CRANELIFT_PEND_SWAP    0x01u
+#define CRANELIFT_PEND_COMPILE 0x02u
+
 static inline void cranelift_bridge_maybe_compile(TranslationBlock *tb)
 {
     if (tb->tier >= 2) {
+        return;
+    }
+    /* Already enqueued for compile: skip the slow path. Without this
+     * gate the slow path re-fires every TB exec between threshold-cross
+     * and swap (millions of wasted mutex+lookups per 30s on Halo 2). */
+    if (qatomic_read(&tb->cranelift_pending) & CRANELIFT_PEND_COMPILE) {
         return;
     }
     /* Pre-warm: TBs at PCs that were hot in a prior session bypass the
@@ -129,7 +144,7 @@ static inline void cranelift_bridge_try_swap(TranslationBlock *tb)
      * try_swap_slow() clears it after consuming. Reads here are
      * uncontended, so qatomic_read is essentially a cache-hot load.
      */
-    if (!qatomic_read(&tb->cranelift_pending)) {
+    if (!(qatomic_read(&tb->cranelift_pending) & CRANELIFT_PEND_SWAP)) {
         return;
     }
     cranelift_bridge_try_swap_slow(tb);

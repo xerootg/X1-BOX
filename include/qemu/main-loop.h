@@ -383,6 +383,16 @@ void bql_lock_impl(const char *file, int line);
  */
 void bql_unlock(void);
 
+#ifdef XBOX
+/*
+ * Dump per-thread BQL contention counters via __android_log_print
+ * (tag "x1-bql"). Called from cranelift_bridge_log_stats on the same
+ * cadence as the other tier-1/tier-2/HLE telemetry. No-op when no
+ * threads have ever acquired the lock.
+ */
+void bql_stats_dump(void);
+#endif
+
 /**
  * BQL_LOCK_GUARD
  *

@@ -596,6 +596,106 @@ void rust_bql_mock_lock(void)
     abort();
 }
 
+#ifdef XBOX
+/*
+ * BQL contention instrumentation.
+ *
+ * One slot per thread (claimed lazily on first BQL acquire). Tracks
+ * total wait-time (time spent inside bql_lock_fn waiting), total
+ * hold-time (between bql_lock return and matching bql_unlock), and
+ * acquire count. Self-cost is ~50ns per acquire (2 clock_gettime
+ * vDSO calls) — negligible vs. lock-wait cost when contended.
+ *
+ * Dumped by bql_stats_dump(), called from cranelift_bridge_log_stats
+ * on the same TB-execution cadence as the other perf counters.
+ *
+ * Why this exists: 2026-05-24 Halo 2 was stuck at 15 FPS with no
+ * single hot symbol explaining it; vCPU thread schedstat showed
+ * ~1300 voluntary ctx switches/sec, suggesting heavy lock contention,
+ * but we had no metric to identify WHICH thread was the holder.
+ */
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <time.h>
+#include <sys/syscall.h>
+
+#ifdef __ANDROID__
+/* pthread_getname_np exists on Bionic but only on Android API 26+; we
+ * compile against an NDK that exposes the prototype but in some configs
+ * it's hidden behind __ANDROID_API__ checks. Forward-declare for safety. */
+extern int pthread_getname_np(pthread_t, char *, size_t);
+#endif
+
+#define BQL_STATS_THREADS_MAX 64
+struct bql_thread_stats {
+    int tid;
+    char comm[16];
+    uint64_t wait_ns_total;
+    uint64_t hold_ns_total;
+    uint64_t acquires;
+    uint64_t hold_start_ns;
+};
+static struct bql_thread_stats g_bql_stats[BQL_STATS_THREADS_MAX];
+static int g_bql_stats_n;
+static pthread_mutex_t g_bql_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static __thread struct bql_thread_stats *bql_stats_self;
+
+static inline uint64_t bql_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static struct bql_thread_stats *bql_stats_get_self(void)
+{
+    if (bql_stats_self) return bql_stats_self;
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    pthread_mutex_lock(&g_bql_stats_lock);
+    if (g_bql_stats_n < BQL_STATS_THREADS_MAX) {
+        struct bql_thread_stats *s = &g_bql_stats[g_bql_stats_n++];
+        s->tid = (int)tid;
+        if (pthread_getname_np(pthread_self(), s->comm, sizeof(s->comm)) != 0) {
+            snprintf(s->comm, sizeof(s->comm), "tid%d", (int)tid);
+        }
+        bql_stats_self = s;
+    }
+    pthread_mutex_unlock(&g_bql_stats_lock);
+    return bql_stats_self;
+}
+
+void bql_stats_dump(void);  /* declared in qemu/main-loop.h */
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#define BQL_LOG(fmt, ...) \
+    __android_log_print(ANDROID_LOG_INFO, "x1-bql", fmt, ##__VA_ARGS__)
+#else
+#define BQL_LOG(fmt, ...) ((void)0)
+#endif
+
+void bql_stats_dump(void)
+{
+    pthread_mutex_lock(&g_bql_stats_lock);
+    int n = g_bql_stats_n;
+    pthread_mutex_unlock(&g_bql_stats_lock);
+    for (int i = 0; i < n; i++) {
+        struct bql_thread_stats *s = &g_bql_stats[i];
+        uint64_t acq = qatomic_read(&s->acquires);
+        if (acq == 0) continue;
+        uint64_t wait_ns = qatomic_read(&s->wait_ns_total);
+        uint64_t hold_ns = qatomic_read(&s->hold_ns_total);
+        BQL_LOG("tid=%d comm=%-16s acq=%" PRIu64
+                " wait_ms=%" PRIu64 " hold_ms=%" PRIu64
+                " avg_wait_us=%" PRIu64 " avg_hold_us=%" PRIu64,
+                s->tid, s->comm, acq,
+                wait_ns / 1000000ull, hold_ns / 1000000ull,
+                acq ? (wait_ns / acq / 1000ull) : 0,
+                acq ? (hold_ns / acq / 1000ull) : 0);
+    }
+}
+#endif
+
 /*
  * The BQL is taken from so many places that it is worth profiling the
  * callers directly, instead of funneling them all through a single function.
@@ -605,13 +705,34 @@ void bql_lock_impl(const char *file, int line)
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
 
     g_assert(!bql_locked());
+#ifdef XBOX
+    struct bql_thread_stats *s = bql_stats_get_self();
+    uint64_t start = bql_now_ns();
     bql_lock_fn(&bql, file, line);
+    uint64_t end = bql_now_ns();
+    if (s) {
+        s->wait_ns_total += end - start;
+        s->acquires++;
+        s->hold_start_ns = end;
+    }
+#else
+    bql_lock_fn(&bql, file, line);
+#endif
 }
 
 void bql_unlock(void)
 {
     g_assert(bql_locked());
     g_assert(!bql_unlock_blocked);
+#ifdef XBOX
+    {
+        struct bql_thread_stats *s = bql_stats_self;
+        if (s && s->hold_start_ns) {
+            s->hold_ns_total += bql_now_ns() - s->hold_start_ns;
+            s->hold_start_ns = 0;
+        }
+    }
+#endif
     qemu_mutex_unlock(&bql);
 }
 

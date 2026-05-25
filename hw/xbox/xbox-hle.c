@@ -60,8 +60,10 @@ static inline void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
 #include "xbox-hle.h"
 #include "hle-dsound-audio.h"
 #include "hw/xbox/nv2a/debug.h"  /* g_nv2a_stats — KiIdleLoop boot gate */
+#include "fpu/softfloat.h"        /* floatx80_to_float64, float64_to_floatx80 */
 #include <unistd.h>
 #include <string.h>
+#include <math.h>                 /* pow() for Halo 2 XBE pow HLE */
 #include <time.h>  /* nanosleep for KiIdleLoop yield */
 
 /* ARM SHA-1 crypto extensions for XcShaTransform HLE. */
@@ -2006,12 +2008,20 @@ static uint64_t g_idle_loop_yields;           /* host nanosleep entered */
 #define IDLE_LOOP_BOOT_FRAMES 30u
 
 /*
- * Yield window. Audio IRQ fires at ~600 Hz (~1.67ms cadence) and FLIP
- * IRQ at the guest's 30 fps (~33ms). 50µs is well under both, so we
- * miss neither — but it's >50× longer than the spin TB iteration, so
- * one yield replaces ~50× spin iters of guest CPU.
+ * Yield window.
+ *
+ * 2026-05-25 experiment: cutting yield_ns 50µs→500ns AND gate /16→/64
+ * dropped FPS 18.83 → 14.90 because the WALT governor on Tensor G4 /
+ * Snapdragon 8 Gen 2 NEEDS the busy-wake cadence to signal demand.
+ * Without periodic yields the CPU looks idle-bursty, governor downclocks
+ * cpu7 (1593 → 1363 MHz observed). Plus audio thread starves on BQL —
+ * Bink attract video stalls.
+ *
+ * Kept the proven config: 50µs nanosleep with BQL drop, every 16th
+ * idle-spin iter. Audio gets its BQL window, governor sees demand.
  */
-#define IDLE_LOOP_YIELD_NS  50000  /* 50µs */
+#define IDLE_LOOP_YIELD_NS_DEFAULT  50000  /* 50µs */
+static long g_idle_loop_yield_ns = IDLE_LOOP_YIELD_NS_DEFAULT;
 
 static bool hle_ki_idle_loop_spin(X86CPU *cpu)
 {
@@ -2096,6 +2106,16 @@ static bool hle_ki_idle_loop_spin(X86CPU *cpu)
     }
 
     /*
+     * Runtime-configurable yield window. =0 disables the yield (busy-
+     * spin only) — useful when the yield is firing too often during
+     * gameplay and starving the vCPU thread. Set 1000-5000 for a
+     * lighter yield, or stay at the 50µs default for max BQL fairness.
+     */
+    if (g_idle_loop_yield_ns <= 0) {
+        return false;
+    }
+
+    /*
      * CRITICAL: drop BQL during the nanosleep. The chain dispatcher's
      * xbox_hle_check runs with BQL held; if we sleep holding BQL,
      * mcpx.apu_thread and pgraph_vk.render block waiting for it →
@@ -2112,7 +2132,7 @@ static bool hle_ki_idle_loop_spin(X86CPU *cpu)
     if (had_bql) {
         bql_unlock();
     }
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = IDLE_LOOP_YIELD_NS };
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = g_idle_loop_yield_ns };
     nanosleep(&ts, NULL);
     if (had_bql) {
         bql_lock();
@@ -2471,6 +2491,96 @@ static const uint8_t SIG_MM_LOCK_UNLOCK_BUFFER_PAGES[] = {
 #define FATX_MATCH_NAME_VA  0x80030dbau
 #define MM_LOCK_UNLOCK_BUFFER_PAGES_VA 0x8001dfe7u
 
+/*
+ * Halo 2 XBE-side pow() HLE.
+ *
+ * The XBE ships a CRT pow at 0x00372d4a (wrapper) → 0x00372d6c (inner
+ * FYL2X implementation). 50+ call sites across the executable; one
+ * site alone (the 256-iteration gradient loop in FUN_00024ee0) calls
+ * it heavily per frame. With setting_x87_lib=true on the soft-fpu
+ * path each FYL2X is multi-microsecond, putting pow on the FPS
+ * critical path.
+ *
+ * ABI (deduced from 0x00372d4a wrapper):
+ *   Enter with x87 stack:  ST(0)=B, ST(1)=A (where A was pushed first)
+ *   Wrapper FXCH+FSTP+FST saves A at [ESP+8], B at [ESP]. Inner pow
+ *   uses ST(0)=A by the time FYL2X runs (ST(1)*log2(ST(0))).
+ *   So the result is: pow(A, B)  i.e.  base^exp where base=A (first
+ *   pushed) and exp=B (second pushed).
+ *
+ * HLE:
+ *   - Read ST(1)=A as base, ST(0)=B as exponent.
+ *   - Compute native libm pow(base, exp) at fp64 precision.
+ *   - Pop ST(0), replace new ST(0) (was ST(1)) with the result.
+ *   - Pop the return address off the stack (stdcall, 0 args because
+ *     pow uses FPU stack not stack args), set EIP.
+ *
+ * X1BOX_HLE_HALO2_POW_SWAP=1 flips the (base, exp) ABI guess if the
+ * default proves wrong (color/physics breakage). Counter g_halo2_pow_hits
+ * surfaces hit rate in xbox_hle_log_stats.
+ */
+#define HALO2_POW_WRAPPER_VA 0x00372d4au
+
+static bool g_gate_halo2_pow = true;
+static bool g_halo2_pow_swap = false;
+static uint64_t g_halo2_pow_hits;
+static uint64_t g_halo2_pow_declines;
+
+static bool hle_halo2_pow(X86CPU *cpu)
+{
+    if (!g_gate_halo2_pow) {
+        g_halo2_pow_declines++;
+        return false;
+    }
+    CPUX86State *env = &cpu->env;
+
+    /* ST(i) reads */
+    int s0_idx = env->fpstt & 7;
+    int s1_idx = (env->fpstt + 1) & 7;
+
+    /* Skip if either slot is empty (fptags[i]==1 means empty/invalid). */
+    if (env->fptags[s0_idx] || env->fptags[s1_idx]) {
+        g_halo2_pow_declines++;
+        return false;
+    }
+
+    floatx80 fa = env->fpregs[s1_idx].d;   /* ST(1) — base */
+    floatx80 fb = env->fpregs[s0_idx].d;   /* ST(0) — exponent */
+
+    float64 f64a = floatx80_to_float64(fa, &env->fp_status);
+    float64 f64b = floatx80_to_float64(fb, &env->fp_status);
+    union { float64 f; double d; } ua, ub, uc;
+    ua.f = f64a;
+    ub.f = f64b;
+
+    double base = ua.d;
+    double exp_  = ub.d;
+    if (g_halo2_pow_swap) {
+        double t = base; base = exp_; exp_ = t;
+    }
+
+    /* Native pow at fp64 precision. */
+    double result = pow(base, exp_);
+    uc.d = result;
+    floatx80 fr = float64_to_floatx80(uc.f, &env->fp_status);
+
+    /* Pop ST(0): mark empty, advance top. */
+    env->fptags[s0_idx] = 1;
+    env->fpstt = (env->fpstt + 1) & 7;
+
+    /* New ST(0) (was ST(1)) gets the result. */
+    int new_top = env->fpstt & 7;
+    env->fpregs[new_top].d = fr;
+    env->fptags[new_top] = 0;
+
+    g_halo2_pow_hits++;
+
+    /* Wrapper at 0x00372d4a is stdcall-0 from caller's POV (no stack
+     * args — uses FPU stack). RET in the inner pow pops 0 args.
+     * We just pop the return address. */
+    return hle_return_stdcall(env, 0);
+}
+
 static const struct extra_hook g_extra_hooks[] = {
     {
         KI_IDLE_LOOP_INNER_VA,
@@ -2529,6 +2639,14 @@ static bool hle_probe_decline(X86CPU *cpu)
 #define HALO2_VSH_PROBE_HI 0x003fad00u
 
 /*
+ * Halo 2 CRT math range — pow() at 0x00372d4a, floor/related at 0x00322b0c.
+ * The XBE's MSVC CRT functions live in this band. Widening the filter so
+ * the HLE table can be hit on these PCs.
+ */
+#define HALO2_CRT_MATH_LO 0x00372000u
+#define HALO2_CRT_MATH_HI 0x00373000u
+
+/*
  * Halo 2 intro-movie state-machine dispatcher.
  *
  * halo_intro_movie_loop (0x001639b0) calls a jumptable dispatcher
@@ -2576,6 +2694,7 @@ static const struct {
     { "D3DDevice_SetVertexShaderConstantNotInlineFast", 0x003f7330u, hle_probe_decline },
     { "D3DDevice_SetVertexShaderConstantNotInline_0",   0x003f7410u, hle_probe_decline },
     { "D3DDevice_MakeSpace",                            0x003fac20u, hle_probe_decline },
+    { "halo2_pow",                                       HALO2_POW_WRAPPER_VA, hle_halo2_pow },
 };
 
 /*
@@ -3156,6 +3275,8 @@ void xbox_hle_init(void)
         { "X1BOX_HLE_YIELD",  &g_gate_yield,  true  },
         { "X1BOX_HLE_DSOUND", &g_gate_dsound, false },
         { "X1BOX_HLE_DSOUND_BYPASS", &g_gate_dsound_bypass, false },
+        { "X1BOX_HLE_HALO2_POW",     &g_gate_halo2_pow,     true  },
+        { "X1BOX_HLE_HALO2_POW_SWAP", &g_halo2_pow_swap,    false },
     };
     for (size_t i = 0; i < ARRAY_SIZE(gates); i++) {
         const char *v = getenv(gates[i].name);
@@ -3163,8 +3284,19 @@ void xbox_hle_init(void)
         bool on = !(*v == '0' || *v == 'n' || *v == 'N');
         *gates[i].gate = on;
     }
-    HLE_LOG("HLE on: rtl=%d kf=%d yield=%d dsound=%d",
-            g_gate_rtl, g_gate_kf, g_gate_yield, g_gate_dsound);
+    {
+        const char *v = getenv("X1BOX_HLE_KI_IDLE_YIELD_NS");
+        if (v && *v) {
+            char *end = NULL;
+            long parsed = strtol(v, &end, 10);
+            if (end && *end == '\0' && parsed >= 0 && parsed <= 100000000L) {
+                g_idle_loop_yield_ns = parsed;
+            }
+        }
+    }
+    HLE_LOG("HLE on: rtl=%d kf=%d yield=%d dsound=%d ki_idle_yield_ns=%ld",
+            g_gate_rtl, g_gate_kf, g_gate_yield, g_gate_dsound,
+            g_idle_loop_yield_ns);
     sha1_init();
     if (g_gate_dsound) {
         hle_audio_init();
@@ -3236,7 +3368,9 @@ bool xbox_hle_check(CPUState *cs, uint32_t pc)
                        pc >= HALO2_DSOUND_PC_LO  && pc < HALO2_DSOUND_PC_HI);
     bool in_intro   = (pc >= HALO2_INTRO_DISPATCHER_LO &&
                        pc <  HALO2_INTRO_DISPATCHER_HI);
-    if (!in_kernel && !in_xbe_vsh && !in_dsound && !in_intro) {
+    bool in_crt     = (g_gate_halo2_pow &&
+                       pc >= HALO2_CRT_MATH_LO   && pc < HALO2_CRT_MATH_HI);
+    if (!in_kernel && !in_xbe_vsh && !in_dsound && !in_intro && !in_crt) {
         /* User-mode PC sampler: covers the case where Halo 2 wedges
          * in title-screen XBE code (g frozen, chain dispatcher still
          * running). Range 0x10000..0x80000000 covers the XBE image
@@ -3335,6 +3469,9 @@ void xbox_hle_log_stats(void)
             g_idle_loop_yields);
     HLE_LOG("keqpc_fast_hits=%" PRIu64 " (inline cntvct path)",
             g_keqpc_fast_hits);
+    HLE_LOG("halo2_pow hits=%" PRIu64 " declines=%" PRIu64 " swap=%d gate=%d",
+            g_halo2_pow_hits, g_halo2_pow_declines,
+            g_halo2_pow_swap, g_gate_halo2_pow);
 
     /* Cross-check: how many SET_TRANSFORM_CONSTANT slot writes pgraph saw
      * vs. how many of those slot writes were redundant (value unchanged).

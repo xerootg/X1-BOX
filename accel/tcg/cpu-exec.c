@@ -303,10 +303,13 @@ static inline void tier1_maybe_form_superblock(CPUState *cpu,
  * Uses a simple call counter rather than real time to avoid clock overhead.
  */
 #define TIER1_BUDGET_RESET_INTERVAL 100000
+/* TIER1_LOG_INTERVAL was 50 (=> stats dump every 5M tier-1 dispatches),
+ * lowered to 5 for active perf debugging so the BQL/chain/LRU stats
+ * surface every ~500K dispatches (a few seconds on Halo 2 gameplay). */
 static uint32_t tier1_budget_counter;
 
 static uint32_t tier1_log_counter;
-#define TIER1_LOG_INTERVAL 50
+#define TIER1_LOG_INTERVAL 5
 
 static inline void tier1_maybe_reset_budget(void)
 {
@@ -702,7 +705,22 @@ struct helper_tb_lru_slot {
     uint32_t cflags;
     TranslationBlock *tb;
 };
-static __thread struct {
+/*
+ * Plain static storage (NOT __thread).
+ *
+ * Per-vCPU LRU was originally __thread. On Android Bionic, __thread
+ * access compiles to __emutls_get_address (a function call resolving
+ * the thread-local slot — measured 1.5% of vCPU in helper_lookup_tb_ptr
+ * profiles) plus tlsdesc_resolver_dynamic (1.5%) plus pthread_getspecific
+ * (1.5%) — about 5% of vCPU on TLS alone.
+ *
+ * xemu is single-vCPU on Android (target/i386 has CPU 0/TCG only). The
+ * LRU data is read+written ONLY from the vCPU thread (helper_lookup_tb_ptr
+ * is called from generated guest code which only runs on that thread).
+ * No TLS isolation needed; plain statics give us register/cache-line
+ * access via the linker's GOT, no function call.
+ */
+static struct {
     struct helper_tb_lru_slot slots[2];
     unsigned last_flush_count;
 } helper_tb_lru;
@@ -830,11 +848,17 @@ static vaddr log_pc(CPUState *cpu, const TranslationBlock *tb)
  *
  * Recursion guard: a Cranelift TB calls this helper, the helper does
  * tb_exec on the next TB, that TB might also be Cranelift and call
- * this helper again. The TLS flag prevents nested chains from looping
+ * this helper again. The flag prevents nested chains from looping
  * — only the outermost helper iterates; nested calls return 0 to fall
  * back into the outer loop.
+ *
+ * Plain static (was __thread). Single-vCPU on Android means there's
+ * exactly one writer/reader. __thread compiled to __emutls_get_address
+ * (function call, ~50-100ns per access) — measured 1.5% of vCPU cost.
+ * Plain static is a direct load (~3ns). This bit is read on EVERY
+ * tier-2 TB exit (via chain_continue), so the saving compounds.
  */
-static __thread bool cranelift_in_chain;
+static bool cranelift_in_chain;
 
 /*
  * Quantum tunables.
