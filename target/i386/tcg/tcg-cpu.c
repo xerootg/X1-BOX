@@ -67,6 +67,40 @@ static TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs)
     return (TCGTBCPUState){ .pc = pc, .flags = flags, .cs_base = cs_base };
 }
 
+#ifdef XBOX
+/*
+ * Fast variant for the Cranelift chain dispatcher (cranelift_chain_continue).
+ *
+ * The chain calls get_tb_cpu_state on every iter; the vtable indirection
+ * through cpu->cc->tcg_ops->get_tb_cpu_state plus the redundant env loads
+ * showed up as 0.44% of process samples in the 2026-05-24 Halo 2 profile.
+ *
+ * Skipping the vtable saves one indirect-call + one load. The body is
+ * intentionally identical to x86_get_tb_cpu_state so codegen stays the
+ * same — only the call site differs.
+ *
+ * Declared in accel/tcg/cranelift-bridge.h alongside the existing
+ * xemu_chain_thread_fingerprint helper.
+ */
+TCGTBCPUState xemu_chain_get_tb_cpu_state(CPUArchState *env)
+{
+    uint32_t flags, cs_base;
+    vaddr pc;
+
+    flags = env->hflags |
+        (env->eflags & (IOPL_MASK | TF_MASK | RF_MASK | VM_MASK | AC_MASK));
+    if (env->hflags & HF_CS64_MASK) {
+        cs_base = 0;
+        pc = env->eip;
+    } else {
+        cs_base = env->segs[R_CS].base;
+        pc = (uint32_t)(cs_base + env->eip);
+    }
+
+    return (TCGTBCPUState){ .pc = pc, .flags = flags, .cs_base = cs_base };
+}
+#endif
+
 static void x86_cpu_synchronize_from_tb(CPUState *cs,
                                         const TranslationBlock *tb)
 {

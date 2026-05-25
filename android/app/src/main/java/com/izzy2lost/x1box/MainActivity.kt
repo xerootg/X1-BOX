@@ -154,6 +154,15 @@ class MainActivity : SDLActivity(), InputManager.InputDeviceListener {
       ?: prefs.getString("setting_renderer", "vulkan")
       ?: "vulkan"
     nativeSetenv("XEMU_RENDERER", if (rendererPref == "opengl") "opengl" else "vulkan")
+    // Hand the per-game tier-2 JIT cache directory to the Cranelift
+    // bridge. LauncherActivity writes this to prefs right before
+    // starting MainActivity (in the :xemu process). Empty value =
+    // cache disabled for this run.
+    val jitCacheDir = prefs.getString("jit_cache_dir", null)
+    if (!jitCacheDir.isNullOrEmpty()) {
+      java.io.File(jitCacheDir).mkdirs()
+      nativeSetenv("X1BOX_JIT_CACHE_DIR", jitCacheDir)
+    }
     OrientationLocker(this, landscapeOnly = true).enable()
     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     val requestedSlot = intent?.getIntExtra(EXTRA_AUTO_LOAD_SNAPSHOT_SLOT, 0) ?: 0

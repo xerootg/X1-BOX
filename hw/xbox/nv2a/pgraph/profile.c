@@ -19,6 +19,9 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "hw/xbox/xpacks.h"
+#ifdef XBOX
+#include "qemu/burst_diag.h"
+#endif
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -32,6 +35,9 @@ NV2AStats g_nv2a_stats;
 
 void nv2a_profile_increment(void)
 {
+#ifdef XBOX
+    burst_diag_on_flip_stall();
+#endif
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     const int64_t fps_update_interval = 250000;
     g_nv2a_stats.last_flip_time = now;

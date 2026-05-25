@@ -18,6 +18,7 @@ specific_ss.add(files(
 	'xid-gamepad.c',
 	'xpacks.c',
 	'xbox-hle.c',
+	'hle-dsound-audio.c',
 	))
 subdir('nv2a')
 subdir('mcpx')

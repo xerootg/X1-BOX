@@ -43,6 +43,14 @@ pub struct EnvDesc {
     /// call_indirect here instead. 0 means flcr is unsupported and
     /// the lowering returns UnsupportedOp.
     pub flcr_fn: u64,
+    /// Address of `helper_cc_compute_all(dst, src1, src2, op)` — the
+    /// lazy-eflags materialisation helper from target/i386/tcg/
+    /// cc_helper.c. The translator pattern-matches Call carg(0)
+    /// against this and replaces the call with an inline if-ladder
+    /// that handles CC_OP_EFLAGS (0 -> return src1) directly and
+    /// falls through to a real call for everything else. 0 disables
+    /// the inline path.
+    pub cc_compute_all_fn: u64,
 }
 
 impl EnvDesc {
@@ -65,6 +73,7 @@ impl EnvDesc {
             chain_continue_fn: 0,
             lookup_tb_ptr_fn: 0,
             flcr_fn: 0,
+            cc_compute_all_fn: 0,
         }
     }
 
@@ -87,6 +96,7 @@ impl EnvDesc {
         chain_continue_fn: u64,
         lookup_tb_ptr_fn: u64,
         flcr_fn: u64,
+        cc_compute_all_fn: u64,
     ) -> Self {
         let mut out = Vec::with_capacity(nb_globals as usize);
         if !globals.is_null() && nb_globals > 0 {
@@ -120,6 +130,7 @@ impl EnvDesc {
             chain_continue_fn,
             lookup_tb_ptr_fn,
             flcr_fn,
+            cc_compute_all_fn,
         }
     }
 }

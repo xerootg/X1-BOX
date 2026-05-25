@@ -1094,6 +1094,16 @@ void helper_fadd_ST0_FT0(CPUX86State *env)
 {
     FPU_HELPER_COUNT();
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FADD)) {
+        floatx80 r;
+        uint16_t sw = x87lib_fadd(ST0, FT0, &r, &env->fp_status);
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST0 = floatx80_add(ST0, FT0, &env->fp_status);
     merge_exception_flags(env, old_flags);
 }
@@ -1102,6 +1112,16 @@ void helper_fmul_ST0_FT0(CPUX86State *env)
 {
     FPU_HELPER_COUNT();
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FMUL)) {
+        floatx80 r;
+        uint16_t sw = x87lib_fmul(ST0, FT0, &r, &env->fp_status);
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST0 = floatx80_mul(ST0, FT0, &env->fp_status);
     merge_exception_flags(env, old_flags);
 }
@@ -1110,6 +1130,16 @@ void helper_fsub_ST0_FT0(CPUX86State *env)
 {
     FPU_HELPER_COUNT();
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FSUB)) {
+        floatx80 r;
+        uint16_t sw = x87lib_fsub(ST0, FT0, &r, &env->fp_status);
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST0 = floatx80_sub(ST0, FT0, &env->fp_status);
     merge_exception_flags(env, old_flags);
 }
@@ -1118,6 +1148,16 @@ void helper_fsubr_ST0_FT0(CPUX86State *env)
 {
     FPU_HELPER_COUNT();
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FSUB)) {
+        floatx80 r;
+        uint16_t sw = x87lib_fsubr(ST0, FT0, &r, &env->fp_status);
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST0 = floatx80_sub(FT0, ST0, &env->fp_status);
     merge_exception_flags(env, old_flags);
 }
@@ -1125,12 +1165,34 @@ void helper_fsubr_ST0_FT0(CPUX86State *env)
 void helper_fdiv_ST0_FT0(CPUX86State *env)
 {
     FPU_HELPER_COUNT();
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FDIV)) {
+        int old_flags = save_exception_flags(env);
+        floatx80 r;
+        uint16_t sw = x87lib_fdiv(ST0, FT0, &r, &env->fp_status);
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST0 = helper_fdiv(env, ST0, FT0);
 }
 
 void helper_fdivr_ST0_FT0(CPUX86State *env)
 {
     FPU_HELPER_COUNT();
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FDIV)) {
+        int old_flags = save_exception_flags(env);
+        floatx80 r;
+        uint16_t sw = x87lib_fdivr(ST0, FT0, &r, &env->fp_status);
+        ST0 = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST0 = helper_fdiv(env, FT0, ST0);
 }
 
@@ -1139,6 +1201,16 @@ void helper_fdivr_ST0_FT0(CPUX86State *env)
 void helper_fadd_STN_ST0(CPUX86State *env, int st_index)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FADD)) {
+        floatx80 r;
+        uint16_t sw = x87lib_fadd(ST(st_index), ST0, &r, &env->fp_status);
+        ST(st_index) = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST(st_index) = floatx80_add(ST(st_index), ST0, &env->fp_status);
     merge_exception_flags(env, old_flags);
 }
@@ -1146,6 +1218,16 @@ void helper_fadd_STN_ST0(CPUX86State *env, int st_index)
 void helper_fmul_STN_ST0(CPUX86State *env, int st_index)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FMUL)) {
+        floatx80 r;
+        uint16_t sw = x87lib_fmul(ST(st_index), ST0, &r, &env->fp_status);
+        ST(st_index) = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST(st_index) = floatx80_mul(ST(st_index), ST0, &env->fp_status);
     merge_exception_flags(env, old_flags);
 }
@@ -1153,6 +1235,16 @@ void helper_fmul_STN_ST0(CPUX86State *env, int st_index)
 void helper_fsub_STN_ST0(CPUX86State *env, int st_index)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FSUB)) {
+        floatx80 r;
+        uint16_t sw = x87lib_fsub(ST(st_index), ST0, &r, &env->fp_status);
+        ST(st_index) = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST(st_index) = floatx80_sub(ST(st_index), ST0, &env->fp_status);
     merge_exception_flags(env, old_flags);
 }
@@ -1160,17 +1252,49 @@ void helper_fsub_STN_ST0(CPUX86State *env, int st_index)
 void helper_fsubr_STN_ST0(CPUX86State *env, int st_index)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FSUB)) {
+        floatx80 r;
+        uint16_t sw = x87lib_fsubr(ST(st_index), ST0, &r, &env->fp_status);
+        ST(st_index) = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST(st_index) = floatx80_sub(ST0, ST(st_index), &env->fp_status);
     merge_exception_flags(env, old_flags);
 }
 
 void helper_fdiv_STN_ST0(CPUX86State *env, int st_index)
 {
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FDIV)) {
+        int old_flags = save_exception_flags(env);
+        floatx80 r;
+        uint16_t sw = x87lib_fdiv(ST(st_index), ST0, &r, &env->fp_status);
+        ST(st_index) = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST(st_index) = helper_fdiv(env, ST(st_index), ST0);
 }
 
 void helper_fdivr_STN_ST0(CPUX86State *env, int st_index)
 {
+#if defined(XBOX) && !defined(USE_HARD_FPU)
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FDIV)) {
+        int old_flags = save_exception_flags(env);
+        floatx80 r;
+        uint16_t sw = x87lib_fdivr(ST(st_index), ST0, &r, &env->fp_status);
+        ST(st_index) = r;
+        x87lib_apply_status_flags(sw, &env->fp_status);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     ST(st_index) = helper_fdiv(env, ST0, ST(st_index));
 }
 
@@ -1653,7 +1777,7 @@ void helper_f2xm1(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_F2XM1)) {
         floatx80 r;
         uint16_t sw = x87lib_f2xm1(ST0, &r, &env->fp_status);
         ST0 = r;
@@ -1829,7 +1953,7 @@ void helper_f2xm1(CPUX86State *env)
 void helper_fptan(CPUX86State *env)
 {
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FPTAN)) {
         floatx80 t, one;
         uint16_t sw = x87lib_fptan(ST0, &t, &one, &env->fp_status);
         if (sw & 0x400) {
@@ -1919,7 +2043,7 @@ void helper_fpatan(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FPATAN)) {
         floatx80 r;
         /* Intel FPATAN: ST(1) = atan(ST(1)/ST(0)); pop. Lib's
          * x87_fpatan(src1, src2) computes atan2(src2, src1) — i.e.
@@ -2380,7 +2504,7 @@ void helper_fxtract(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FXTRACT)) {
         floatx80 exp_val, sig_val;
         uint16_t sw = x87lib_fxtract(ST0, &exp_val, &sig_val, &env->fp_status);
         ST0 = exp_val;
@@ -2457,7 +2581,7 @@ static void helper_fprem_common(CPUX86State *env, bool mod)
     uint64_t quotient;
 
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FPREM)) {
         floatx80 r;
         uint16_t sw;
         /* mod=true → fprem (truncated quotient), mod=false → fprem1 (nearest). */
@@ -2693,7 +2817,7 @@ void helper_fyl2xp1(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FYL2XP1)) {
         floatx80 r;
         uint16_t sw = x87lib_fyl2xp1(ST0, ST1, &r, &env->fp_status);
         ST1 = r;
@@ -2809,7 +2933,7 @@ void helper_fyl2x(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FYL2X)) {
         floatx80 r;
         /* Intel FYL2X: ST(1) = ST(1) * log2(ST(0)); pop.
          * Lib signature x87_fyl2x(src1=x, src2=y, dst) → log2(x)*y. */
@@ -2974,7 +3098,7 @@ void helper_fsqrt(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FSQRT)) {
         if (floatx80_is_neg(ST0)) {
             env->fpus &= ~0x4700;
             env->fpus |= 0x400;
@@ -2998,7 +3122,7 @@ void helper_fsqrt(CPUX86State *env)
 void helper_fsincos(CPUX86State *env)
 {
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FSINCOS)) {
         floatx80 s, c;
         uint16_t sw = x87lib_fsincos(ST0, &s, &c, &env->fp_status);
         /* If C2 set, lib didn't compute: leave stack alone (no push), source
@@ -3033,7 +3157,7 @@ void helper_frndint(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FRNDINT)) {
         floatx80 r;
         uint16_t sw = x87lib_frndint(ST0, &r, &env->fp_status);
         ST0 = r;
@@ -3050,7 +3174,7 @@ void helper_fscale(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FSCALE)) {
         floatx80 r;
         /* Intel FSCALE: ST(0) = ST(0) * 2^trunc(ST(1)). Lib expects
          * src1 = base (ST(0)), src2 = exponent (ST(1)). */
@@ -3112,7 +3236,7 @@ void helper_fscale(CPUX86State *env)
 void helper_fsin(CPUX86State *env)
 {
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FSIN)) {
         floatx80 r;
         uint16_t sw = x87lib_fsin(ST0, &r, &env->fp_status);
         ST0 = r;
@@ -3137,7 +3261,7 @@ void helper_fsin(CPUX86State *env)
 void helper_fcos(CPUX86State *env)
 {
 #if defined(XBOX) && !defined(USE_HARD_FPU)
-    if (xemu_get_x87_lib()) {
+    if (xemu_get_x87_lib_op(X87_LIB_OP_FCOS)) {
         floatx80 r;
         uint16_t sw = x87lib_fcos(ST0, &r, &env->fp_status);
         ST0 = r;

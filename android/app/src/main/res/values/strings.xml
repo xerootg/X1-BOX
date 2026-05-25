@@ -375,6 +375,11 @@
   <string name="library_custom_cover_removed">Custom cover removed</string>
   <string name="library_custom_cover_failed">Failed to save custom cover</string>
   <string name="library_per_game_settings_option">Per-Game Settings</string>
+  <string name="library_clear_jit_cache_option">Clear CPU JIT Cache</string>
+  <string name="library_clear_jit_cache_confirm_title">Clear CPU JIT cache?</string>
+  <string name="library_clear_jit_cache_confirm_message">Removes the persisted tier-2 (Cranelift) JIT cache for “%1$s”. The cache rebuilds automatically on next boot — first few seconds will be slightly slower until it warms back up.</string>
+  <string name="library_clear_jit_cache_done">JIT cache cleared (%1$d files removed)</string>
+  <string name="library_clear_jit_cache_empty">No JIT cache to clear</string>
 
   <string name="per_game_settings_title">Per-Game Settings</string>
   <string name="per_game_settings_intro">Choose only the settings this game should override. Leave a field on Use Global to keep the normal app setting.</string>

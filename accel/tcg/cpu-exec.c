@@ -51,6 +51,7 @@
 #include "cranelift-bridge.h"
 #ifdef XBOX
 #include "hw/xbox/xbox-hle.h"
+#include "qemu/burst_diag.h"
 #endif
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -704,6 +705,8 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
         return tcg_code_gen_epilogue;
     }
 
+    BURST_DIAG_BUMP_TB_LOOKUP_PC(s.pc);
+
     if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
         log_cpu_exec(s.pc, cpu, tb);
     }
@@ -742,24 +745,20 @@ static __thread bool cranelift_in_chain;
 /*
  * Quantum tunables.
  *
- * Cap base defaults to 16 (lowered from 64 on 2026-05-21 after the BQL
- * hold-time regressed MCPX apu_thread IRQ delivery). On top of that we
- * add a small Lehmer-LCG jitter so that consecutive chains don't all
- * exit on the same TB boundary — that lock-step alignment is what
- * Cemu's PPCScheduler.cpp:1281 documents as the OSLockMutex livelock
- * in Mario Party 10 early boot, and the same pattern shows up in the
- * Halo 2 post-load vCPU wedge (project_halo2_post_load_hang).
+ * Base bumped 16→32 on 2026-05-24 after profile showed helper_lookup_tb_ptr
+ * at 4.2% + qht_lookup_custom at 2.44% — each chain exit re-enters the
+ * dispatcher and walks the hash table. Doubling chain depth halves the
+ * dispatch-side cost on hot loops without crossing the BQL-unfriendly 64
+ * threshold (worst case with jitter mask 0x1F is 63). Audio safety is
+ * still bounded by the per-iter interrupt_request check.
  *
- * Jitter is `& JITTER_MASK` (0..15 by default), so chain length is
- * 16..31 TBs — still well inside the audio-safe envelope of the prior
- * fixed 16 (chain length is bounded above by 31 even with worst-case
- * jitter, vs. the BQL-unfriendly 64 we walked back from).
+ * Jitter is `& JITTER_MASK` (default 0x1F), so chain length is 32..63 TBs.
  *
  * X1BOX_CHAIN_MAX=<N> overrides the base at init (1..256).
- * X1BOX_CHAIN_JITTER=<2^N-1> can widen jitter (default mask = 0xF).
+ * X1BOX_CHAIN_JITTER=<2^N-1> can widen jitter (default mask = 0x1F).
  */
-static unsigned cranelift_chain_max_base = 16;
-static uint32_t cranelift_chain_jitter_mask = 0xF;
+static unsigned cranelift_chain_max_base = 32;
+static uint32_t cranelift_chain_jitter_mask = 0x1F;
 
 /* Per-vCPU Lehmer LCG state. __thread keeps it cache-local + race-free.
  * Modulus is Cemu's: 2^32 - 5 (the largest prime under 2^32). */
@@ -857,23 +856,115 @@ uintptr_t cranelift_chain_continue(CPUArchState *env)
      * back; bump it on tb_lookup misses instead (those are the rare
      * legitimate "something weird" signals).
      */
+    /*
+     * Chain-local 2-slot last-tb cache.
+     *
+     * Halo 2 hot loops are 1-3 TB cycles. The CPU's tb_jmp_cache (4K entries
+     * keyed by tb_jmp_cache_hash_func(pc)) already absorbs most lookups, but
+     * the hash + array load + cmp chain still shows up as ~2.4% of profile
+     * via qht_lookup_custom on JC misses + the hot JC-hit path itself.
+     *
+     * A tiny stack-local 2-slot cache catches the dominant 1-2 TB self-loop
+     * before tb_lookup() runs at all, replacing the hash/array dance with
+     * 4 register compares. Slot 0 is MRU.
+     *
+     * Pointer safety: tb_flush only runs at safe points outside guest exec
+     * (and the chain holds cranelift_in_chain=true, blocking re-entry).
+     * Within one cranelift_chain_continue call the cached TB pointers stay
+     * live — but we still re-check tb_cflags for CF_INVALID in case an
+     * async invalidation marked the slot dead between iters.
+     */
+    struct { vaddr pc; uint64_t cs_base; uint32_t flags; uint32_t cflags;
+             TranslationBlock *tb; } tb_lru[2] = {{0}};
+
     unsigned iters = 0;
     while (iters++ < chain_max) {
         if (qatomic_read(&cpu->exit_request)) {
             break;
         }
-        if (cpu->interrupt_request) {
-            cranelift_chain_irq_exits++;
-            break;
-        }
+
+#ifdef XBOX
+        /* Direct target-side call avoids the cc->tcg_ops vtable hop —
+         * see xemu_chain_get_tb_cpu_state() in target/i386/tcg/tcg-cpu.c. */
+        TCGTBCPUState s = xemu_chain_get_tb_cpu_state(env);
+#else
         TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
+#endif
         s.cflags = curr_cflags(cpu);
         if (s.cflags & CF_INVALID) {
             break;
         }
-        TranslationBlock *tb = tb_lookup(cpu, s);
-        if (!tb) {
+
+        /*
+         * Standard interrupt check — break on any pending interrupt.
+         * Inhibit handling lives in the outer cpu_loop's
+         * cpu_handle_interrupt → x86_cpu_pending_interrupt path which
+         * already gates HARD IRQs on `!(env->hflags & HF_INHIBIT_IRQ_MASK)`
+         * (target/i386/cpu.c:9879). When inhibit is set, pending=0,
+         * dispatcher continues to the next TB (the post-STI clear TB)
+         * which clears inhibit; the iter after that delivers the IRQ
+         * naturally.
+         *
+         * Earlier attempt: gate this break on inhibit too. That caused
+         * Halo 2 title-screen corruption — diagnosis pending. Reverted
+         * to the standard break here while the filter removal stands
+         * or falls on its own merits.
+         */
+        if (cpu->interrupt_request) {
+            cranelift_chain_irq_exits++;
+            /* Diagnose which IRQ bit is set when chains collapse. The
+             * persistent avg=1.01 / irq_exits=99.97% pattern that
+             * wedges Halo 2's title screen needs the bit identity to
+             * trace the source. Throttle to once per ~1M breaks so the
+             * log isn't a torrent. */
+            {
+                static __thread uint64_t irq_log_skip;
+                if ((++irq_log_skip & 0xFFFFFu) == 0u) {
+                    uint32_t bits = qatomic_read(&cpu->interrupt_request);
+                    __android_log_print(ANDROID_LOG_INFO,
+                        "x1-cranelift",
+                        "chain irq break: req=0x%08x "
+                        "HARD=%d EXITTB=%d HALT=%d",
+                        bits,
+                        !!(bits & CPU_INTERRUPT_HARD),
+                        !!(bits & CPU_INTERRUPT_EXITTB),
+                        !!(bits & CPU_INTERRUPT_HALT));
+                }
+            }
             break;
+        }
+
+        TranslationBlock *tb = NULL;
+        if (likely(tb_lru[0].tb && tb_lru[0].pc == s.pc &&
+                   tb_lru[0].cs_base == s.cs_base &&
+                   tb_lru[0].flags == s.flags &&
+                   tb_lru[0].cflags == s.cflags &&
+                   !(tb_cflags(tb_lru[0].tb) & CF_INVALID))) {
+            tb = tb_lru[0].tb;
+        } else if (tb_lru[1].tb && tb_lru[1].pc == s.pc &&
+                   tb_lru[1].cs_base == s.cs_base &&
+                   tb_lru[1].flags == s.flags &&
+                   tb_lru[1].cflags == s.cflags &&
+                   !(tb_cflags(tb_lru[1].tb) & CF_INVALID)) {
+            /* Promote slot 1 to MRU. */
+            tb = tb_lru[1].tb;
+            tb_lru[1] = tb_lru[0];
+            tb_lru[0].pc = s.pc;
+            tb_lru[0].cs_base = s.cs_base;
+            tb_lru[0].flags = s.flags;
+            tb_lru[0].cflags = s.cflags;
+            tb_lru[0].tb = tb;
+        } else {
+            tb = tb_lookup(cpu, s);
+            if (!tb) {
+                break;
+            }
+            tb_lru[1] = tb_lru[0];
+            tb_lru[0].pc = s.pc;
+            tb_lru[0].cs_base = s.cs_base;
+            tb_lru[0].flags = s.flags;
+            tb_lru[0].cflags = s.cflags;
+            tb_lru[0].tb = tb;
         }
 
         /*

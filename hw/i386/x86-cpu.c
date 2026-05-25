@@ -35,8 +35,47 @@
 uint64_t cpu_get_tsc(CPUX86State *env)
 {
 #ifdef XBOX
+    /*
+     * Xbox CPU runs at 733.333 MHz. Profiled Halo 2 first level:
+     * vDSO __kernel_clock_gettime was 4.87% of total CPU on the vCPU
+     * thread, and KeQueryPerformanceCounter HLE hits=0 — so Halo 2
+     * polls RDTSC directly (compiled into game code, never going
+     * through a kernel hook). Each RDTSC was costing us a
+     * qemu_clock_get_ns → cpus_get_virtual_clock → clock_gettime
+     * syscall path; that's ~50 cycles for a one-instruction RDTSC.
+     *
+     * On aarch64 hosts we sidestep the entire timer stack by reading
+     * ARM's cntvct_el0 directly (1 mrs instruction, ~1 cycle) and
+     * scaling to 733 MHz with a cached 96.32 fixed-point multiplier
+     * computed once from cntfrq_el0. That's a single mrs + umulh per
+     * RDTSC. Halo 2's game timing only cares about monotonic
+     * elapsed-cycle counts, not host-vs-guest pause semantics.
+     *
+     * Non-aarch64 builds (host testing) keep the slow path.
+     */
+#if defined(__aarch64__)
+    {
+        static uint64_t s_mul;
+        static bool s_init;
+        if (__builtin_expect(!s_init, 0)) {
+            uint64_t cntfrq;
+            __asm__("mrs %0, cntfrq_el0" : "=r"(cntfrq));
+            if (cntfrq == 0) {
+                cntfrq = 19200000ULL;
+            }
+            /* mul = (733333333 << 32) / cntfrq. Fits in 64 bits:
+             * 733333333 * 2^32 ≈ 3.15e18 < 2^64. */
+            s_mul = (733333333ULL << 32) / cntfrq;
+            s_init = true;
+        }
+        uint64_t v;
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+        return (uint64_t)(((unsigned __int128)v * s_mul) >> 32);
+    }
+#else
     return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), 733333333,
                     NANOSECONDS_PER_SECOND);
+#endif
 #else
     return cpus_get_elapsed_ticks();
 #endif

@@ -113,6 +113,17 @@ class LauncherActivity : Activity() {
           launchEditor.remove("dvdUri")
         }
       }
+      // Tier-2 JIT cache directory for this specific game. Derived from
+      // the relativePath so it's stable across launches AND matches the
+      // GameLibraryActivity "Clear CPU JIT Cache" target. Native side
+      // reads X1BOX_JIT_CACHE_DIR from env (set by MainActivity).
+      val cacheRelative = frontendLaunch.relativePath
+      if (!cacheRelative.isNullOrEmpty()) {
+        val cacheDir = JitCachePaths.dirForRelativePath(this, cacheRelative)
+        launchEditor.putString("jit_cache_dir", cacheDir.absolutePath)
+      } else {
+        launchEditor.remove("jit_cache_dir")
+      }
       launchEditor.commit()
 
       if (hasMcpx && hasFlash && hasHdd) {

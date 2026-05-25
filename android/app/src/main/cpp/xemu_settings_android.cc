@@ -295,6 +295,34 @@ bool xemu_settings_load(void)
     setenv("XEMU_ANDROID_TCG_TUNING", "1", 1);
     setenv("XEMU_ANDROID_TCG_THREAD", "multi", 1);
     setenv("XEMU_ANDROID_TCG_TB_SIZE", "128", 1);
+    /* Production default on Android: 4-worker MCPX voice fanout.
+     *
+     * History: we briefly defaulted to 1 inline worker (2026-05-22) on
+     * the basis that Pixel 10a's Tensor G4 mid cluster saw 22.35 vs
+     * 8.5 FPS on Halo 2 battle scene with num_workers=1 vs =4 — the
+     * cond_broadcast/cond_wait fanout overhead dominated parallel voice
+     * work on that SoC.
+     *
+     * Reverted to 4 (2026-05-23) because num_workers=1 broke RECORDED
+     * audio (Bink intros, attract video). Bink decodes audio in the
+     * guest CPU and feeds it into a CDirectSoundBuffer ring at ~250 Hz
+     * via Lock + SetCurrentPosition (see [[project_dsound_hle_scaffold]]
+     * Ghidra anchors FUN_003e0530 + FUN_003e3a10). With a single inline
+     * worker on apu_thread, any scheduling jitter on apu_thread misses
+     * Bink's 50 ms refill quantum → ring underrun → tinny / sample-rate-
+     * mismatch artifacts on every recorded clip. Live game audio is
+     * fine at num_workers=1 (independent voices, no ring-write
+     * dependency on apu_thread).
+     *
+     * Audio correctness wins. Strong SoCs (Snapdragon 8 Gen 2+, Elite)
+     * already absorb the fanout cost well. Pixel 10a perf regression
+     * on this default is recoverable via the env var
+     *   XEMU_ANDROID_VP_WORKERS=1
+     * (set in the launcher's env_vars pref). Document that as the
+     * Pixel-specific knob; default stays at 4 for everyone else.
+     *
+     * "1" flag = overwrite any prior env, so this default is unambiguous. */
+    setenv("XEMU_ANDROID_VP_WORKERS", "2", 1);
     /* Xbox kernel HLE: default ON now that the ordinal table is
      * Ghidra-verified against the running Halo 2 retail kernel and
      * every install path goes through `prologue_matches()`. Active
@@ -304,12 +332,62 @@ bool xemu_settings_load(void)
      * lands. Set X1BOX_HLE=0 to disable, or per-family
      * X1BOX_HLE_YIELD=0 / _KF=0. */
     setenv("X1BOX_HLE", "1", 0);
-    /* SSE scalar inline emit: default ON. Requires fp_jit=true (the
-     * inline gate also checks g_use_fp_jit). Worth ~1.55% TCG on Halo 2
-     * with hard FPU enabled. Set X1BOX_SSE_INLINE=0 to fall back to the
-     * helper path, or per-op X1BOX_SSE_INLINE_{ADD,SUB,MUL,DIV,SQRT,COMI}
-     * for bisection. See project_sse_scalar_inline_gated.md. */
-    setenv("X1BOX_SSE_INLINE", "1", 0);
+    /* SSE scalar inline emit: default OFF.
+     *
+     * Was default-ON for ~1.55% TCG savings on Halo 2 hardware-FPU
+     * builds — but the inline path emits tcg_gen_mul_f32/f64 which
+     * lower to NEON FMUL/FADD on aarch64. NEON's FPCR rounding +
+     * denormal handling doesn't exactly match Intel SSE MXCSR
+     * semantics, and the ~1-ULP/op drift accumulates into Halo 2's
+     * physics integrator: persistent momentum on walk-stop, sliding
+     * static characters, can't step up on minor surfaces. Bisected
+     * 2026-05-24 against the x87 lib op mask (all lib ops on with
+     * SSE_INLINE off ⇒ physics correct; all lib ops on with
+     * SSE_INLINE on ⇒ drift independent of which lib bits are set).
+     *
+     * Set X1BOX_SSE_INLINE=1 to opt in for the perf win on builds /
+     * games that don't depend on bit-exact SSE rounding. Per-op gates
+     * X1BOX_SSE_INLINE_{ADD,SUB,MUL,DIV,SQRT,COMI}=1 are still
+     * available for fine-grained bisection. See
+     * project_sse_scalar_inline_gated.md. */
+    setenv("X1BOX_SSE_INLINE", "0", 0);
+    /* x87 lib per-instruction bisection mask. Production default 0x4FF
+     * = bits 0-7 lib (arith/log/sqrt class) + bit 10 FSCALE lib;
+     * bits 8/9/11/12 (FSINCOS/FRNDINT/FSIN/FCOS) fall through to QEMU
+     * softfloat. Reached by bisection 2026-05-22 — see
+     * HANDOFF_x87_lib_bisection.md.
+     *
+     * Why FSCALE-lib is load-bearing: QEMU softfloat helper_fscale
+     * (fpu_helper.c) feeds ST(1) through floatx80_to_int32_round_to_zero
+     * then floatx80_scalbn. Per Intel SDM, FSCALE with |ST(1)| > 2^15 is
+     * implementation-defined; softfloat saturates int32 then collapses
+     * the magnitude to subnormal/zero, which Halo 2's projectile physics
+     * multiplies into near-infinity ("rocket-physics on shoot").
+     * Aaron Giles' lib clamps the exponent in a way the engine
+     * tolerates. Keep bit 10 set.
+     *
+     * Why trig (FSINCOS/FSIN/FCOS) is on softfloat: the lib's
+     * range_reduce uses a π/2 constant whose precision tradeoff is
+     * irreconcilable across modern Intel (Pentium-truncated) vs Xbox
+     * P6 (full-precision). Even with X87_TRIG_FULL_PRECISION_PI=1
+     * compiled in (CMakeLists.txt), residual divergence shows up as
+     * minor physics imperfection and a measurable FPS hit. Softfloat
+     * trig is acceptable for this title.
+     *
+     * Bit map matches enum X87LibOp in target/i386/tcg/x87_lib_shim.h.
+     *
+     * Bisection knob (live, no rebuild): adb shell setprop
+     * debug.x1box.x87mask <value>. Property wins over this default
+     * within 500ms per thread; see resolve_op_mask_android().
+     *
+     * 2026-05-23 update: bumped default to 0xFFFFFFFF (all ops on lib)
+     * after upstream x87 dbdb659 landed 1817bd9 "fsincos/fptan: out-of-
+     * range branch must zero dst2" + we enabled X87_TRIG_FULL_PRECISION_PI
+     * in CMakeLists.txt. Together those eliminate the range_reduce
+     * sign-flip residue that had previously kept trig (FSINCOS/FSIN/FCOS/
+     * FRNDINT) on softfloat. Halo 2 verified physics-stable on
+     * Snapdragon 8 Gen 2 with soft path + x87 lib + mask=0xFFFFFFFF. */
+    setenv("X1BOX_X87_LIB_MASK", "0xFFFFFFFF", 0);
 
     const char *path = xemu_settings_get_path();
     if (!path || *path == '\0') {

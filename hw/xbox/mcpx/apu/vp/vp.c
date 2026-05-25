@@ -21,6 +21,10 @@
 
 #include "hw/xbox/mcpx/apu/apu_int.h"
 #include "adpcm.h"
+#ifdef XBOX
+#include "hw/xbox/xbox-hle.h"
+#include "hw/xbox/hle-dsound-audio.h"
+#endif
 #ifdef __ANDROID__
 #include <android/log.h>
 #include <sys/prctl.h>
@@ -1577,6 +1581,85 @@ static void voice_process(MCPXAPUState *d,
                           uint16_t v, int voice_list)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+#ifdef XBOX
+    /*
+     * DSound HLE per-voice bypass with minimal voice state-machine.
+     * Opted in via X1BOX_HLE_DSOUND_BYPASS=1. Skips the expensive
+     * sample read+decode+resample+accumulate inner loop (the dominant
+     * cost in voice_process per per_pixel_vcpu_ipc_profile measurement)
+     * but still:
+     *   - advances NV_PAVS_VOICE_PAR_OFFSET (CBO) at the voice's pitch
+     *     rate, so the game's GetCurrentPosition sees motion;
+     *   - calls voice_off() when CBO crosses EBO (non-looping), which
+     *     fires the SE2FE_IDLE_VOICE → audio-frontend IRQ that the
+     *     game's audio thread is waiting on. Without this, the guest
+     *     HLT-wedges (confirmed 2026-05-23).
+     *
+     * Approximations vs the real path:
+     *   - envelope (EF) is treated as 1.0; pitch is just the static
+     *     PITCH register, no envelope-scaled term. Off-by-a-few-percent
+     *     advance rate; the game tolerates this as long as motion +
+     *     end-detection eventually happen.
+     *   - stream-mode (multi-segment SSL) advance is simplified to
+     *     "wrap at EBO" without firing the SSL-done notifier. Bink-
+     *     style ring buffers (loop=true) are fine; complex stream
+     *     graphs may stall.
+     *   - paused voices return without advance, matching the real
+     *     path's `if (paused) return` early-exit.
+     *
+     * Mixbins are not touched here — they stay zero from the caller's
+     * per-batch memset. Audio output is therefore silent while the
+     * bypass is on, but the game continues to drive the audio engine
+     * normally (Lock/Unlock/SetCurrentPosition all see real progress).
+     */
+    if (xbox_hle_dsound_bypass_active()) {
+        /* Cheapest viable cursor advance. Three guards keep this
+         * predicate path tiny:
+         *   - paused voices: no advance, no math, return immediately
+         *     (matches the real path's `if (paused) return`).
+         *   - EBO == 0 means the voice hasn't been initialized yet but
+         *     somehow ended up enqueued; advancing CBO would trip the
+         *     end-of-buffer immediately and burn voice_off-then-reactivate
+         *     cycles (~50× the cost of just running real voice_process).
+         *     Return without touching state.
+         *   - skip the pitch-rate powf(). Approximate advance =
+         *     NUM_SAMPLES_PER_FRAME (32) regardless of pitch — voices
+         *     end up to ~10% earlier than real on slowed playback but
+         *     the game tolerates that (still gets the IRQ, just sooner).
+         */
+        bool paused = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                     NV_PAVS_VOICE_PAR_STATE_PAUSED);
+        if (paused) {
+            return;
+        }
+        uint32_t ebo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT,
+                                      NV_PAVS_VOICE_PAR_NEXT_EBO);
+        if (ebo == 0) {
+            return;
+        }
+        hwaddr voice_base = d->regs[NV_PAPU_VPVADDR] + v * NV_PAVS_SIZE;
+        uint32_t cfg_fmt = mcpx_ram_ldl_le(d, voice_base +
+                                           NV_PAVS_VOICE_CFG_FMT);
+        bool loop = voice_extract_mask(cfg_fmt,
+                                       NV_PAVS_VOICE_CFG_FMT_LOOP);
+        uint32_t cbo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                                      NV_PAVS_VOICE_PAR_OFFSET_CBO);
+        uint32_t lbo = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSH_SAMPLE,
+                                      NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO);
+        cbo += NUM_SAMPLES_PER_FRAME;
+        if (cbo >= ebo) {
+            if (loop && lbo < ebo) {
+                cbo = lbo + ((cbo - ebo) % (ebo - lbo));
+            } else {
+                cbo = ebo;
+                voice_off(d, v);
+            }
+        }
+        voice_set_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                       NV_PAVS_VOICE_PAR_OFFSET_CBO, cbo);
+        return;
+    }
+#endif
     bool stereo = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                  NV_PAVS_VOICE_CFG_FMT_STEREO);
     unsigned int channels = stereo ? 2 : 1;
@@ -2385,6 +2468,22 @@ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_P
      * synchronizes via vwd->lock + workers_pending; no d->lock juggling
      * needed here. */
     voice_work_dispatch(d, mixbins);
+
+#ifdef XBOX
+    /*
+     * HLE audio drain — DISABLED in tandem with the per-voice bypass
+     * above. Now that voice_process runs in full, the real voice path
+     * produces real audio into mixbins. With the handler shim below
+     * configured to snoop+decline, the real CDirectSoundBuffer path
+     * also runs, so mixing HLE samples on top would double-play any
+     * captured audio. Keep the API surface (hle_audio_drain symbol +
+     * the backend ring) so the next pass — voice state-machine advance
+     * in the per-voice bypass — can re-enable both bypass and drain
+     * together. Until then, mixbins are populated solely by the real
+     * voice_process path.
+     */
+    (void)hle_audio_drain;
+#endif
 
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
         /* Mix all voices together to hear any audible voice */

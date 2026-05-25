@@ -834,6 +834,56 @@ static inline int64_t get_clock(void)
 
 extern int use_rt_clock;
 
+#if defined(XBOX) && defined(__aarch64__) && defined(__ANDROID__)
+/*
+ * Android aarch64 fast path: read ARM cntvct_el0 directly (one `mrs`
+ * instruction, ~1 cycle) instead of clock_gettime(CLOCK_MONOTONIC)
+ * via the vDSO (which is itself ~50 cycles even on the fast path).
+ *
+ * `get_clock` is the single bottom of QEMU's timer stack — every
+ * qemu_clock_get_ns(QEMU_CLOCK_REALTIME) and most QEMU_CLOCK_VIRTUAL
+ * paths eventually call it. Profiling Halo 2 first level on Snapdragon
+ * 8 Gen 2 (Zenfone) showed __kernel_clock_gettime at 4.65% of total
+ * CPU time on the vCPU thread alone (with another ~3% spread across
+ * helper threads); the only paths I'd already swapped manually
+ * (cpu_get_tsc, KeQueryPerformanceCounter HLE) made zero dent because
+ * the rest of the QEMU timer stack still funnels through this inline.
+ *
+ * Scaling: cntvct ticks at cntfrq_el0 Hz (19.2 MHz on Snapdragon, 24
+ * MHz on Tensor — read once at boot). Multiply by `(1e9 << 32) /
+ * cntfrq` then shift right 32 to get nanoseconds. The compiler emits
+ * a single umulh.
+ *
+ * Correctness: cntvct_el0 is monotonic per ARM ARM and ticks across
+ * CPU sleep, matching CLOCK_MONOTONIC semantics. Initial base offset
+ * differs from CLOCK_MONOTONIC, but every QEMU subsystem reads its
+ * times through this same `get_clock()` so deltas stay consistent.
+ * The only risk is host code that compares a `get_clock()` result to
+ * a value obtained from an outside `clock_gettime()` call — there is
+ * no such code in the xemu codebase.
+ */
+static inline int64_t get_clock(void)
+{
+    static uint64_t s_get_clock_mul;
+    static int      s_get_clock_init;
+    if (__builtin_expect(!s_get_clock_init, 0)) {
+        uint64_t cntfrq;
+        __asm__("mrs %0, cntfrq_el0" : "=r"(cntfrq));
+        if (cntfrq == 0) {
+            cntfrq = 19200000ULL;
+        }
+        /* (1e9 << 32) / cntfrq fits in 64 bits: 1e9 * 2^32 ~ 4.3e18
+         * < 2^64. Subsequent (cntvct * mul) does not overflow because
+         * cntvct itself is at most ~2^63 (the lib's signed return),
+         * and mul ~ 2^38 for 19.2 MHz — fits in u128. */
+        s_get_clock_mul = (1000000000ULL << 32) / cntfrq;
+        s_get_clock_init = 1;
+    }
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return (int64_t)(((unsigned __int128)v * s_get_clock_mul) >> 32);
+}
+#else
 static inline int64_t get_clock(void)
 {
     if (use_rt_clock) {
@@ -846,6 +896,7 @@ static inline int64_t get_clock(void)
         return get_clock_realtime();
     }
 }
+#endif
 #endif
 
 /*******************************************/

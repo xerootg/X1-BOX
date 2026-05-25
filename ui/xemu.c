@@ -65,6 +65,10 @@
 #ifdef __ANDROID__
 #include <android/log.h>
 #include <time.h>
+#include <errno.h>
+#endif
+#if defined(XBOX) && defined(__aarch64__) && defined(__ANDROID__)
+#include "accel/tcg/cranelift-bridge.h"
 #endif
 #ifdef _WIN32
 #include "nvapi.h"
@@ -1838,7 +1842,18 @@ void sdl2_gl_refresh(DisplayChangeListener *dcl)
 #endif
 
 #ifdef __ANDROID__
-    const int64_t sleep_threshold = 500000;   // 0.5ms — Android CFS scheduler jitter is ~0.2ms
+    /*
+     * 2026-05-24 v3: restore the sleep_ns loop with threshold=0 (v1).
+     *
+     * v2 (clock_nanosleep CLOCK_REALTIME, TIMER_ABSTIME) regressed: SDL
+     * SwapWindow stopped vsync-blocking and host swap FPS jumped to 745/s.
+     * Most likely Bionic doesn't return what the libc-style code expects,
+     * or there's an interaction with EGL surface flush we don't understand.
+     * Either way the v1 loop demonstrated the busy-spin removal IS a win
+     * (1.79% SDLThread → ~0% on the clock_gettime hotspot) and a ~0.2ms
+     * nanosleep overshoot is the price.
+     */
+    const int64_t sleep_threshold = 0;
 #elif !defined(_WIN32)
     const int64_t sleep_threshold = 2000000;
 #else
@@ -2124,6 +2139,11 @@ int main(int argc, char **argv)
         exit(1);
     }
     atexit(xemu_settings_save);
+#if defined(XBOX) && defined(__aarch64__) && defined(__ANDROID__)
+    /* Persist the Cranelift hint cache on every exit path so the next
+     * boot can warm up faster. Stub on non-Cranelift builds. */
+    atexit(cranelift_bridge_jit_cache_save);
+#endif
 
 #ifdef _WIN32
     if (g_config.display.setup_nvidia_profile) {

@@ -30,6 +30,79 @@ extern "C" {
 bool xemu_get_x87_lib(void);
 void xemu_set_x87_lib(bool enable);
 
+/*
+ * Per-instruction enable mask for bisecting which lib op causes a guest
+ * regression. Default mask is 0xFFFFFFFF (all ops use lib when global
+ * xemu_set_x87_lib(true) is set). Override at runtime via the env var
+ *
+ *   X1BOX_X87_LIB_MASK=0xNNNN   (parsed with strtoul base=0)
+ *
+ * Bit i (= X87_LIB_OP_*) cleared ⇒ that opcode falls back to soft-float
+ * even when the global toggle is on. The set of gated ops below
+ * corresponds 1:1 with the `if (xemu_get_x87_lib_op(...))` sites in
+ * fpu_helper.c, so the mask is dense — binary search lands in O(log2 N).
+ *
+ * Quick bisection workflow (see [[project_x87_lib_slow_methods]]):
+ *   X1BOX_X87_LIB_MASK=0           → all soft-float (baseline)
+ *   X1BOX_X87_LIB_MASK=0xFFFFFFFF  → all lib (= prior default behavior)
+ *   X1BOX_X87_LIB_MASK=0x000000FF  → only ops 0-7 use lib
+ *   X1BOX_X87_LIB_MASK=0x00000001  → only F2XM1 uses lib, etc.
+ */
+enum X87LibOp {
+    X87_LIB_OP_F2XM1 = 0,
+    X87_LIB_OP_FPTAN,
+    X87_LIB_OP_FPATAN,
+    X87_LIB_OP_FXTRACT,
+    X87_LIB_OP_FPREM,       /* covers both FPREM and FPREM1 */
+    X87_LIB_OP_FYL2XP1,
+    X87_LIB_OP_FYL2X,
+    X87_LIB_OP_FSQRT,
+    X87_LIB_OP_FSINCOS,
+    X87_LIB_OP_FRNDINT,
+    X87_LIB_OP_FSCALE,
+    X87_LIB_OP_FSIN,
+    X87_LIB_OP_FCOS,
+    X87_LIB_OP_FADD,        /* covers helper_fadd_{ST0_FT0,STN_ST0} */
+    X87_LIB_OP_FSUB,        /* covers FSUB and FSUBR */
+    X87_LIB_OP_FMUL,
+    X87_LIB_OP_FDIV,        /* covers FDIV and FDIVR */
+    X87_LIB_OP_COUNT
+};
+
+bool xemu_get_x87_lib_op(unsigned op);
+uint32_t xemu_get_x87_lib_mask(void);
+void xemu_set_x87_lib_mask(uint32_t mask);
+
+/*
+ * Precision-guarded gate for the lib. Returns true ONLY when the
+ * given op is enabled in the mask AND the guest's current x87 PC
+ * (precision-control) bits select extended (64-bit mantissa) — the
+ * lib operates exclusively at extended precision and ignores PC,
+ * so routing single/double-precision computations through it would
+ * silently compute extra mantissa bits the game never asked for.
+ *
+ * Halo 2 sets PC to extended for most code (Xbox default after
+ * boot) but switches to single (24-bit) for some physics paths.
+ * Without this guard, those physics computations get fp80 mantissa
+ * accuracy from the lib instead of 24-bit-rounded from softfloat,
+ * which manifests as position drift / momentum / sliding statics
+ * once the guest's collision/integration math diverges from the
+ * original Intel x87 rounding it was tuned against
+ * (2026-05-24, after the FDIV/FSUB operand-swap fix unblocked
+ * gameplay enough to expose the precision-control gap).
+ */
+static inline bool xemu_use_x87_lib_op(unsigned op,
+                                       const float_status *st)
+{
+    if (!xemu_get_x87_lib_op(op)) {
+        return false;
+    }
+    if (st && st->floatx80_rounding_precision != floatx80_precision_x) {
+        return false;
+    }
+    return true;
+}
+
 /* Translate x87 SW exception bits to softfloat float_flag_* mask. */
 void x87lib_apply_status_flags(uint16_t sw, float_status *status);
 

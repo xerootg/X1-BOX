@@ -170,7 +170,23 @@ FetchContent_MakeAvailable(nv2a_vsh_cpu)
 # ISA, with a runtime toggle (xemu_set_x87_lib / setting_x87_lib).
 # Upstream has no CMakeLists; we build the .cpp files into a static lib
 # and link it into xemu_core.
-set(X87_GIT_REV "4b7806824f35df894ba643110c4ca17f27e55dd9")
+# d555a87 (README) ⇒ documents X87_MATCH_XEFU build flag (d660bc1):
+# routes every hand-rolled transcendental + fxtract/fscale/fprem/fprem1
+# through the fp64 implementation, matching Microsoft's XEFU
+# Xbox-on-360 emulator's `FP*Glue` design (PPC has no native fp80, so
+# XEFU computes via PPC fp64 + libm and stores back through fp80
+# round-trip). Implies X87_FORCE_HAND_ROLLED. Trade-off: parity with
+# XEFU behavior, not bit-exact modern Intel.
+#
+# Prior pin dbdb659 added 1817bd9 "fsincos/fptan: out-of-range branch
+# must zero dst2" — fixed Halo 2 walking momentum drift + end-of-Bink
+# corruption from stale ST1 on FSINCOS out-of-range.
+#
+# Bump to 9ba84576 on 2026-05-24 picks up "fsqrt: aarch64 fast path via HW
+# fp64 fsqrt" — x87::fp80_t::x87_fsqrt was 1.22% of CPU 0/TCG in the Halo 2
+# gameplay profile and is the next largest x87 helper after the canonicalize
+# pipeline. Native aarch64 fsqrt should collapse it.
+set(X87_GIT_REV "9ba84576d44586159cded9f1e4ff3b84126d58d5")
 FetchContent_Declare(
   x87
   GIT_REPOSITORY "https://github.com/xerootg/x87.git"
@@ -189,6 +205,87 @@ if(NOT x87_POPULATED)
   endif()
 endif()
 
+# Upstream d660bc1 (X87_MATCH_XEFU) puts the via_fp64_unary*/_binary forward
+# declarations 80 lines AFTER their first use inside x87_f2xm1 — clean
+# compile error at x87fp80trans.cpp:433 the moment XEFU is enabled. Patch
+# in an earlier forward-decl block right after the existing `extern
+# round_fpext*_to_fp80` lines, gated on a sentinel string so reruns are
+# no-ops. TODO: push fix upstream and drop this hunk when X87_GIT_REV moves
+# past the fix.
+# X1BOX_CW_OVERRIDE_PATCH — Halo 2's physics integration sets FCW PC=single
+# (24-bit mantissa). The lib's hand-rolled do_div/do_mul rounds via
+# round_fpext96_to_fp80(r, read_x87_cw(), ...). On non-x86 hosts the
+# upstream read_x87_cw() returns a hardcoded EXTENDED|NEAREST|ALL_EX —
+# completely ignoring the guest CW. Result: accumulated drift in physics
+# math (persistent momentum, sliding statics, can't step up on surfaces).
+# Patch read_x87_cw() to consult a thread-local override. Our shim
+# (target/i386/tcg/x87_lib_shim.cpp) sets the override per call from
+# float_status->floatx80_rounding_precision via rounding_scope.
+# Apply via CMake (not patching upstream the same way XEFU is) because
+# FetchContent grabs xerootg/x87 from GitHub at a fixed sha — local
+# edits to ~/repos/x87 are not seen by the build.
+set(_x87_main_src "${x87_SOURCE_DIR}/x87fp80.cpp")
+file(READ "${_x87_main_src}" _x87_main_contents)
+if(NOT _x87_main_contents MATCHES "X1BOX_CW_OVERRIDE_PATCH")
+  string(REPLACE
+"x87cw_t read_x87_cw()
+{
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    uint16_t cw;
+    __asm__ volatile(\"fnstcw %0\" : \"=m\"(cw));
+    return cw;
+#else
+    return X87CW_PRECISION_EXTENDED | X87CW_ROUNDING_NEAREST | X87CW_MASK_ALL_EX;
+#endif
+}"
+"// X1BOX_CW_OVERRIDE_PATCH — see android/app/src/main/cpp/CMakeLists.txt
+#if !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+static thread_local x87cw_t g_x87_cw_override = 0;
+extern \"C\" void  x1box_x87_set_cw_override(x87cw_t cw) { g_x87_cw_override = cw; }
+extern \"C\" x87cw_t x1box_x87_get_cw_override()        { return g_x87_cw_override; }
+#endif
+x87cw_t read_x87_cw()
+{
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    uint16_t cw;
+    __asm__ volatile(\"fnstcw %0\" : \"=m\"(cw));
+    return cw;
+#else
+    if (g_x87_cw_override) {
+        return g_x87_cw_override;
+    }
+    return X87CW_PRECISION_EXTENDED | X87CW_ROUNDING_NEAREST | X87CW_MASK_ALL_EX;
+#endif
+}"
+    _x87_main_patched "${_x87_main_contents}")
+  file(WRITE "${_x87_main_src}" "${_x87_main_patched}")
+  message(STATUS "x87: applied CW-override patch to ${_x87_main_src}")
+endif()
+
+set(_x87_src "${x87_SOURCE_DIR}/x87fp80trans.cpp")
+file(READ "${_x87_src}" _x87_src_contents)
+if(NOT _x87_src_contents MATCHES "X1BOX_XEFU_FORWARD_DECL_PATCH")
+  string(REPLACE
+    "extern x87cw_t read_x87_cw();"
+"extern x87cw_t read_x87_cw();
+
+// X1BOX_XEFU_FORWARD_DECL_PATCH — see android/app/src/main/cpp/CMakeLists.txt.
+// Forward-declare the fp64-roundtrip helpers so the X87_MATCH_XEFU branches
+// inside the first hand-rolled function bodies (x87_f2xm1 etc.) can name
+// them. Upstream declares these ~80 lines too late.
+#if defined(X87_MATCH_XEFU) && X87_MATCH_XEFU
+static uint16_t via_fp64_unary  (fp80_t const &a, fp80_t &dst,
+                                 uint16_t (*fn)(fp64_t const &, fp64_t &));
+static uint16_t via_fp64_unary2 (fp80_t const &a, fp80_t &dst1, fp80_t &dst2,
+                                 uint16_t (*fn)(fp64_t const &, fp64_t &, fp64_t &));
+static uint16_t via_fp64_binary (fp80_t const &a, fp80_t const &b, fp80_t &dst,
+                                 uint16_t (*fn)(fp64_t const &, fp64_t const &, fp64_t &));
+#endif"
+    _x87_src_patched "${_x87_src_contents}")
+  file(WRITE "${_x87_src}" "${_x87_src_patched}")
+  message(STATUS "x87: applied XEFU forward-decl patch to ${_x87_src}")
+endif()
+
 add_library(x87 STATIC
   "${x87_SOURCE_DIR}/x87fp64trans.cpp"
   "${x87_SOURCE_DIR}/x87fp80.cpp"
@@ -200,6 +297,25 @@ set_target_properties(x87 PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 target_include_directories(x87 PUBLIC "${x87_SOURCE_DIR}")
+# Opt out of the Pentium-truncated π/2 (range_reduce) and ln(2) (f2xm1)
+# constants the upstream lib uses to bit-match modern Intel x87. The
+# Xbox P6 (Pentium II/III) microarchitecture uses full-precision forms,
+# and the Halo 2 trig regression on the title scene + cutscene reduces
+# to FSIN/FCOS/FSINCOS feeding range_reduce on inputs where the truncated
+# vs full-precision residual flips sign — manifesting as walked-through-
+# walls and inaccurate stick aim. Upstream commits 2030a1d / b9480f3
+# (xerootg/x87) added these flags specifically so emulators targeting
+# pre-Core x87 can restore the older constants. See
+# HANDOFF_x87_lib_bisection.md for the bisection trail.
+target_compile_definitions(x87 PRIVATE
+  X87_TRIG_FULL_PRECISION_PI=1
+  X87_LOGEXP_FULL_PRECISION_LN2=1
+  # XEFU-style fp64 routing for transcendentals + fxtract/fscale/fprem/fprem1.
+  # Implies X87_FORCE_HAND_ROLLED. Supersedes the FULL_PRECISION_* paths above
+  # at the hand-rolled call sites (kept here so flipping XEFU off in a bisect
+  # restores the Pentium-III-matched constants without another CMake edit).
+  X87_MATCH_XEFU=1
+)
 target_compile_options(x87 PRIVATE
   # Force-include <array>: upstream x87fp80trans.cpp uses std::array<>
   # without #include <array>; relies on transitive STL header pulls that
@@ -213,6 +329,14 @@ target_compile_options(x87 PRIVATE
   -Wno-missing-field-initializers
   -Wno-reorder-ctor
   -Wno-error
+  # Crank optimization on the lib specifically. Hot paths are fixed-iter
+  # Taylor polynomials over software-emulated fpext_t — both inlining
+  # (O3) and loop unrolling pay off. Override -O2 from the perftest
+  # variant default. DO NOT add -ffast-math / -fno-signed-zeros /
+  # -freciprocal-math: they break the lib's bit-exact NaN, denorm, and
+  # rounding-mode semantics, which is the entire reason we use the lib.
+  -O3
+  -funroll-loops
 )
 
 if(XEMU_ENABLE_VULKAN)
@@ -1204,6 +1328,12 @@ target_compile_definitions(xemu_core PRIVATE
   $<$<BOOL:${XEMU_OPT_TCG_PEEPHOLE}>:XEMU_OPT_TCG_PEEPHOLE=1>
   $<$<BOOL:${XEMU_OPT_TB_CACHE_HINTS}>:XEMU_OPT_TB_CACHE_HINTS=1>
   CONFIG_ATOMIC64
+  # aarch64 has native mul+umulh (and ABI passes __int128 in reg pairs).
+  # Enabling CONFIG_INT128 inlines mulu64/muls64/divu128 to ~2 insns and
+  # makes Int128 a native __int128_t (vs struct-pair fallback). Worth ~1%
+  # CPU on fp80-heavy workloads where mulu64 shows up as a hot function
+  # in profiles instead of being inlined into frac64_mulw/mul128To256.
+  CONFIG_INT128
   CONFIG_PPOLL
   CONFIG_PRCTL_PR_SET_TIMERSLACK
   # Bionic's pthread_setname_np takes (pthread_t, const char*) — the

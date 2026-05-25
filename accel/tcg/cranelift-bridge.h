@@ -12,6 +12,7 @@
 #include "qemu/osdep.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg.h"
+#include "accel/tcg/tb-cpu-state.h"
 
 #if defined(XBOX) && defined(__aarch64__) && defined(__ANDROID__) && !defined(XEMU_DISABLE_CRANELIFT)
 #define XEMU_HAVE_CRANELIFT 1
@@ -52,12 +53,46 @@ void cranelift_bridge_enqueue(TCGContext *s, TranslationBlock *tb);
  */
 void cranelift_bridge_maybe_compile_slow(TranslationBlock *tb);
 
+/*
+ * Tier-2 hot-PC hint table — direct-mapped, open-addressed via
+ * Fibonacci hash. Populated by cranelift_bridge_jit_cache_open() from
+ * the per-game hints.bin file and by cranelift_bridge_swap_install_one
+ * on every successful tier-2 install. The maybe_compile inline below
+ * uses this to bypass the exec_count threshold for PCs that were hot
+ * in a previous session — they go straight to compile-enqueue on
+ * first execution.
+ *
+ * Read without locks: a torn 64-bit read on aarch64 is impossible
+ * (aligned u64 reads/writes are atomic) and even on hypothetical torn
+ * archs the worst case is a false positive (compile a cold TB) or
+ * false negative (fall back to the normal threshold path) — neither
+ * affects correctness.
+ */
+#define CRANELIFT_HOT_PC_SLOTS 8192u
+extern uint64_t cranelift_bridge_g_hot_pcs[CRANELIFT_HOT_PC_SLOTS];
+
+static inline bool cranelift_bridge_pc_is_hot(uint64_t pc)
+{
+    if (pc == 0) {
+        return false;
+    }
+    unsigned slot = (unsigned)((pc * 2654435761ull) & (CRANELIFT_HOT_PC_SLOTS - 1));
+    return cranelift_bridge_g_hot_pcs[slot] == pc;
+}
+
 static inline void cranelift_bridge_maybe_compile(TranslationBlock *tb)
 {
     if (tb->tier >= 2) {
         return;
     }
-    if (tb->exec_count <
+    /* Pre-warm: TBs at PCs that were hot in a prior session bypass the
+     * exec_count gate so they compile on first execution. The table is
+     * populated on every tier-2 install (live + load-on-init from the
+     * per-game hints.bin). False positives here only cost a wasted
+     * compile of a cold TB. */
+    bool hot_hint = cranelift_bridge_pc_is_hot((uint64_t)tb->pc);
+    if (!hot_hint &&
+        tb->exec_count <
         qatomic_read(&cranelift_bridge_g_tier2_threshold)) {
         return;
     }
@@ -174,6 +209,18 @@ void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
  */
 uint32_t xemu_chain_thread_fingerprint(CPUArchState *env);
 
+/*
+ * Target-side fast variant of get_tb_cpu_state for the chain dispatcher.
+ *
+ * Bypasses the cpu->cc->tcg_ops->get_tb_cpu_state vtable indirection that
+ * x86_get_tb_cpu_state usually goes through; the chain calls this on every
+ * iter so the indirect call + redundant env loads are measurable in the
+ * profile (0.44% process samples in the 2026-05-24 Halo 2 capture).
+ *
+ * cflags is NOT set here — caller fills it from curr_cflags(cpu).
+ */
+TCGTBCPUState xemu_chain_get_tb_cpu_state(CPUArchState *env);
+
 /* Runtime toggle + tuning knobs. */
 void cranelift_bridge_set_enabled(bool enabled);
 bool cranelift_bridge_is_enabled(void);
@@ -187,6 +234,39 @@ bool cranelift_bridge_is_swap_enabled(void);
 
 /* Dump current telemetry to the log. */
 void cranelift_bridge_log_stats(void);
+
+/*
+ * Tier-2 disk cache (hint-cache v1).
+ *
+ * Saves per-game lists of guest PCs that were promoted to tier-2 in
+ * the previous session. On the next boot the dispatcher pre-seeds
+ * exec_count for those TBs so they enqueue compile on first execution
+ * instead of waiting for X1BOX_CRANELIFT_THRESHOLD (default 4) hits.
+ *
+ * Location: $X1BOX_JIT_CACHE_DIR/hints.bin (env var set by the Android
+ * launcher; sanitised game-title key matches the UI in
+ * GameLibraryActivity.kt::jitCacheKey).
+ *
+ * File format:
+ *   magic[4]: "X1JH"
+ *   version: u32 (currently 1)
+ *   build_id_len: u32, build_id[N]: bytes (CRANELIFT_BUILD_ID)
+ *   xbe_sha1[20]: future use — currently zero
+ *   count: u32
+ *   tb_pcs: u64 × count
+ *
+ * On version/build-id mismatch the cache is discarded silently.
+ *
+ * `cranelift_bridge_jit_cache_open(dir_path)` is called once after the
+ * game is identified; passing NULL disables both save and load (useful
+ * on first boot before the path is known, and as a soft kill switch).
+ *
+ * `cranelift_bridge_jit_cache_save()` flushes the in-memory list to
+ * disk; called from the game-shutdown path. Idempotent — safe to call
+ * multiple times.
+ */
+void cranelift_bridge_jit_cache_open(const char *dir_path);
+void cranelift_bridge_jit_cache_save(void);
 
 #else /* !XEMU_HAVE_CRANELIFT */
 
@@ -229,6 +309,8 @@ static inline void cranelift_bridge_log_stats(void) {}
 static inline void cranelift_bridge_set_swap_enabled(bool e) { (void)e; }
 static inline bool cranelift_bridge_is_swap_enabled(void) { return false; }
 static inline void cranelift_bridge_on_tb_flush(void) {}
+static inline void cranelift_bridge_jit_cache_open(const char *p) { (void)p; }
+static inline void cranelift_bridge_jit_cache_save(void) {}
 static inline void cranelift_chain_init_quantum(void) {}
 static inline void
 cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,

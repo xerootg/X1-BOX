@@ -30,6 +30,14 @@
 
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+/* Forward decl — definition is later in this file. Referenced from
+ * cranelift_bridge_swap_install_one (above the impl). */
+static void jit_cache_record_hot_pc(uint64_t pc);
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -62,6 +70,17 @@ uintptr_t cranelift_g_tb_ret_addr;
  */
 extern const void *helper_lookup_tb_ptr(CPUArchState *env);
 
+/* x86 lazy-eflags materialisation helper. Defined in
+ * target/i386/tcg/cc_helper.c; we only need its ADDRESS to publish
+ * via EnvDesc so tier-2 can pattern-match the call site and inline
+ * the trivial CC_OP cases. The real prototype uses `target_ulong`
+ * which is target-dependent (uint32_t on i386, uint64_t on x86_64);
+ * declaring it here with the wrong width would be an ODR mismatch.
+ * Instead, take the address through a void* symbol resolved at link
+ * time. */
+extern void helper_cc_compute_all(void);
+#define CRANELIFT_HELPER_CC_COMPUTE_ALL ((uintptr_t)&helper_cc_compute_all)
+
 /*
  * Tier-2 promotion threshold. The TCG-side exec_count saturates at
  * 2*TB_TIER1_THRESHOLD (= 128 by default), so this must be <= 128 to
@@ -71,13 +90,17 @@ extern const void *helper_lookup_tb_ptr(CPUArchState *env);
  *
  * 2026-05-20: lowered default 32 → 8 after profiling showed
  * helper_lookup_tb_ptr + qht_lookup_custom + tb_lookup_cmp at ~17.5%
- * of CPU 0/TCG on Halo 2 in-game. The pattern-elision at
- * translator.rs:640 already removes that helper from tier-2 TBs, so
- * the remaining cost is dominated by tier-1 TBs that haven't crossed
- * the threshold. Dropping to 8 promotes more TBs into tier-2 sooner.
- * Override at runtime via X1BOX_CRANELIFT_THRESHOLD.
+ * of CPU 0/TCG on Halo 2 in-game.
+ *
+ * 2026-05-24: lowered default 8 → 4. With the chain-LRU cache, state
+ * cache and KiIdleLoop nanosleep landed in this session, the cost of
+ * the COMPILE side dominates the cost of the EXEC side for marginal
+ * TBs. Dropping to 4 enrolls TBs that reach 4 executions but never 8 —
+ * SS2 cinematic showed many "warm" TBs in this band (per the compile
+ * queue staying empty and act=670 plateauing). Override at runtime
+ * via X1BOX_CRANELIFT_THRESHOLD.
  */
-uint32_t cranelift_bridge_g_tier2_threshold = 8;
+uint32_t cranelift_bridge_g_tier2_threshold = 4;
 
 /*
  * Master switch for installing Cranelift-compiled shims into the TB
@@ -405,6 +428,18 @@ static void cranelift_bridge_lazy_init(void)
         .chain_continue_fn = (uintptr_t)&cranelift_chain_continue,
         .lookup_tb_ptr_fn  = (uintptr_t)&helper_lookup_tb_ptr,
         .flcr_fn           = (uintptr_t)&cranelift_helper_flcr,
+        /*
+         * Diagnostic kill-switch for the cc_compute_all inline.
+         * X1BOX_CC_INLINE=0 forces the legacy call_indirect path
+         * (zero address tells tier-2 to skip the pattern-match in
+         * lower_call_impl). Set X1BOX_CC_INLINE=1 (or unset) to
+         * re-enable the inline. Bisecting the Halo 2 title-screen
+         * wedge that reproduces in both perftest and debug.
+         */
+        .cc_compute_all_fn = (getenv("X1BOX_CC_INLINE") &&
+                              getenv("X1BOX_CC_INLINE")[0] == '0')
+                             ? 0u
+                             : CRANELIFT_HELPER_CC_COMPUTE_ALL,
     };
 
     g_cranelift_ctx = cranelift_tcg_init(&env);
@@ -453,6 +488,14 @@ static void cranelift_bridge_lazy_init(void)
     /* Per-chain quantum tuning: reads X1BOX_CHAIN_MAX + X1BOX_CHAIN_JITTER.
      * Defined in accel/tcg/cpu-exec.c next to cranelift_chain_continue. */
     cranelift_chain_init_quantum();
+
+    /* Tier-2 disk cache (hint-cache v1) — open the per-game directory
+     * if the launcher set the env var. Failing to find the env var is
+     * fine; cache is a perf-only feature. */
+    const char *cache_env = getenv("X1BOX_JIT_CACHE_DIR");
+    if (cache_env && *cache_env) {
+        cranelift_bridge_jit_cache_open(cache_env);
+    }
 
     g_cranelift_initialised = true;
     CL_LOG("cranelift tier-2 backend initialised: env_size=0x%x "
@@ -1319,7 +1362,206 @@ void cranelift_bridge_try_swap_slow(TranslationBlock *tb)
     if (tb->tier < 2) {
         tb->tier = 2;
     }
+    /* Record the guest PC in the JIT hint cache. CF_PCREL TBs have
+     * tb->pc == 0 — the chain dispatcher records those at execution
+     * time via xemu_chain_get_tb_cpu_state. For tb->pc != 0 the value
+     * here IS the guest PC. */
+    if (tb->pc != 0) {
+        jit_cache_record_hot_pc((uint64_t)tb->pc);
+    }
 }
+
+/* ------------------------------------------------------------------ */
+/*  Tier-2 disk cache (hint-cache v1)                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Records every guest PC that has been successfully promoted to tier-2.
+ * On shutdown we flush the set to <cache_dir>/hints.bin. On the next
+ * boot of the same game cranelift_bridge_jit_cache_open() reads the
+ * file back; future work will use it to skip the threshold gate for
+ * those PCs (immediate compile on first execution).
+ *
+ * Storage: open-addressed direct-mapped 8K slots. Hash collisions
+ * silently overwrite (lossy) — acceptable because the cache is a hint,
+ * not a correctness boundary, and most hot TBs accumulate enough
+ * cross-session hits that they survive.
+ */
+/* Public hot-PC table — see cranelift-bridge.h for the inline reader.
+ * Size MUST match CRANELIFT_HOT_PC_SLOTS. */
+uint64_t cranelift_bridge_g_hot_pcs[CRANELIFT_HOT_PC_SLOTS];
+#define JIT_HINT_SLOTS CRANELIFT_HOT_PC_SLOTS
+#define g_jit_hint_pcs cranelift_bridge_g_hot_pcs
+static uint32_t g_jit_hint_count;   /* observable for stats */
+static QemuMutex g_jit_hint_mu;
+static bool g_jit_hint_mu_inited;
+static char g_jit_cache_dir[1024];
+static bool g_jit_cache_dir_set;
+
+#define JIT_HINT_MAGIC 0x484A3158u   /* "X1JH" little-endian */
+#define JIT_HINT_VERSION 1u
+
+static void jit_cache_lazy_mu_init(void)
+{
+    if (!g_jit_hint_mu_inited) {
+        qemu_mutex_init(&g_jit_hint_mu);
+        g_jit_hint_mu_inited = true;
+    }
+}
+
+static inline unsigned jit_hint_slot(uint64_t pc)
+{
+    /* Fibonacci hash. */
+    return (unsigned)((pc * 2654435761ull) & (JIT_HINT_SLOTS - 1));
+}
+
+static void jit_cache_record_hot_pc(uint64_t pc)
+{
+    if (pc == 0) return;
+    jit_cache_lazy_mu_init();
+    qemu_mutex_lock(&g_jit_hint_mu);
+    unsigned slot = jit_hint_slot(pc);
+    if (g_jit_hint_pcs[slot] != pc) {
+        if (g_jit_hint_pcs[slot] == 0) {
+            g_jit_hint_count++;
+        }
+        g_jit_hint_pcs[slot] = pc;
+    }
+    qemu_mutex_unlock(&g_jit_hint_mu);
+}
+
+void cranelift_bridge_jit_cache_open(const char *dir_path)
+{
+    if (!dir_path || !*dir_path) {
+        g_jit_cache_dir_set = false;
+        g_jit_cache_dir[0] = '\0';
+        CL_LOG("jit-cache: disabled (no dir)");
+        return;
+    }
+    snprintf(g_jit_cache_dir, sizeof(g_jit_cache_dir), "%s", dir_path);
+    g_jit_cache_dir_set = true;
+
+    /* Best-effort mkdir -p. Ignore failures — the save path will
+     * report errors if the directory genuinely can't be created. */
+    (void)mkdir(g_jit_cache_dir, 0755);
+
+    /* Load previous-session hints. v1: just log the count; the active
+     * use of these (immediate-compile bypass of threshold) is a future
+     * iteration. Set the count in g_jit_hint_count so stats show
+     * non-zero immediately after open. */
+    char path[1280];
+    snprintf(path, sizeof(path), "%s/hints.bin", g_jit_cache_dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        CL_LOG("jit-cache: open dir=%s, no previous hints", g_jit_cache_dir);
+        return;
+    }
+    uint32_t magic, version, build_id_len, pc_count;
+    if (fread(&magic, 4, 1, f) != 1 || magic != JIT_HINT_MAGIC ||
+        fread(&version, 4, 1, f) != 1 || version != JIT_HINT_VERSION ||
+        fread(&build_id_len, 4, 1, f) != 1 || build_id_len > 256) {
+        fclose(f);
+        CL_LOG("jit-cache: hints file header mismatch, ignoring");
+        return;
+    }
+    /* Skip build_id for now (future: compare against compiled build id
+     * and discard if different). */
+    if (build_id_len) {
+        fseek(f, (long)build_id_len, SEEK_CUR);
+    }
+    uint8_t xbe_sha1[20];
+    if (fread(xbe_sha1, 1, 20, f) != 20) {
+        fclose(f);
+        return;
+    }
+    if (fread(&pc_count, 4, 1, f) != 1 || pc_count > JIT_HINT_SLOTS) {
+        fclose(f);
+        return;
+    }
+    jit_cache_lazy_mu_init();
+    qemu_mutex_lock(&g_jit_hint_mu);
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < pc_count; i++) {
+        uint64_t pc;
+        if (fread(&pc, 8, 1, f) != 1) break;
+        if (pc == 0) continue;
+        unsigned slot = jit_hint_slot(pc);
+        if (g_jit_hint_pcs[slot] == 0) {
+            g_jit_hint_pcs[slot] = pc;
+            g_jit_hint_count++;
+            loaded++;
+        }
+    }
+    qemu_mutex_unlock(&g_jit_hint_mu);
+    fclose(f);
+    CL_LOG("jit-cache: loaded %u hot PCs from %s (file count=%u)",
+           loaded, path, pc_count);
+}
+
+void cranelift_bridge_jit_cache_save(void)
+{
+    if (!g_jit_cache_dir_set) {
+        return;
+    }
+    jit_cache_lazy_mu_init();
+
+    char tmp[1280], dst[1280];
+    snprintf(tmp, sizeof(tmp), "%s/hints.bin.tmp", g_jit_cache_dir);
+    snprintf(dst, sizeof(dst), "%s/hints.bin", g_jit_cache_dir);
+
+    /* Ensure directory exists (Android removes app caches when user
+     * "Clears Cache"; we want save to recover from that). */
+    (void)mkdir(g_jit_cache_dir, 0755);
+
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        CL_LOG("jit-cache: save fopen(%s) failed", tmp);
+        return;
+    }
+
+    qemu_mutex_lock(&g_jit_hint_mu);
+
+    uint32_t magic = JIT_HINT_MAGIC;
+    uint32_t version = JIT_HINT_VERSION;
+    /* build_id is presence-only; bump version if the cache shape
+     * changes between builds so old files are rejected on load. */
+    uint32_t build_id_len = 0;
+    uint8_t xbe_sha1[20] = {0};
+    uint32_t pc_count = g_jit_hint_count;
+
+    bool ok = true;
+    ok = ok && fwrite(&magic, 4, 1, f) == 1;
+    ok = ok && fwrite(&version, 4, 1, f) == 1;
+    ok = ok && fwrite(&build_id_len, 4, 1, f) == 1;
+    ok = ok && fwrite(xbe_sha1, 1, 20, f) == 20;
+    ok = ok && fwrite(&pc_count, 4, 1, f) == 1;
+    uint32_t written = 0;
+    for (unsigned i = 0; i < JIT_HINT_SLOTS && ok; i++) {
+        if (g_jit_hint_pcs[i] != 0) {
+            ok = fwrite(&g_jit_hint_pcs[i], 8, 1, f) == 1;
+            written++;
+        }
+    }
+
+    qemu_mutex_unlock(&g_jit_hint_mu);
+
+    if (ok) {
+        fclose(f);
+        /* Atomic rename. */
+        if (rename(tmp, dst) != 0) {
+            CL_LOG("jit-cache: rename(%s,%s) failed", tmp, dst);
+            unlink(tmp);
+            return;
+        }
+        CL_LOG("jit-cache: saved %u hot PCs to %s", written, dst);
+    } else {
+        fclose(f);
+        unlink(tmp);
+        CL_LOG("jit-cache: save write failed at %u/%u entries",
+               written, pc_count);
+    }
+}
+
 
 const void *cranelift_bridge_lookup_shim(const TranslationBlock *tb)
 {

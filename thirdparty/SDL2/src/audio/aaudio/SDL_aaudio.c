@@ -164,6 +164,36 @@ static int aaudio_OpenDevice(_THIS, const char *devname)
 
     private->frame_size = this->spec.channels * (SDL_AUDIO_BITSIZE(this->spec.format) / 8);
 
+    /*
+     * x1-box fix (2026-05-24): bump the playback buffer to absorb
+     * scheduling jitter. AAudio's default LOW_LATENCY buffer is one
+     * burst (typically 96-192 frames = 2-4 ms at 48 kHz); on the first
+     * preempt longer than that, the device drains to empty and
+     * underruns audibly — manifests as occasional pops/dropouts during
+     * video playback where audio is fed in tight ~50 ms quanta.
+     *
+     * Target = 8 bursts (typically ~16-32 ms of latency cushion).
+     * Capped at the device's actual buffer capacity. Pre-Q devices may
+     * not have these calls dlsym'd; check the function ptr first and
+     * skip silently if absent.
+     */
+    if (!iscapture && ctx.AAudioStream_getFramesPerBurst &&
+        ctx.AAudioStream_setBufferSizeInFrames) {
+        int32_t fpb = ctx.AAudioStream_getFramesPerBurst(private->stream);
+        int32_t cap = ctx.AAudioStream_getBufferCapacityInFrames ?
+            ctx.AAudioStream_getBufferCapacityInFrames(private->stream) : 0;
+        if (fpb > 0) {
+            int32_t desired = fpb * 8;
+            if (cap > 0 && desired > cap) {
+                desired = cap;
+            }
+            int32_t got = ctx.AAudioStream_setBufferSizeInFrames(
+                private->stream, desired);
+            LOGI("AAudio buffer: requested=%d got=%d burst=%d cap=%d",
+                 desired, (int)got, fpb, cap);
+        }
+    }
+
     res = ctx.AAudioStream_requestStart(private->stream);
     if (res != AAUDIO_OK) {
         LOGI("SDL Failed AAudioStream_requestStart %d iscapture:%d", res, iscapture);
@@ -315,16 +345,52 @@ static void aaudio_PlayDevice(_THIS)
 {
     struct SDL_PrivateAudioData *private = this->hidden;
     aaudio_result_t res;
-    int64_t timeoutNanoseconds = 1 * 1000 * 1000; /* 8 ms */
-    res = ctx.AAudioStream_write(private->stream, private->mixbuf, private->mixlen / private->frame_size, timeoutNanoseconds);
-    if (res < 0) {
-        LOGI("%s : %s", __func__, ctx.AAudio_convertResultToText(res));
-        if (RecoverAAudioDevice(this) < 0) {
-            return;  /* oh well, we went down hard. */
-        }
-    } else {
-        LOGI("SDL AAudio play: %d frames, wanted:%d frames", (int)res, private->mixlen / private->frame_size);
+    int32_t total_frames = private->mixlen / private->frame_size;
+    int32_t frames_written = 0;
+    /*
+     * x1-box fix (2026-05-24): the original `1 * 1000 * 1000` was a
+     * 1 ms timeout (the comment claiming "8 ms" was wrong by 8×). xemu
+     * pushes 2048-frame buffers at 48 kHz = ~43 ms of audio per call,
+     * which cannot fit into AAudio's LOW_LATENCY internal buffer in
+     * 1 ms. AAudioStream_write() then returns a SHORT WRITE (< total
+     * frames) and the unwritten tail is silently dropped — manifests
+     * as continuous popping / chopped recorded audio (Bink) on Tensor
+     * G4 / Pixel devices where AAudio is the default backend, while
+     * OpenSL ES works because its push model is async-queued with no
+     * write timeout.
+     *
+     * Fix: compute a timeout matched to the buffer's duration (with a
+     * generous 2× safety margin) AND loop on short writes, advancing
+     * mixbuf past the bytes that landed. Stops only on a real error
+     * (negative result) or full success.
+     */
+    int64_t timeoutNanoseconds = (int64_t)private->mixlen * 1000000000LL /
+                                 ((int64_t)this->spec.freq *
+                                  (int64_t)private->frame_size) * 2;
+    if (timeoutNanoseconds < 8 * 1000 * 1000LL) {
+        timeoutNanoseconds = 8 * 1000 * 1000LL; /* floor at 8 ms */
     }
+    while (frames_written < total_frames) {
+        res = ctx.AAudioStream_write(private->stream,
+            private->mixbuf + frames_written * private->frame_size,
+            total_frames - frames_written, timeoutNanoseconds);
+        if (res < 0) {
+            LOGI("%s : %s", __func__, ctx.AAudio_convertResultToText(res));
+            if (RecoverAAudioDevice(this) < 0) {
+                return;  /* oh well, we went down hard. */
+            }
+            return;
+        }
+        if (res == 0) {
+            /* No progress this round — device buffer momentarily full.
+             * Don't busy-loop; bail with the rest going on the next
+             * SDL callback. AAudio's internal queue won't gap as long
+             * as we keep up over time. */
+            break;
+        }
+        frames_written += res;
+    }
+    LOGI("SDL AAudio play: %d/%d frames", (int)frames_written, (int)total_frames);
 
 #if 0
     /* Log under-run count */

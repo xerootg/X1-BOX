@@ -72,6 +72,7 @@ class GameLibraryActivity : AppCompatActivity() {
     PER_GAME_SETTINGS,
     SET_CUSTOM_COVER,
     REMOVE_CUSTOM_COVER,
+    CLEAR_JIT_CACHE,
     DELETE_GAME,
   }
 
@@ -1387,9 +1388,16 @@ class GameLibraryActivity : AppCompatActivity() {
       editor = launchEditor,
       relativePath = game.relativePath,
     )
+    // Per-game tier-2 (Cranelift) JIT cache directory. MainActivity
+    // reads this and nativeSetenv's it so the Cranelift bridge can
+    // open the cache on init. Must be set on EVERY launch path —
+    // library-pick, frontend-intent, and resume — otherwise the C
+    // side doesn't know where to write hints.bin.
+    val cacheDir = JitCachePaths.dirForRelativePath(this, game.relativePath)
     launchEditor
       .putString("dvdUri", game.uri.toString())
       .remove("dvdPath")
+      .putString("jit_cache_dir", cacheDir.absolutePath)
       .putBoolean("skip_game_picker", false)
       .commit()
 
@@ -1733,6 +1741,55 @@ class GameLibraryActivity : AppCompatActivity() {
 
   private fun customCoversDir(): File = File(filesDir, "custom_covers")
 
+  /**
+   * Per-game tier-2 (Cranelift) JIT cache directory. The C side stores
+   * compiled-TB hints (and eventually serialised code blobs) here so a
+   * second boot of the same game ramps up faster.
+   *
+   * Layout: <filesDir>/x1box/jit_cache/<sanitised-title>/
+   *
+   * The sanitised title is the per-game identifier. The C side computes
+   * the same key from the loaded XBE title (see xbox-hle.c / xbe header).
+   */
+  private fun jitCacheRootDir(): File = File(File(filesDir, "x1box"), "jit_cache")
+
+  private fun jitCacheDirForGame(game: GameEntry): File =
+    File(jitCacheRootDir(), JitCachePaths.jitCacheKey(game.relativePath))
+
+  private fun confirmClearJitCache(game: GameEntry) {
+    MaterialAlertDialogBuilder(this, R.style.ThemeOverlay_Xemu_RoundedDialog)
+      .setTitle(R.string.library_clear_jit_cache_confirm_title)
+      .setMessage(getString(R.string.library_clear_jit_cache_confirm_message, game.title))
+      .setPositiveButton(R.string.library_clear_jit_cache_option) { _, _ ->
+        clearJitCache(game)
+      }
+      .setNegativeButton(android.R.string.cancel, null)
+      .show()
+  }
+
+  private fun clearJitCache(game: GameEntry) {
+    val dir = jitCacheDirForGame(game)
+    if (!dir.exists()) {
+      Toast.makeText(this, R.string.library_clear_jit_cache_empty, Toast.LENGTH_SHORT).show()
+      return
+    }
+    var removed = 0
+    dir.walkBottomUp().forEach { f ->
+      if (f.isFile) {
+        if (f.delete()) removed++
+      } else if (f != dir) {
+        f.delete()
+      }
+    }
+    dir.delete()
+    Toast.makeText(
+      this,
+      getString(R.string.library_clear_jit_cache_done, removed),
+      Toast.LENGTH_SHORT
+    ).show()
+  }
+
+
   private fun getCustomCoverFile(game: GameEntry): File =
     File(customCoversDir(), "${collapseCoverKey(game.title)}.png")
 
@@ -1843,6 +1900,10 @@ class GameLibraryActivity : AppCompatActivity() {
       if (hasCustomCover) {
         add(GameContextAction.REMOVE_CUSTOM_COVER)
       }
+      // Always show — clear handler reports "no cache to clear" if empty.
+      // This way the user can see the option without depending on the
+      // C-side cache writer having already run.
+      add(GameContextAction.CLEAR_JIT_CACHE)
       add(GameContextAction.DELETE_GAME)
     }
     val options = actions.map { action ->
@@ -1850,6 +1911,7 @@ class GameLibraryActivity : AppCompatActivity() {
         GameContextAction.PER_GAME_SETTINGS -> getString(R.string.library_per_game_settings_option)
         GameContextAction.SET_CUSTOM_COVER -> getString(R.string.library_custom_cover_set_option)
         GameContextAction.REMOVE_CUSTOM_COVER -> getString(R.string.library_custom_cover_remove_option)
+        GameContextAction.CLEAR_JIT_CACHE -> getString(R.string.library_clear_jit_cache_option)
         GameContextAction.DELETE_GAME -> getString(R.string.library_delete_option)
       }
     }.toTypedArray()
@@ -1883,6 +1945,7 @@ class GameLibraryActivity : AppCompatActivity() {
                 pickCustomCover.launch("image/*")
               }
               GameContextAction.REMOVE_CUSTOM_COVER -> removeCustomCover(game)
+              GameContextAction.CLEAR_JIT_CACHE -> confirmClearJitCache(game)
               GameContextAction.DELETE_GAME -> confirmDeleteGame(game)
             }
           }

@@ -83,6 +83,9 @@ this code that are retained.
 #include <math.h>
 #include "qemu/bitops.h"
 #include "fpu/softfloat.h"
+#ifdef XBOX
+#include "qemu/burst_diag.h"
+#endif
 
 /* We only need stdlib for abort() */
 
@@ -2103,6 +2106,114 @@ floatx80_addsub(floatx80 a, floatx80 b, float_status *status, bool subtract)
         return floatx80_default_nan(status);
     }
 
+#if defined(__aarch64__) && defined(__SIZEOF_INT128__)
+    /*
+     * fp80 fast path. fp80 fraction is single-word (frac_lo always 0
+     * post-canonicalize). Conservative — abs(exp_diff) < 64 so no
+     * sticky bookkeeping is needed (shifted-off bits fit in frac_lo).
+     */
+    if (likely(pa.cls == float_class_normal && pb.cls == float_class_normal)) {
+        int sign_xor = pa.sign ^ pb.sign ^ subtract;
+        int exp_diff = pa.exp - pb.exp;
+        int abs_diff = exp_diff < 0 ? -exp_diff : exp_diff;
+
+        if (likely(abs_diff < 64)) {
+            uint64_t fa, fa_lo, fb, fb_lo;
+            int exp, sign;
+
+            /* Aligned mantissas: shift the smaller-exp operand right by
+             * abs_diff. The bits shifted off land in *_lo (no sticky
+             * loss since abs_diff < 64). */
+            if (exp_diff >= 0) {
+                fa = pa.frac_hi;
+                fa_lo = 0;
+                fb_lo = (abs_diff == 0) ? 0 : (pb.frac_hi << (64 - abs_diff));
+                fb = pb.frac_hi >> abs_diff;
+                exp = pa.exp;
+                sign = pa.sign;
+            } else {
+                fb = pb.frac_hi;
+                fb_lo = 0;
+                fa_lo = pa.frac_hi << (64 - abs_diff);
+                fa = pa.frac_hi >> abs_diff;
+                exp = pb.exp;
+                sign = pb.sign ^ subtract;
+            }
+
+            uint64_t r_lo, r_hi;
+            if (likely(sign_xor == 0)) {
+                /* Addition */
+                r_lo = fa_lo + fb_lo;
+                uint64_t carry = r_lo < fa_lo;
+                r_hi = fa + fb + carry;
+                if (r_hi < fa) {
+                    /* shr_jam by 1 (carry becomes new top bit) */
+                    uint64_t sticky = r_lo & 1;
+                    r_lo = (r_lo >> 1) | (r_hi << 63) | sticky;
+                    r_hi = (r_hi >> 1) | (1ULL << 63);
+                    exp += 1;
+                }
+            } else {
+                /* Subtraction. Do (fa,fa_lo) - (fb,fb_lo) unconditionally
+                 * via subs/sbcs and capture the borrow into a flag (the
+                 * carry-out, NOT the sign of r_hi — fp80 normal mantissas
+                 * have bit 63 set so r_hi often has bit 63 set even when
+                 * fa > fb). Single 128-bit compare-by-subtract collapses
+                 * the prior cmp/b.hi/b.ne/cmp/b.lo ladder. */
+                uint32_t fa_lt_fb;
+                __asm__("subs %0, %3, %4\n\t"
+                        "sbcs %1, %5, %6\n\t"
+                        "cset %w2, lo"
+                        : "=&r"(r_lo), "=&r"(r_hi), "=r"(fa_lt_fb)
+                        : "r"(fa_lo), "r"(fb_lo), "r"(fa), "r"(fb)
+                        : "cc");
+
+                if (fa_lt_fb) {
+                    /* (fa,fa_lo) < (fb,fb_lo) — negate 128-bit and flip sign */
+                    sign ^= 1;
+                    uint64_t new_lo, new_hi;
+                    __asm__("negs %0, %2\n\t"
+                            "ngc  %1, %3"
+                            : "=&r"(new_lo), "=&r"(new_hi)
+                            : "r"(r_lo), "r"(r_hi)
+                            : "cc");
+                    r_lo = new_lo;
+                    r_hi = new_hi;
+                }
+
+                if (r_hi == 0 && r_lo == 0) {
+                    /* Cancellation to zero — inline pack */
+                    int zero_sign = status->float_rounding_mode == float_round_down;
+                    floatx80 result;
+                    result.low = 0;
+                    result.high = (uint16_t)(zero_sign << 15);
+                    return result;
+                }
+
+                int shift;
+                if (r_hi != 0) {
+                    shift = __builtin_clzll(r_hi);
+                    if (shift > 0) {
+                        r_hi = (r_hi << shift) | (r_lo >> (64 - shift));
+                        r_lo = r_lo << shift;
+                    }
+                } else {
+                    shift = 64 + __builtin_clzll(r_lo);
+                    r_hi = r_lo << (shift - 64);
+                    r_lo = 0;
+                }
+                exp -= shift;
+            }
+
+            pa.frac_hi = r_hi;
+            pa.frac_lo = r_lo;
+            pa.exp = exp;
+            pa.sign = sign;
+            return floatx80_round_pack_canonical(&pa, status);
+        }
+    }
+#endif
+
     pr = parts_addsub(&pa, &pb, status, subtract);
     return floatx80_round_pack_canonical(pr, status);
 }
@@ -2224,6 +2335,32 @@ floatx80_mul(floatx80 a, floatx80 b, float_status *status)
         !floatx80_unpack_canonical(&pb, b, status)) {
         return floatx80_default_nan(status);
     }
+
+#if defined(__aarch64__) && defined(__SIZEOF_INT128__)
+    /*
+     * fp80 fast path: fp80 mantissa is single-word (frac_lo always 0
+     * post-canonicalize), so parts_mul's 128x128->256 multiply does 3
+     * wasted partials and a 192-bit add. For normal*normal, do a single
+     * 64x64->128 (mul+umulh on aarch64) and feed the result straight to
+     * round_pack_canonical.
+     */
+    if (likely(pa.cls == float_class_normal && pb.cls == float_class_normal)) {
+        __uint128_t prod = (__uint128_t)pa.frac_hi * pb.frac_hi;
+        uint64_t hi = (uint64_t)(prod >> 64);
+        uint64_t lo = (uint64_t)prod;
+        int exp = pa.exp + pb.exp + 1;
+        if (!(hi & DECOMPOSED_IMPLICIT_BIT)) {
+            hi = (hi << 1) | (lo >> 63);
+            lo <<= 1;
+            exp -= 1;
+        }
+        pa.frac_hi = hi;
+        pa.frac_lo = lo;
+        pa.exp = exp;
+        pa.sign ^= pb.sign;
+        return floatx80_round_pack_canonical(&pa, status);
+    }
+#endif
 
     pr = parts_mul(&pa, &pb, status);
     return floatx80_round_pack_canonical(pr, status);

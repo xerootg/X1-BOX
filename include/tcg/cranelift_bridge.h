@@ -129,6 +129,17 @@ typedef struct CraneliftTcgEnvDesc {
      * argument helper that does the MXCSR->FPCR translation. 0 means
      * flcr is unsupported and the TB bails to tier-1. */
     uintptr_t flcr_fn;
+    /* Address of `helper_cc_compute_all(dst, src1, src2, op)`
+     * (target/i386/tcg/cc_helper.c). x86 frontend calls this whenever
+     * lazy eflags need to materialise (sti/popf/iret, pushf/cpuid,
+     * any cc-consuming branch when CC_OP is dynamic). Profile shows
+     * ~1.25% of Halo 2 title-screen CPU sits in this single helper.
+     * Tier-2 lowering peeks at carg(0); when it matches, we emit an
+     * inline if-ladder that handles CC_OP_EFLAGS (= 0, returns src1
+     * verbatim) and CC_OP_POPCNT (returns src ? 0 : CC_Z) and falls
+     * through to the C helper for everything else. 0 disables the
+     * inline path and routes every call through call_indirect. */
+    uintptr_t cc_compute_all_fn;
 } CraneliftTcgEnvDesc;
 
 /* ------------------------------------------------------------------ */

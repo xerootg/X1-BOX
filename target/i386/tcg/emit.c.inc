@@ -600,7 +600,21 @@ static int sse_scalar_inline_mask(void)
 static bool gen_sse_scalar_inline(DisasContext *s, X86DecodedInsn *decode,
                                   SseFpScalarKind kind, bool is_sd)
 {
-    if (kind == SSE_FPS_NONE || !g_use_fp_jit || !HARD_FPU_HAS_TCG_FP_OPS
+    /*
+     * Decoupled from g_use_fp_jit on 2026-05-24. The inline path emits
+     * tcg_gen_mul_f32/mul_f64 which lower to NEON fmul on aarch64 — they
+     * never touch host x87 state, so they're safe regardless of whether
+     * x87 helpers go to the lib (g_use_fp_jit=0) or to the host FPU
+     * (g_use_fp_jit=1). HARD_FPU_HAS_TCG_FP_OPS is still required because
+     * x86 hosts without TCG FP support need the helper path.
+     *
+     * Why this matters: user prefers x87 lib (hard_fpu=false → g_use_fp_jit=0)
+     * per [[project_x87_lib_slow_methods]]. Pre-decouple, the SSE inline
+     * gate was disabled in that mode and helper_mulss ran as a C helper
+     * (0.97% on Halo 2 gameplay profile 2026-05-24). Decoupling lets the
+     * SSE scalar path stay inline regardless of the x87 backend choice.
+     */
+    if (kind == SSE_FPS_NONE || !HARD_FPU_HAS_TCG_FP_OPS
         || !((sse_scalar_inline_mask() >> kind) & 1)) {
         return false;
     }
@@ -4505,7 +4519,10 @@ static int sse_comi_inline_enabled(void)
 
 static bool gen_VCOMI_inline(DisasContext *s, X86DecodedInsn *decode)
 {
-    if (!g_use_fp_jit || !HARD_FPU_HAS_TCG_FP_OPS || !sse_comi_inline_enabled()) {
+    /* Decoupled from g_use_fp_jit 2026-05-24 — same reasoning as
+     * gen_sse_scalar_inline(): tcg_gen_com_f32/com_f64 lower to NEON FCMP
+     * on aarch64 and don't touch x87 state. */
+    if (!HARD_FPU_HAS_TCG_FP_OPS || !sse_comi_inline_enabled()) {
         return false;
     }
 

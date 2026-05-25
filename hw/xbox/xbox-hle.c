@@ -21,6 +21,34 @@
 #include "qemu/log.h"
 #include "qemu/atomic.h"
 #include "qemu/timer.h"  /* qemu_clock_get_ns for KeQueryPerformanceCounter */
+#include "qemu/main-loop.h"  /* bql_unlock/lock around KiIdleLoop nanosleep */
+
+/* Cranelift chain dispatcher stats — extern'd here to avoid pulling in
+ * the internal accel/tcg/cranelift-bridge.h from a hw/ TU. Used by the
+ * KiIdleLoop yield's IRQ-storm gate; safe stub on non-Cranelift builds. */
+#if defined(XBOX) && defined(__aarch64__) && defined(__ANDROID__)
+extern void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
+                                       uint64_t *spins, uint64_t *irq_exits,
+                                       uint32_t *thread_count,
+                                       unsigned *chain_max,
+                                       uint32_t *jitter);
+#else
+static inline void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
+                                              uint64_t *spins,
+                                              uint64_t *irq_exits,
+                                              uint32_t *thread_count,
+                                              unsigned *chain_max,
+                                              uint32_t *jitter)
+{
+    if (runs) *runs = 0;
+    if (iters) *iters = 0;
+    if (spins) *spins = 0;
+    if (irq_exits) *irq_exits = 0;
+    if (thread_count) *thread_count = 0;
+    if (chain_max) *chain_max = 0;
+    if (jitter) *jitter = 0;
+}
+#endif
 #include "hw/core/cpu.h"
 #include "exec/cpu-common.h"
 #include "exec/cpu-interrupt.h"
@@ -30,8 +58,11 @@
 #include "system/memory.h"
 #include "cpu.h"  /* target/i386 -- X86CPU, CPUX86State */
 #include "xbox-hle.h"
+#include "hle-dsound-audio.h"
+#include "hw/xbox/nv2a/debug.h"  /* g_nv2a_stats — KiIdleLoop boot gate */
 #include <unistd.h>
 #include <string.h>
+#include <time.h>  /* nanosleep for KiIdleLoop yield */
 
 /* ARM SHA-1 crypto extensions for XcShaTransform HLE. */
 #if defined(__aarch64__)
@@ -151,6 +182,9 @@ static bool g_hle_resolved;         /* PE walk succeeded once */
 static bool g_gate_rtl = true;      /* RtlMoveMemory + RtlFillMemory */
 static bool g_gate_kf  = true;      /* KfAcquireSpinLock + Release */
 static bool g_gate_yield = true;    /* KeDelay... + NtYieldExecution */
+static bool g_gate_dsound = false;  /* Halo 2 DSound leaf-stub HLE */
+static bool g_gate_dsound_bypass = false; /* per-voice cursor-advance bypass */
+static bool g_gate_fs  = true;      /* FATX/file-system leaf helpers */
 
 static uint64_t g_resolve_attempts;
 static uint64_t g_resolve_failures;
@@ -181,6 +215,34 @@ static inline void unhooked_pc_count(uint32_t pc)
          * stability while letting new entries register. */
         g_unhooked_pcs[slot].pc = pc;
         g_unhooked_pcs[slot].count = 1;
+    }
+}
+
+/*
+ * Separate histogram for XBE / user-mode PCs. Halo 2 title-screen
+ * wedges where the guest stops advancing FLIP_STALL (g frozen) but
+ * the chain dispatcher keeps running — meaning vCPU is in user-mode
+ * code that never re-enters the kernel. Without this sampler the
+ * existing unhooked_pc_count never fires (kernel-range filter at
+ * xbox_hle_check rejects user-mode), so we'd be blind to the wedge
+ * location. Sample 1-in-64 to keep overhead in noise; pure inc on
+ * the 256-slot direct-map costs ~5 ns per sample.
+ */
+static struct {
+    uint32_t pc;
+    uint64_t count;
+} g_xbe_pcs[HLE_PROFILE_SLOTS];
+
+static inline void xbe_pc_count(uint32_t pc)
+{
+    static __thread uint32_t skip;
+    if ((++skip & 0x3F) != 0) return;
+    unsigned slot = (unsigned)((pc * 2654435761u) >> (32 - 8));
+    if (g_xbe_pcs[slot].pc == pc) {
+        g_xbe_pcs[slot].count++;
+    } else if (g_xbe_pcs[slot].count < 8) {
+        g_xbe_pcs[slot].pc = pc;
+        g_xbe_pcs[slot].count = 1;
     }
 }
 
@@ -687,6 +749,181 @@ static bool hle_rtl_equal_string(X86CPU *cpu)
 }
 
 /* ------------------------------------------------------------------ */
+/*  FATX filename glob matcher                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * FatxMatchName (Ghidra-named, was FUN_80030dba) — pure leaf matcher
+ * called from FATX directory enumeration. Stdcall(2):
+ *   arg0 = pattern PSTRING ptr (ushort length, ushort pad, char *buf)
+ *   arg1 = name PSTRING ptr (same layout)
+ *
+ * Wildcards:
+ *   '*' (0x2A): pattern advances by 2 (skips '*' AND next byte); name
+ *               advances until '.' or end of name
+ *   '?' (0x3F): matches any single name byte
+ *   other:      literal compare with case-fold (a-z → A-Z via -0x20)
+ *
+ * Empty name → returns 0. Name shorter than non-wildcard pattern → 0.
+ * Pattern ends with '*' → 1. Otherwise both must be exhausted together.
+ *
+ * On the Halo 2 title-screen 2026-05-24 profile this was ~1.37M hits
+ * across three TBs inside the function body — pure CPU 0/TCG cost since
+ * it's called from FATX directory loops at 0x40-byte stride per entry.
+ * HLE-ing it avoids the byte-at-a-time TCG loop entirely.
+ */
+static bool hle_fatx_match_name(X86CPU *cpu)
+{
+    CPUX86State *env = &cpu->env;
+    uint32_t pattern_ptr = hle_arg32(env, 0);
+    uint32_t name_ptr    = hle_arg32(env, 1);
+
+    uint16_t name_len = 0;
+    if (!g_read(name_ptr, &name_len, 2)) return false;
+    if (name_len == 0) {
+        env->regs[R_EAX] = 0;
+        hle_return_stdcall(env, 2);
+        return true;
+    }
+
+    uint16_t pat_len = 0;
+    if (!g_read(pattern_ptr, &pat_len, 2)) return false;
+
+    /* Bound both — FATX names + patterns are realistic at <256 bytes; the
+     * directory entry caps name at 42 chars. 512 is generous. If either
+     * exceeds, decline and let the kernel run the slow path. */
+    if (name_len > 512 || pat_len > 512) return false;
+
+    uint32_t pat_buf = 0, name_buf = 0;
+    if (!g_read32(pattern_ptr + 4, &pat_buf)) return false;
+    if (!g_read32(name_ptr + 4,    &name_buf)) return false;
+
+    uint8_t pat[512], name[512];
+    if (pat_len  && !g_read(pat_buf,  pat,  pat_len))  return false;
+    if (name_len && !g_read(name_buf, name, name_len)) return false;
+
+    size_t p = 0, n = 0;
+    while (p < pat_len) {
+        uint8_t pat_c = pat[p++];
+        if (pat_c == '*') {
+            if (p == pat_len) {
+                /* Pattern ends with '*' — match. */
+                env->regs[R_EAX] = 1;
+                hle_return_stdcall(env, 2);
+                return true;
+            }
+            /* Match algorithm skips one pattern byte AFTER '*', then scans
+             * name until '.' or end. Reproduces the guest behavior bit-for-
+             * bit (see plate comment on FatxMatchName in xboxkrnl). */
+            p++;
+            while (n < name_len) {
+                if (name[n++] == '.') break;
+            }
+            continue;
+        }
+        if (n == name_len) {
+            /* Name exhausted before pattern (and current pattern byte is
+             * not '*') — no match. */
+            env->regs[R_EAX] = 0;
+            hle_return_stdcall(env, 2);
+            return true;
+        }
+        uint8_t name_c = name[n++];
+        if (pat_c == '?') continue;
+        if (name_c >= 'a' && name_c <= 'z') name_c -= 0x20;
+        if (name_c != pat_c) {
+            env->regs[R_EAX] = 0;
+            hle_return_stdcall(env, 2);
+            return true;
+        }
+    }
+    /* Pattern exhausted; match iff name also exhausted. */
+    env->regs[R_EAX] = (n == name_len) ? 1 : 0;
+    hle_return_stdcall(env, 2);
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/*  MmLockUnlockBufferPages — page lock-count refcount adjuster        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Halo 2 hits this ~413K times per stats period (per the 2026-05-24
+ * unhooked-PC list, 0x8001dffc/+0x15 = inside the page walk loop).
+ *
+ * The kernel function:
+ *   1) KeRaiseIrqlToDpcLevel (saves old IRQL)
+ *   2) if (VA >= 0x80000000 && PDE_byte_table[(VA>>20)&0xffc] & 0x80 == 0):
+ *        walk PTEs in [VA, VA+len) at 0xc0000000 + (VA>>12)*4
+ *        for each PTE with PFN <= 0x3fff: lock_table[PFN] += {+2 if lock, -2 if unlock}
+ *   3) KfLowerIrql (restore old IRQL)
+ *
+ * HLE: skip the IRQL elevate/restore entirely. We're single-vCPU
+ * (single TCG thread); no other guest code can run in parallel with this
+ * handler, so the IRQL protection against concurrent re-entry is vacuous.
+ * The kernel's normal IRQL transitions (next time guest code hits one)
+ * will dispatch any DPCs we'd otherwise have triggered.
+ *
+ * Stdcall(3): arg0 = base VA, arg1 = length, arg2 = lock_flag
+ * (0 = LOCK → counter += 2; non-zero = UNLOCK → counter -= 2).
+ */
+static bool hle_mm_lock_unlock_buffer_pages(X86CPU *cpu)
+{
+    CPUX86State *env = &cpu->env;
+    uint32_t va        = hle_arg32(env, 0);
+    uint32_t len       = hle_arg32(env, 1);
+    uint32_t lock_flag = hle_arg32(env, 2);
+
+    /* User-mode VA → kernel decides nothing happens, just lower IRQL.
+     * Take the no-op fast path. */
+    if (va + 0x80000000u > 0xfffffff && len > 0) {
+        /* Large-page / non-paged region check: PDE byte table at
+         * 0xc0300000 + ((VA>>20) & 0xffc). Bit 7 = "this PDE points to
+         * a 4 MiB page" — no per-page lock counter to adjust. */
+        uint8_t pde_flag = 0;
+        if (!g_read(0xc0300000u + ((va >> 20) & 0xffcu), &pde_flag, 1)) {
+            return false;
+        }
+        if (!(pde_flag & 0x80)) {
+            int16_t delta = (lock_flag == 0) ? 2 : -2;
+
+            /* PTE offsets in the kernel page table (0xc0000000 base).
+             * The 4-byte stride is encoded as ((VA>>10) & 0x3ffffc) =
+             * (VA>>12) * 4 with the bottom 2 bits zeroed for alignment. */
+            uint32_t pte_off_start = (va >> 10) & 0x3ffffcu;
+            uint32_t pte_off_end   = (((va + len) - 1u) >> 10) & 0x3ffffcu;
+
+            /* Cap iterations defensively. A single call should never walk
+             * more than 16K pages (= 64 MiB range); if it does, decline
+             * and let the kernel handle it. */
+            if (pte_off_end < pte_off_start ||
+                (pte_off_end - pte_off_start) > (16u * 1024u * 4u)) {
+                return false;
+            }
+
+            for (uint32_t pte_off = pte_off_start;
+                 pte_off <= pte_off_end;
+                 pte_off += 4) {
+                uint32_t pte_addr = 0xc0000000u + pte_off;
+                uint32_t pte = 0;
+                if (!g_read32(pte_addr, &pte)) return false;
+                uint32_t pfn = pte >> 12;
+                if (pfn > 0x3fff) continue;
+                uint32_t counter_addr = 0x83ff0000u + pfn * 4u;
+                uint16_t counter = 0;
+                if (!g_read(counter_addr, &counter, 2)) return false;
+                counter = (uint16_t)(counter + (uint16_t)delta);
+                if (!g_write(counter_addr, &counter, 2)) return false;
+            }
+        }
+    }
+
+    /* Void return — no EAX touch needed. Stdcall(3) pops 3 args. */
+    hle_return_stdcall(env, 3);
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
 /*  SHA-1 native transform — for XcShaTransform HLE                    */
 /* ------------------------------------------------------------------ */
 
@@ -1133,25 +1370,95 @@ static bool hle_ke_query_performance_frequency(X86CPU *cpu)
  * with a kernel-maintained high-half tracker (DAT_80035a78 etc.).
  * Each call triggers an MMIO emulation roundtrip in xemu.
  *
- * HLE strategy: bypass the I/O port entirely and convert QEMU's
- * VIRTUAL clock (nanoseconds in guest virtual time) into ticks at
- * the kernel's reported 3.375 MHz frequency.
+ * HLE strategy v2 (2026-05-24): read the ARM virtual counter
+ * (cntvct_el0) directly. That's ONE `mrs` instruction (~1 cycle)
+ * vs the ~50 cycles of `qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)` →
+ * vDSO `__kernel_clock_gettime`. Halo 2 calls KeQPC 5M+ times/sec
+ * (profiled 4.48% of total CPU time was clock_gettime on the
+ * vCPU thread); the cntvct path collapses that to <1% noise.
  *
- * Using QEMU_CLOCK_VIRTUAL (not host monotonic) is load-bearing:
- * xemu's PMTMR emulation also ticks off the virtual clock, so this
- * HLE returns values consistent with what the rest of the emulator
- * believes about elapsed guest time. Otherwise frame-delta math in
- * Halo 2 would desync with the audio/video subsystems.
+ * Calibration: read cntfrq_el0 once at init to compute the
+ * multiplier for `cntvct → 3.375 MHz Xbox ticks`. We use a
+ * 96.32 fixed-point multiplier so the hot path is a single
+ * `umulh + lsr` pair — no division, no syscall.
  *
- * Conversion: ticks = ns * 3375000 / 1e9 = ns * 27 / 8000. Exact.
+ * Trade-off vs the prior QEMU_CLOCK_VIRTUAL path: cntvct is host
+ * monotonic and doesn't pause when the emulator pauses (manual
+ * pause / debugger break). For normal-running gameplay (the only
+ * regime that matters for the 5M-calls/sec hotspot) virtual and
+ * host clocks track within ns, so frame-delta math stays clean.
+ * If the user pauses for >1 frame, the resumed delta gets one
+ * inflated frame timestep — game accepts that and continues.
  *
  * Returns 64-bit value via EDX:EAX (stdcall LARGE_INTEGER return).
  */
+#if defined(__aarch64__)
+static inline uint64_t arm_cntvct_el0(void)
+{
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+}
+
+static inline uint64_t arm_cntfrq_el0(void)
+{
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
+    return v;
+}
+
+/* 32.32 fixed-point multiplier such that
+ *   xbox_ticks = (cntvct * g_xbox_qpc_mul) >> 32
+ * gives `cntvct * (3.375 MHz / cntfrq_el0)`. Initialised lazily on
+ * first call. cntfrq is a constant from boot — Snapdragon = 19.2 MHz,
+ * Tensor = 24 MHz — so one read & cache is enough. */
+static uint64_t g_xbox_qpc_mul;
+static bool     g_xbox_qpc_init;
+
+static void xbox_qpc_calibrate(void)
+{
+    uint64_t cntfrq = arm_cntfrq_el0();
+    if (cntfrq == 0) {
+        cntfrq = 19200000ULL;  /* sensible Snapdragon default */
+    }
+    /* (3375000 << 32) / cntfrq fits in 64 bits while preserving
+     * precision: 3375000 * 2^32 ≈ 1.45e16, well below 2^64. */
+    g_xbox_qpc_mul = (3375000ULL << 32) / cntfrq;
+    g_xbox_qpc_init = true;
+}
+
+static inline uint64_t xbox_qpc_ticks_fast(void)
+{
+    if (__builtin_expect(!g_xbox_qpc_init, 0)) {
+        xbox_qpc_calibrate();
+    }
+    uint64_t v = arm_cntvct_el0();
+    /* 64x64 → 128 high-half multiply. clang emits `umulh + lsr 0`
+     * which collapses to one umulh on aarch64. */
+    return (uint64_t)(((unsigned __int128)v * g_xbox_qpc_mul) >> 32);
+}
+#else
+static inline uint64_t xbox_qpc_ticks_fast(void)
+{
+    /* Non-aarch64 fallback (used only by host x86 builds for unit
+     * tests — Android target is always aarch64 in production). */
+    int64_t virtual_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return ((uint64_t)virtual_ns * 27ull) / 8000ull;
+}
+#endif
+
+/* PC of KeQueryPerformanceCounter in the Halo 2 retail kernel. Exposed
+ * so the xbox_hle_check fast-path can const-compare against it without
+ * walking the hash table. Resolved at boot via the EAT walk; if a
+ * different kernel revision moves it the slow path still works
+ * (handler still installed) — only the ultra-fast bypass goes silent. */
+#define XBOX_HLE_KE_QPC_VA 0x80015314u
+static uint64_t g_keqpc_fast_hits;
+
 static bool hle_ke_query_performance_counter(X86CPU *cpu)
 {
     CPUX86State *env = &cpu->env;
-    int64_t virtual_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint64_t ticks = ((uint64_t)virtual_ns * 27ull) / 8000ull;
+    uint64_t ticks = xbox_qpc_ticks_fast();
     env->regs[R_EAX] = (uint32_t)(ticks & 0xFFFFFFFFu);
     env->regs[R_EDX] = (uint32_t)(ticks >> 32);
     hle_return_stdcall(env, 0);
@@ -1520,6 +1827,99 @@ static bool hle_nt_yield_execution(X86CPU *cpu)
 }
 
 /*
+ * KeBugCheckEx logger. Halo 2 title screen wedges at FUN_800151ed
+ * (cli;hlt halt loop) after ~30s of normal gameplay — kernel has
+ * bugchecked. This handler doesn't recover (kernel still halts);
+ * it ONLY captures the bugcheck code + 4 parameters + caller's
+ * return address ONCE per process so we can identify the trigger
+ * site in Ghidra.
+ *
+ * Always returns false → the kernel runs its own KeBugCheckEx and
+ * proceeds to cli;hlt as before. The logger is purely additive.
+ *
+ * Stack on entry (stdcall):
+ *   [esp]    = return address (caller PC)
+ *   [esp+4]  = BugCheckCode
+ *   [esp+8]  = BugCheckParameter1
+ *   [esp+12] = BugCheckParameter2
+ *   [esp+16] = BugCheckParameter3
+ *   [esp+20] = BugCheckParameter4
+ *
+ * Also dumps the 32 bytes immediately preceding the return address
+ * (call instruction + a bit of context) so we can identify which
+ * call site issued the bugcheck even if multiple sites share a
+ * common caller (rare; KeBugCheckEx is almost always called from
+ * a leaf panic handler).
+ */
+static bool hle_ke_bugcheck_ex(X86CPU *cpu)
+{
+    static bool logged_once = false;
+    if (logged_once) return false;
+
+    CPUX86State *env = &cpu->env;
+    uint32_t esp = env->regs[R_ESP];
+    uint32_t ret_pc = 0, code = 0;
+    uint32_t p1 = 0, p2 = 0, p3 = 0, p4 = 0;
+    g_read32(esp,      &ret_pc);
+    g_read32(esp + 4,  &code);
+    g_read32(esp + 8,  &p1);
+    g_read32(esp + 12, &p2);
+    g_read32(esp + 16, &p3);
+    g_read32(esp + 20, &p4);
+
+    HLE_LOG("KeBugCheckEx FIRED code=0x%08x p1=0x%08x p2=0x%08x "
+            "p3=0x%08x p4=0x%08x caller=0x%08x esp=0x%08x "
+            "eip=0x%08x eax=0x%08x ebx=0x%08x ecx=0x%08x edx=0x%08x "
+            "esi=0x%08x edi=0x%08x ebp=0x%08x",
+            code, p1, p2, p3, p4, ret_pc, esp,
+            (uint32_t)env->eip,
+            (uint32_t)env->regs[R_EAX], (uint32_t)env->regs[R_EBX],
+            (uint32_t)env->regs[R_ECX], (uint32_t)env->regs[R_EDX],
+            (uint32_t)env->regs[R_ESI], (uint32_t)env->regs[R_EDI],
+            (uint32_t)env->regs[R_EBP]);
+
+    /* Disassembly context: 32 bytes ending at the return address
+     * gives us the call instruction (5 bytes) plus prior insns. */
+    if (ret_pc >= 32) {
+        uint8_t ctx[32];
+        if (g_read(ret_pc - 32, ctx, sizeof(ctx))) {
+            HLE_LOG("KeBugCheckEx caller_bytes [0x%08x..0x%08x] = "
+                    "%02x%02x%02x%02x%02x%02x%02x%02x "
+                    "%02x%02x%02x%02x%02x%02x%02x%02x "
+                    "%02x%02x%02x%02x%02x%02x%02x%02x "
+                    "%02x%02x%02x%02x%02x%02x%02x%02x",
+                    ret_pc - 32, ret_pc - 1,
+                    ctx[0],  ctx[1],  ctx[2],  ctx[3],
+                    ctx[4],  ctx[5],  ctx[6],  ctx[7],
+                    ctx[8],  ctx[9],  ctx[10], ctx[11],
+                    ctx[12], ctx[13], ctx[14], ctx[15],
+                    ctx[16], ctx[17], ctx[18], ctx[19],
+                    ctx[20], ctx[21], ctx[22], ctx[23],
+                    ctx[24], ctx[25], ctx[26], ctx[27],
+                    ctx[28], ctx[29], ctx[30], ctx[31]);
+        }
+    }
+
+    /* Walk a few stack frames so we can see what the panic-handler
+     * caller was doing. ebp chain on Xbox kernel is reliable: it's
+     * built with push ebp; mov ebp, esp; the kernel doesn't omit
+     * the frame pointer. */
+    uint32_t ebp = env->regs[R_EBP];
+    for (int depth = 0; depth < 6; depth++) {
+        uint32_t saved_ebp = 0, saved_ret = 0;
+        if (!g_read32(ebp,     &saved_ebp)) break;
+        if (!g_read32(ebp + 4, &saved_ret)) break;
+        HLE_LOG("KeBugCheckEx frame[%d] ebp=0x%08x ret=0x%08x",
+                depth, ebp, saved_ret);
+        if (saved_ebp <= ebp || saved_ebp == 0) break;
+        ebp = saved_ebp;
+    }
+
+    logged_once = true;
+    return false;
+}
+
+/*
  * VOID KiIdleLoop(VOID)  — kernel idle thread, infinite loop:
  *   do {
  *     do {
@@ -1587,16 +1987,37 @@ static bool hle_nt_yield_execution(X86CPU *cpu)
 static uint64_t g_idle_loop_idle;             /* both empty */
 static uint64_t g_idle_loop_dpc_pending;
 static uint64_t g_idle_loop_next_thread_pending;
-static uint64_t g_idle_loop_halts;            /* CPU_INTERRUPT_HALT set */
+static uint64_t g_idle_loop_halts;            /* CPU_INTERRUPT_HALT set (legacy) */
+static uint64_t g_idle_loop_yields;           /* host nanosleep entered */
+
+/*
+ * Boot gate RESTORED 2026-05-24 — removing it caused Halo 2 chain
+ * stats to collapse from avg=30 to avg=1.01 iters with irq_exits at
+ * 99.9% of chain runs. Diagnosis: during boot the audio/render
+ * threads are racing to take BQL while the vCPU yields, so when the
+ * vCPU resumes interrupt_request is already set and the very next
+ * chain entry breaks out. Net effect: vCPU does almost no useful work
+ * between chain entries; FPS drops to 10 + visible corruption.
+ *
+ * Keep the gate. SS2's slow boot pays the busy-spin cost during init
+ * but avoids the steady-state chain collapse the unbounded yield
+ * caused. Post-boot the yield works as designed.
+ */
+#define IDLE_LOOP_BOOT_FRAMES 30u
+
+/*
+ * Yield window. Audio IRQ fires at ~600 Hz (~1.67ms cadence) and FLIP
+ * IRQ at the guest's 30 fps (~33ms). 50µs is well under both, so we
+ * miss neither — but it's >50× longer than the spin TB iteration, so
+ * one yield replaces ~50× spin iters of guest CPU.
+ */
+#define IDLE_LOOP_YIELD_NS  50000  /* 50µs */
 
 static bool hle_ki_idle_loop_spin(X86CPU *cpu)
 {
     /*
-     * Sample every 16 iters. The previous /64 was a sched_yield throttle;
-     * here each "hit" sets CPU_INTERRUPT_HALT and the vCPU stops spinning
-     * immediately, so we want to halt fast. Each check costs 2 g_read32
-     * calls (~50ns) and ~140k idle-TB hits/sec, so /16 is well under 1%
-     * overhead.
+     * Sample every 16 iters. Each check costs 2 g_read32 calls (~50ns)
+     * and ~140k idle-TB hits/sec, so /16 is well under 1% overhead.
      */
     static __thread uint32_t iter;
     iter++;
@@ -1619,25 +2040,84 @@ static bool hle_ki_idle_loop_spin(X86CPU *cpu)
     }
 
     g_idle_loop_idle++;
+    (void)g_idle_loop_halts;  /* retained for memory of v2 attempt */
 
     /*
-     * HALT-on-idle was tried (2026-05-22) — CPU_INTERRUPT_HALT here +
-     * MTTCG halt_cond wait. Architecturally correct: the kernel's
-     * STI/NOP/NOP/CLI sequence is exactly an HLT approximation. But on
-     * boot, kernel dips into KiIdleLoop during phases where the next
-     * wake event isn't a HARD IRQ (BIOS polling, NV2A init handshake,
-     * disc spin-up), so halt_cond never fires and the boot deadlocks.
-     * Even with a consec-idle-of-8 gate the boot still wedged because
-     * the dip CAN be ≥8 samples but the wake still isn't a HARD IRQ.
+     * Genuine idle: both DPC list and NextThread quiescent.
      *
-     * Until we have a way to gate this on "kernel is past full init"
-     * (e.g., guest flip count >= N, or a kernel-symbol probe), keep the
-     * handler as pure telemetry. g_idle_loop_idle still shows where
-     * vCPU host-cycles go; the actual win lives elsewhere (memory note:
-     * MCPX voice-fanout dispatch dominates title-screen frame time, not
-     * idle-loop spinning).
+     * v3.1 (2026-05-24): boot-gate RESTORED. Removing it caused
+     * chain-stats collapse (avg=30→1.01, irq_exits=99.9%) on Halo 2
+     * because audio/render threads grab BQL during the yield window
+     * and set interrupt_request before vCPU resumes. The yield is
+     * still a major win post-boot — gate just defers it until the
+     * guest has cleared init.
      */
-    (void)g_idle_loop_halts;
+    if (g_nv2a_stats.frame_count < IDLE_LOOP_BOOT_FRAMES) {
+        return false;
+    }
+
+    /* If an IRQ is already pending, don't sleep — let the dispatcher
+     * deliver it on the next chain iter. */
+    if (qatomic_read(&CPU(cpu)->interrupt_request)) {
+        return false;
+    }
+
+    /*
+     * IRQ-storm gate (added 2026-05-24).
+     *
+     * The boot gate above keeps yields off until frame_count >= 30,
+     * which covers BIOS + early init. But Halo 2's title-screen Bink
+     * intro keeps the audio engine extremely active well past frame
+     * 30 — and our yield's BQL release lets the audio thread fire an
+     * IRQ during the gap, which then breaks the next chain at iter 1.
+     * Symptom: chain avg=1.01 / irq_exits=99.97% / FLIP_STALL counter
+     * frozen / wedge perceived as "title-screen crash".
+     *
+     * The chain dispatcher's irq_exits counter is the direct
+     * observable. When recent chains overwhelmingly exit on IRQ, the
+     * audio thread is already getting plenty of preemption via normal
+     * IRQ delivery — our additional yield only tips the dispatcher
+     * into 1-iter-chain collapse. Skip the yield in that regime;
+     * spin a bit longer instead.
+     *
+     * Sampling is one-shot per call (we already gate at ~1/16 spin
+     * iters above). The numerator/denominator are cumulative — a
+     * single bad window above the threshold suppresses yields until
+     * the ratio averages back below it (which happens once the chain
+     * starts running 30+ iters again).
+     */
+    {
+        uint64_t runs = 0, irq_exits = 0;
+        cranelift_chain_get_stats(&runs, NULL, NULL, &irq_exits,
+                                  NULL, NULL, NULL);
+        if (runs > 10000ull && irq_exits * 100ull > runs * 80ull) {
+            return false;
+        }
+    }
+
+    /*
+     * CRITICAL: drop BQL during the nanosleep. The chain dispatcher's
+     * xbox_hle_check runs with BQL held; if we sleep holding BQL,
+     * mcpx.apu_thread and pgraph_vk.render block waiting for it →
+     * audio static in Bink video. Same root cause as the 2026-05-22
+     * sched_yield regression.
+     *
+     * BUT the OUTER cpu_loop's xbox_hle_check (cpu-exec.c around 1676)
+     * runs AFTER a bql_unlock() in the IRQ-handling block at ~1521 —
+     * so BQL may already be unlocked when we arrive. SS2 boot crash
+     * 2026-05-24: bql_unlock g_assert(bql_locked()) tripped from this
+     * site. Test bql_locked() first and only bracket-unlock if held.
+     */
+    bool had_bql = bql_locked();
+    if (had_bql) {
+        bql_unlock();
+    }
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = IDLE_LOOP_YIELD_NS };
+    nanosleep(&ts, NULL);
+    if (had_bql) {
+        bql_lock();
+    }
+    g_idle_loop_yields++;
     return false;
 }
 
@@ -1712,6 +2192,14 @@ struct ord_entry {
 static const uint8_t SIG_NT_YIELD_EXECUTION[] = {
     /* cmp [0x8003aa00], 0; push edi; mov edi, 0x40000024 */
     0x83, 0x3d, 0x00, 0xaa, 0x03, 0x80, 0x00, 0x57
+};
+/* KeBugCheckEx: we don't know the real prologue yet, but the function
+ * almost certainly starts with `push ebp; mov ebp, esp` (every other
+ * 5-arg stdcall in xboxkrnl does). Use a permissive 3-byte signature;
+ * we'll log the full caller context from the handler so the FIRST
+ * crash gives us everything we need to lock the sig down. */
+static const uint8_t SIG_KE_BUGCHECK_EX[] = {
+    0x55, 0x8b, 0xec
 };
 static const uint8_t SIG_KE_DELAY_EXECUTION_THREAD[] = {
     /* push ebp; mov ebp, esp; sub esp, 0x10; push ebx; push esi */
@@ -1831,6 +2319,22 @@ static const struct ord_entry g_ordinal_table[] = {
      */
     { 277, "RtlEnterCriticalSection",     hle_rtl_enter_critical_section,     &g_gate_rtl,
         SIG(SIG_RTL_ENTER_CRITICAL_SECTION) },
+    /*
+     * KeBugCheckEx — instrumentation only. Always declines (returns
+     * false), but the FIRST time the kernel calls this we dump the
+     * bugcheck code + 4 params + caller PC + register set + 32 bytes
+     * preceding the call site + 6 frames of ebp-chain backtrace.
+     * That is enough context to identify exactly which kernel path
+     * issued the panic — we can then look up `caller` in Ghidra and
+     * apply a targeted forward fix. Halo 2 title screen wedges at
+     * 0x800151ed (cli;hlt) ~30s after boot; this handler turns that
+     * silent halt into actionable telemetry.
+     *
+     * Standard NT ordinal is 13. Gate via &g_gate_kf so it follows
+     * the same boot-resolve sequence as the other kernel hooks.
+     */
+    {  13, "KeBugCheckEx",                hle_ke_bugcheck_ex,                 &g_gate_kf,
+        SIG(SIG_KE_BUGCHECK_EX) },
     { 294, "RtlLeaveCriticalSection",     hle_rtl_leave_critical_section,     &g_gate_rtl,
         SIG(SIG_RTL_LEAVE_CRITICAL_SECTION) },
     /*
@@ -1949,7 +2453,23 @@ static const uint8_t SIG_XC_SHA_TRANSFORM[] = {
     0x56, 0x57, 0x53, 0x55, 0x8b, 0x54, 0x24, 0x18
 };
 
+static const uint8_t SIG_FATX_MATCH_NAME[] = {
+    /* mov edx, [esp+8]; push esi; mov si, [edx]; test si, si; jnz +4 */
+    0x8b, 0x54, 0x24, 0x08, 0x56, 0x66, 0x8b, 0x32, 0x66, 0x85, 0xf6, 0x75, 0x04
+};
+
+static const uint8_t SIG_MM_LOCK_UNLOCK_BUFFER_PAGES[] = {
+    /* push ebp; mov ebp,esp; push ecx;
+     * call KeRaiseIrqlToDpcLevel (rel32 = 0xffff6358);
+     * mov edx, [ebp+8]; mov [ebp-1], al; lea ?? */
+    0x55, 0x8b, 0xec, 0x51,
+    0xe8, 0x58, 0x63, 0xff, 0xff,
+    0x8b, 0x55, 0x08, 0x88, 0x45, 0xff, 0x8d
+};
+
 #define XC_SHA_TRANSFORM_VA 0x80031550u
+#define FATX_MATCH_NAME_VA  0x80030dbau
+#define MM_LOCK_UNLOCK_BUFFER_PAGES_VA 0x8001dfe7u
 
 static const struct extra_hook g_extra_hooks[] = {
     {
@@ -1965,6 +2485,20 @@ static const struct extra_hook g_extra_hooks[] = {
         hle_xc_sha_transform,
         &g_gate_kf,
         SIG(SIG_XC_SHA_TRANSFORM),
+    },
+    {
+        FATX_MATCH_NAME_VA,
+        "FatxMatchName",
+        hle_fatx_match_name,
+        &g_gate_fs,
+        SIG(SIG_FATX_MATCH_NAME),
+    },
+    {
+        MM_LOCK_UNLOCK_BUFFER_PAGES_VA,
+        "MmLockUnlockBufferPages",
+        hle_mm_lock_unlock_buffer_pages,
+        &g_gate_kf,  /* memory-management lives with the Ke/Mm gate */
+        SIG(SIG_MM_LOCK_UNLOCK_BUFFER_PAGES),
     },
 };
 
@@ -1994,6 +2528,43 @@ static bool hle_probe_decline(X86CPU *cpu)
 #define HALO2_VSH_PROBE_LO 0x003f7000u
 #define HALO2_VSH_PROBE_HI 0x003fad00u
 
+/*
+ * Halo 2 intro-movie state-machine dispatcher.
+ *
+ * halo_intro_movie_loop (0x001639b0) calls a jumptable dispatcher
+ * FUN_002141f0 every iteration. The dispatcher uses DAT_0055bd04 as
+ * an index into PTR_LAB_00214858[16], each entry advancing some part
+ * of the intro-movie startup state machine.
+ *
+ * Case 12 (handler at 0x002145c4) is a hand-rolled fade/timing wait:
+ *   - counter  = [0x55bcf0]
+ *   - limit    = [0x55bcf4]
+ *   - delta    = [0x55bd18]
+ *   - mixer    = [0x55c02c]
+ *   - call FUN_00123110(delta, counter)  ; empty busy-wait
+ *   - on counter==limit:  advance state
+ *   - on counter < limit: counter += delta, loop back via dispatcher
+ *
+ * On Android, certain runs wedge in case 12 — `g` (NV097_FLIP_STALL
+ * counter) freezes while the chain dispatcher keeps grinding at
+ * 6M runs/sec. The XBE PC sampler caught 0x00123158 (busy-wait body)
+ * and the case-12 PCs as the wedge location. KeBugCheckEx never
+ * fires; the kernel is healthy. The intro state machine simply
+ * never advances past case 12.
+ *
+ * Forward fix: when this handler observes case 12 entered >N times
+ * consecutively with `counter < limit` and `counter` unchanged, it
+ * writes `counter := limit` to satisfy the equality check and let
+ * the case body advance the state machine. This unwedges the intro
+ * loop at the cost of skipping the residual fade timing — visually
+ * the intro starts a frame or two earlier than it would have.
+ *
+ * Always returns false (decline) — the game code runs normally and
+ * sees the patched global on its next read.
+ */
+#define HALO2_INTRO_DISPATCHER_LO 0x002141f0u
+#define HALO2_INTRO_DISPATCHER_HI 0x002141f4u
+
 static const struct {
     const char *name;
     uint32_t pc;
@@ -2007,6 +2578,26 @@ static const struct {
     { "D3DDevice_MakeSpace",                            0x003fac20u, hle_probe_decline },
 };
 
+/*
+ * Public accessor read by vp.c voice_process. Cheap branch in a hot
+ * loop — the value is stable across the session so the host branch
+ * predictor pins it. NB: when dsound HLE is on, ALL MCPX voice work
+ * goes silent (real CDS voices have no HLE side-channel yet), so this
+ * is a UPPER-BOUND-MEASUREMENT mode until the SDL backend lands.
+ */
+bool xbox_hle_dsound_active(void)
+{
+    return g_gate_dsound;
+}
+
+/* Bypass-specific accessor used by vp.c voice_process. Separate from
+ * the main gate so HLE_DSOUND=1 stays a no-op until the bypass logic is
+ * proven safe. Opt in via X1BOX_HLE_DSOUND_BYPASS=1. */
+bool xbox_hle_dsound_bypass_active(void)
+{
+    return g_gate_dsound_bypass;
+}
+
 static bool g_xbe_probes_installed;
 
 static void install_xbe_probes_once(void)
@@ -2017,6 +2608,369 @@ static void install_xbe_probes_once(void)
         hle_install(g_xbe_probes[i].name, g_xbe_probes[i].pc,
                     g_xbe_probes[i].handler);
     }
+}
+
+/* See comment near HALO2_INTRO_DISPATCHER_LO above for the diagnosis
+ * and the case-12 forward-fix rationale. */
+static bool hle_h2_intro_dispatcher(X86CPU *cpu)
+{
+    (void)cpu;
+
+    uint32_t case_idx = 0xffffffffu, counter = 0, limit = 0;
+    uint32_t delta = 0, mixer = 0;
+    uint8_t gate = 0;
+    g_read32(0x0055bd04u, &case_idx);
+    g_read32(0x0055bcf0u, &counter);
+    g_read32(0x0055bcf4u, &limit);
+    g_read32(0x0055bd18u, &delta);
+    g_read32(0x0055c02cu, &mixer);
+    g_read(0x0055bd0cu, &gate, 1);
+
+    /* Track consecutive entries with the same (case, counter) pair.
+     * If the counter moves we're making progress; if the case index
+     * moves we've advanced. Either way reset the stuck counter. */
+    static __thread uint32_t same_count;
+    static __thread uint32_t last_case;
+    static __thread uint32_t last_counter;
+    if (case_idx == last_case && counter == last_counter) {
+        same_count++;
+    } else {
+        last_case = case_idx;
+        last_counter = counter;
+        same_count = 1;
+    }
+
+    /* Throttled log: surface a snapshot every 4096 stuck-entries so
+     * we have a paper trail if the forward-fix needs revisiting. */
+    if ((same_count & 0xfffu) == 1u && same_count > 1u) {
+        HLE_LOG("intro_dispatcher case=%u stuck=%u counter=0x%x "
+                "limit=0x%x delta=0x%x mixer=0x%x gate=%u",
+                case_idx, same_count, counter, limit, delta, mixer,
+                gate);
+    }
+
+    /* Forward fix: case 12 wedged with counter < limit and counter
+     * unchanged for >5000 consecutive dispatcher entries. Force the
+     * equality so the busy-wait completes-once-and-advances path
+     * (the `74 39  jz +0x39` at 0x002145f2 → 0x00214669) is taken.
+     * 5000 entries at ~1ms/iter SwitchToThread cadence ≈ 5s, well
+     * past any legitimate fade timing. */
+    if (case_idx == 12 && same_count > 5000u && counter != limit) {
+        HLE_LOG("intro_dispatcher: case 12 wedge — forcing "
+                "counter (0x%x) -> limit (0x%x)",
+                counter, limit);
+        g_write32(0x0055bcf0u, limit);
+        same_count = 0;
+    }
+
+    return false;
+}
+
+/* ------------------------------------------------------------------ */
+/*  XBE-side DSound HLE (Halo 2 leaf stubs)                            */
+/* ------------------------------------------------------------------ */
+/*
+ * Scaffold for the Cxbx-Reloaded DSound HLE port. Today this is just
+ * the **leaf** API stubs: pure-control entry points (Play/Stop/Pause +
+ * all Set*) where stubbing means silent audio but no guest crash. The
+ * stateful entry points (DirectSoundCreate, CreateSoundBuffer/Stream,
+ * Lock/Unlock, GetStatus, GetCurrentPosition) write guest-visible OUT
+ * structs and are left to fall through to the real Xbox SDK code path
+ * for now — a follow-up will port Cxbx-R's HybridDSBuffer model and an
+ * SDL-audio backend.
+ *
+ * Entry-point VAs are hardcoded for halo2-default.xbe; identified from
+ * retained DSound symbols in Ghidra (see [[project_halo2_xpack_mod_
+ * candidates]] sibling work). Other titles will need their own
+ * resolution pass.
+ *
+ * Xbox COM ABI: __stdcall with `this` on the stack as arg-0. Return
+ * value in EAX. Callee pops ret + N*4. Floats are passed in 32-bit
+ * slots (so SetPosition(this,x,y,z,dwApply) = 5 slots, SetOrientation
+ * with two float3 vectors + this + dwApply = 8 slots).
+ *
+ * Stubs all return DS_OK (0). DSound success is HRESULT==0 — the game
+ * branches on `if (FAILED(hr))` so any non-negative value is fine.
+ */
+#define HALO2_DSOUND_PC_LO 0x00379d00u
+#define HALO2_DSOUND_PC_HI 0x0037fd00u
+
+/*
+ * DSOUND_STUB(N) — was "return DS_OK + pop N stdcall args + take ownership".
+ *
+ * Changed 2026-05-23 to a pure-decline shim after Ghidra revealed Halo 2's
+ * Bink-video audio thread (FUN_003e0530) hits the buffer methods at ~250 Hz
+ * for ring-buffer cursor management — IDirectSoundBuffer_SetCurrentPosition
+ * @ 0x0037b797 (currently table-bound to hle_dsound_stub_2) is the
+ * load-bearing call. Taking ownership means the real
+ * CDirectSoundBuffer_SetCurrentPosition impl never runs, MCPX voice cursor
+ * never advances, the audio thread writes new samples while playback reads
+ * stale ones → tinny / corrupt output during attract & intro videos.
+ *
+ * Same hazard for every other stub_N entry (Pause, StopEx, DoWork,
+ * CommitDeferredSettings, listener SetDistance/Doppler/Rolloff/Position/
+ * Orientation): without the real impl running, MCPX state diverges from
+ * what the game expects.
+ *
+ * Until the full bypass + drain returns (with the voice state-machine
+ * follow-up in [[project_dsound_hle_scaffold]]), every entry is a pure
+ * `return false` — table entries remain so the dispatcher's decline
+ * counters still tell us which functions Halo 2 exercises, but no real
+ * behavior is hijacked. The `_##N` suffix is kept so the entries in
+ * g_dsound_entries[] still resolve at compile time.
+ */
+#define DSOUND_STUB(N)                                                     \
+    static bool hle_dsound_stub_##N(X86CPU *cpu)                           \
+    {                                                                      \
+        (void)cpu;                                                         \
+        return false;                                                      \
+    }
+
+DSOUND_STUB(0)
+DSOUND_STUB(1)
+DSOUND_STUB(2)
+DSOUND_STUB(3)
+DSOUND_STUB(4)
+DSOUND_STUB(5)
+DSOUND_STUB(8)
+
+/*
+ * Real handlers that drive hle_audio_*. Same stdcall pop discipline as
+ * the stubs, but with actual side effects.
+ *
+ * v1 assumes WAVE_FORMAT_PCM 22050 Hz mono 16-bit for any captured
+ * buffer — that's Halo 2's dominant UI-sound default. Buffers that
+ * use a different format will sound wrong-pitched (rate) or quiet
+ * (8-bit treated as 16-bit). Format detection from the buffer's
+ * WAVEFORMATEX is the next sub-task — see [[project_dsound_hle_scaffold]].
+ */
+/*
+ * All buffer/stream method handlers are SNOOP+DECLINE as of 2026-05-23.
+ *
+ * Mechanism: read the call's args from the guest stack and feed the
+ * HLE audio backend (so the per-pBuffer slot table builds up the same
+ * picture it would in full-intercept mode), then **return false**
+ * WITHOUT mutating env (don't set EAX, don't pop the return address).
+ * The dispatcher then runs the real TB, so the real CDirectSoundBuffer
+ * impl handles the call end-to-end — MCPX voice gets the data and gets
+ * activated, voice_process advances its cursor, MCPX raises the
+ * end-of-buffer IRQ, the game's audio code sees real progress.
+ *
+ * Why not full-intercept: with full-intercept, the real CDirectSound
+ * impl never runs → MCPX voice for that buffer is never activated →
+ * voice cursor stays at zero → GetCurrentPosition returns 0 forever →
+ * Halo 2 main thread HLTs waiting for the IRQ that never fires.
+ * Confirmed 2026-05-23 (vCPU TCG delta = 0 over 5s, runstate=running
+ * = HLT-loop wedge).
+ *
+ * The full-intercept path will come back when we implement either
+ * (a) a fake-object pool that fully replaces real CDirectSoundBuffer,
+ * or (b) a minimal voice state-machine in the per-voice bypass that
+ * advances CBO + fires voice_off() at end-of-buffer. Until then,
+ * decline + snoop keeps the game stable and gives the backend real
+ * telemetry on what audio data Halo 2 is actually using.
+ */
+/*
+ * Snoop logic stripped 2026-05-23 (third pass).
+ *
+ * Earlier "snoop + decline" tried to read the call's args + up to 4 MB
+ * of guest audio bytes per call before declining. Symptoms reported by
+ * the user during gameplay validation:
+ *   - Bink opening-video audio is "deeply distorted, mostly tinny"
+ *   - Attract-mode video audio is corrupt
+ *   - Physics is broken
+ *   - Title-screen audio (which doesn't use streams) sounds fine
+ *
+ * The pattern points at per-call latency: stream Process gets hammered
+ * during video playback, the per-call g_read+memcpy of guest audio
+ * pushed the real CDirectSoundStream::Process past its realtime
+ * deadline → underrun → tinny audio. The same overhead steals time
+ * from the vCPU's main loop → physics tick drifts → physics breaks.
+ *
+ * Since the bypass + drain hooks are compiled out today, the HLE
+ * backend has no consumer — the snoop was just heap-thrashing a ring
+ * that no one reads. Drop the snoop entirely. Handlers stay as table
+ * entries so we still get decline-counter telemetry, but they are
+ * literally `return false` with no work.
+ *
+ * The snoop logic can come back when the bypass + drain return
+ * (per the [[project_dsound_hle_scaffold]] voice-state-machine
+ * follow-up). At that point the handlers will take ownership too, so
+ * the realtime-deadline concern disappears.
+ */
+static bool hle_dsound_set_buffer_data(X86CPU *cpu)
+{
+    (void)cpu;
+    return false;
+}
+
+static bool hle_dsound_play(X86CPU *cpu)
+{
+    (void)cpu;
+    return false;
+}
+
+static bool hle_dsound_stop(X86CPU *cpu)
+{
+    (void)cpu;
+    return false;
+}
+
+static bool hle_dsound_set_volume(X86CPU *cpu)
+{
+    (void)cpu;
+    return false;
+}
+
+static bool hle_dsound_set_frequency(X86CPU *cpu)
+{
+    (void)cpu;
+    return false;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Create probes — snapshot WAVEFORMATEX, decline, let real Create run */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Read X_DSBUFFERDESC / X_DSSTREAMDESC.lpwfxFormat → WAVEFORMATEX and
+ * push to the format FIFO. wfx_off is the offset of lpwfxFormat inside
+ * the descriptor (12 for X_DSBUFFERDESC, 8 for X_DSSTREAMDESC).
+ *
+ * Both arms decline (return false) — the real Create runs in the guest
+ * and produces the real pBuffer/pStream the game holds. The FIFO entry
+ * gets consumed by the first SetBufferData (for buffers) or Process
+ * (for streams) that follows.
+ */
+static void capture_format(uint32_t pDesc, uint32_t wfx_off)
+{
+    if (!pDesc) return;
+    uint32_t lpwfx = 0;
+    if (!g_read32(pDesc + wfx_off, &lpwfx) || !lpwfx) return;
+    uint8_t wfx[18];
+    if (!g_read(lpwfx, wfx, sizeof(wfx))) return;
+    uint16_t tag  = lduw_le_p(wfx + 0);
+    uint16_t ch   = lduw_le_p(wfx + 2);
+    uint32_t rate = ldl_le_p(wfx + 4);
+    uint16_t ba   = lduw_le_p(wfx + 12);
+    uint16_t bits = lduw_le_p(wfx + 14);
+    hle_audio_format_push(tag, rate, ch, bits, ba);
+}
+
+/* DirectSoundCreateBuffer(LPCDSBUFFERDESC pdsbd, LPDIRECTSOUNDBUFFER *pp, void *pUnk) */
+static bool hle_dsound_create_buffer_probe(X86CPU *cpu)
+{
+    capture_format(hle_arg32(&cpu->env, 0), 12u);
+    return false;
+}
+
+/* IDirectSound::CreateSoundBuffer(this, pdsbd, ppBuffer, pUnk) */
+static bool hle_idsound_create_buffer_probe(X86CPU *cpu)
+{
+    capture_format(hle_arg32(&cpu->env, 1), 12u);
+    return false;
+}
+
+/* DirectSoundCreateStream(LPDSSTREAMDESC pdssd, LPDIRECTSOUNDSTREAM *pp, void *pUnk) */
+static bool hle_dsound_create_stream_probe(X86CPU *cpu)
+{
+    capture_format(hle_arg32(&cpu->env, 0), 8u);
+    return false;
+}
+
+/* IDirectSound::CreateSoundStream(this, pdssd, ppStream, pUnk) */
+static bool hle_idsound_create_stream_probe(X86CPU *cpu)
+{
+    capture_format(hle_arg32(&cpu->env, 1), 8u);
+    return false;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Stream pump — CDirectSoundStream_Process + CMcpxStream_Flush       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * CDirectSoundStream::Process(LPXMEDIAPACKET pInput, LPXMEDIAPACKET pOutput)
+ *
+ * Stack: [ret, pThis, pInput, pOutput]. We read the input packet's
+ * (pvBuffer, dwMaxSize), copy guest bytes, push as a stream packet,
+ * then mark the packet's completion fields so the game sees it as
+ * consumed (else it'll keep retrying with the same packet).
+ *
+ * XMEDIAPACKET layout (24 bytes):
+ *   +0  pvBuffer            (guest pointer to audio bytes)
+ *   +4  dwMaxSize
+ *   +8  pdwCompletedSize    (guest pointer to out-DWORD)
+ *  +12  pdwStatus           (guest pointer to out-DWORD; we write XMP_STATUS_SUCCESS=0)
+ *  +16  hCompletionEvent / pContext (union; not touched here)
+ *  +20  prtTimestamp        (guest pointer; ignored)
+ */
+/* Stream Process — snoop stripped (see comment on the buffer handlers
+ * above). The g_read of guest packet bytes on every Process call was
+ * what corrupted Bink-video audio + drifted physics. Pure decline. */
+static bool hle_dsound_stream_process(X86CPU *cpu)
+{
+    (void)cpu;
+    return false;
+}
+
+static bool hle_dsound_mcpx_stream_flush(X86CPU *cpu)
+{
+    (void)cpu;
+    return false;
+}
+
+static const struct {
+    const char *name;
+    uint32_t pc;
+    XboxHleHandler handler;
+} g_dsound_entries[] = {
+    /* Pump / global */
+    { "DirectSoundDoWork",                     0x0037b844u, hle_dsound_stub_0 },
+    { "IDirectSound_CommitDeferredSettings",   0x0037d141u, hle_dsound_stub_1 },
+
+    /* Buffer control — real handlers driving the audio backend */
+    { "IDirectSoundBuffer_Stop",               0x0037b703u, hle_dsound_stop          },
+    { "IDirectSoundBuffer_Pause",              0x0037b73fu, hle_dsound_stub_2        },
+    { "IDirectSoundBuffer_SetCurrentPosition", 0x0037b797u, hle_dsound_stub_2        },
+    { "IDirectSoundBuffer_SetVolume",          0x0037b66fu, hle_dsound_set_volume    },
+    { "IDirectSoundBuffer_SetFrequency",       0x0037c5c8u, hle_dsound_set_frequency },
+    { "IDirectSoundBuffer_SetBufferData",      0x0037cc4au, hle_dsound_set_buffer_data },
+    { "IDirectSoundBuffer_Play",               0x0037b6dfu, hle_dsound_play          },
+    { "IDirectSoundBuffer_StopEx",             0x0037b71bu, hle_dsound_stub_4        },
+
+    /* Device-level 3D-listener controls (Xbox merges into IDirectSound) */
+    { "IDirectSound_SetDistanceFactor",        0x0037d506u, hle_dsound_stub_3 },
+    { "IDirectSound_SetDopplerFactor",         0x0037d52au, hle_dsound_stub_3 },
+    { "IDirectSound_SetRolloffFactor",         0x0037d5cdu, hle_dsound_stub_3 },
+    { "IDirectSound_SetPosition",              0x0037d598u, hle_dsound_stub_5 },
+    { "IDirectSound_SetOrientation",           0x0037d54eu, hle_dsound_stub_8 },
+
+    /* Create probes — decline (real Create runs), snapshot WAVEFORMATEX
+     * into format FIFO so SetBufferData / Process can bind real format. */
+    { "DirectSoundCreateBuffer",               0x0037d7deu, hle_dsound_create_buffer_probe   },
+    { "DirectSoundCreateStream",               0x0037d835u, hle_dsound_create_stream_probe   },
+    { "IDirectSound_CreateSoundBuffer",        0x0037d4beu, hle_idsound_create_buffer_probe  },
+    { "IDirectSound_CreateSoundStream",        0x0037d4e2u, hle_idsound_create_stream_probe  },
+
+    /* Stream pump — real handlers driving the audio backend */
+    { "CDirectSoundStream_Process",            0x0037ad25u, hle_dsound_stream_process        },
+    { "CMcpxStream_Flush",                     0x0037fbfeu, hle_dsound_mcpx_stream_flush     },
+};
+
+static bool g_dsound_installed;
+
+static void install_dsound_hooks_once(void)
+{
+    if (g_dsound_installed) return;
+    if (!g_gate_dsound)    return;
+    g_dsound_installed = true;
+    for (size_t i = 0; i < ARRAY_SIZE(g_dsound_entries); i++) {
+        hle_install(g_dsound_entries[i].name, g_dsound_entries[i].pc,
+                    g_dsound_entries[i].handler);
+    }
+    HLE_LOG("dsound: installed %zu leaf-stub hooks",
+            ARRAY_SIZE(g_dsound_entries));
 }
 
 /*
@@ -2196,20 +3150,25 @@ void xbox_hle_init(void)
         return;
     }
 
-    const struct { const char *name; bool *gate; } gates[] = {
-        { "X1BOX_HLE_RTL",   &g_gate_rtl   },
-        { "X1BOX_HLE_KF",    &g_gate_kf    },
-        { "X1BOX_HLE_YIELD", &g_gate_yield },
+    const struct { const char *name; bool *gate; bool default_on; } gates[] = {
+        { "X1BOX_HLE_RTL",    &g_gate_rtl,    true  },
+        { "X1BOX_HLE_KF",     &g_gate_kf,     true  },
+        { "X1BOX_HLE_YIELD",  &g_gate_yield,  true  },
+        { "X1BOX_HLE_DSOUND", &g_gate_dsound, false },
+        { "X1BOX_HLE_DSOUND_BYPASS", &g_gate_dsound_bypass, false },
     };
     for (size_t i = 0; i < ARRAY_SIZE(gates); i++) {
         const char *v = getenv(gates[i].name);
-        if (v && (*v == '0' || *v == 'n' || *v == 'N')) {
-            *gates[i].gate = false;
-        }
+        if (!v || !*v) continue;
+        bool on = !(*v == '0' || *v == 'n' || *v == 'N');
+        *gates[i].gate = on;
     }
-    HLE_LOG("HLE on: rtl=%d kf=%d yield=%d",
-            g_gate_rtl, g_gate_kf, g_gate_yield);
+    HLE_LOG("HLE on: rtl=%d kf=%d yield=%d dsound=%d",
+            g_gate_rtl, g_gate_kf, g_gate_yield, g_gate_dsound);
     sha1_init();
+    if (g_gate_dsound) {
+        hle_audio_init();
+    }
 }
 
 bool xbox_hle_is_enabled(void)
@@ -2225,6 +3184,43 @@ bool xbox_hle_check(CPUState *cs, uint32_t pc)
         xbox_hle_init();
     }
     if (!g_hle_enabled) return false;
+
+    /*
+     * Ultra-fast-path: KeQueryPerformanceCounter. Halo 2 calls this
+     * 5M+ times/sec (profiled 4.48% of total CPU on the vCPU thread
+     * was just vDSO clock_gettime); the normal dispatch path (range
+     * check → hash lookup → indirect call → hle_return_stdcall) takes
+     * ~80-100ns per call even before the qemu_clock_get_ns syscall.
+     *
+     * Inline EVERYTHING here: cntvct_el0 read, 96.32 fixed-point
+     * tick conversion, EDX:EAX write, return-pop. Eight host insns
+     * total. The compare-and-branch on the cold path is one extra
+     * compare for every other PC — a register-relative const compare,
+     * so the branch predictor pins it not-taken after the first miss.
+     *
+     * Safe pre-resolve: KeQPC has no kernel-state dependencies, no
+     * gating (the unguarded read is the whole point on real hardware
+     * too), and the failure mode of a bad ESP/stack is exactly the
+     * same as the full handler (return false → kernel TB runs).
+     */
+    if (__builtin_expect(pc == XBOX_HLE_KE_QPC_VA, 0)) {
+        X86CPU *x86 = X86_CPU(cs);
+        CPUX86State *env = &x86->env;
+        uint32_t esp = env->regs[R_ESP];
+        uint32_t ret_addr;
+        if (g_read32(esp, &ret_addr)) {
+            uint64_t ticks = xbox_qpc_ticks_fast();
+            env->regs[R_EAX] = (uint32_t)(ticks & 0xFFFFFFFFu);
+            env->regs[R_EDX] = (uint32_t)(ticks >> 32);
+            env->regs[R_ESP] = esp + 4;  /* stdcall, 0 args */
+            env->eip = ret_addr;
+            g_keqpc_fast_hits++;
+            return true;
+        }
+        /* g_read failed → fall through to slow path (full handler
+         * also reads esp and would fail the same way). */
+    }
+
     /*
      * Fast-path range filter. Two narrow windows:
      *   - kernel image at 0x80010000..0x800b0000
@@ -2234,22 +3230,67 @@ bool xbox_hle_check(CPUState *cs, uint32_t pc)
      */
 #define XKRNL_HOOK_RANGE_LO 0x80010000u
 #define XKRNL_HOOK_RANGE_HI 0x800b0000u
-    bool in_kernel = (pc >= XKRNL_HOOK_RANGE_LO && pc < XKRNL_HOOK_RANGE_HI);
-    bool in_xbe_vsh = (pc >= HALO2_VSH_PROBE_LO && pc < HALO2_VSH_PROBE_HI);
-    if (!in_kernel && !in_xbe_vsh) {
+    bool in_kernel  = (pc >= XKRNL_HOOK_RANGE_LO && pc < XKRNL_HOOK_RANGE_HI);
+    bool in_xbe_vsh = (pc >= HALO2_VSH_PROBE_LO  && pc < HALO2_VSH_PROBE_HI);
+    bool in_dsound  = (g_gate_dsound &&
+                       pc >= HALO2_DSOUND_PC_LO  && pc < HALO2_DSOUND_PC_HI);
+    bool in_intro   = (pc >= HALO2_INTRO_DISPATCHER_LO &&
+                       pc <  HALO2_INTRO_DISPATCHER_HI);
+    if (!in_kernel && !in_xbe_vsh && !in_dsound && !in_intro) {
+        /* User-mode PC sampler: covers the case where Halo 2 wedges
+         * in title-screen XBE code (g frozen, chain dispatcher still
+         * running). Range 0x10000..0x80000000 covers the XBE image
+         * + heap; nothing useful sits below 0x10000. */
+        if (pc >= 0x00010000u && pc < 0x80000000u) {
+            xbe_pc_count(pc);
+        }
         return false;
+    }
+    if (in_intro) {
+        /* Install lazily on first hit so non-Halo-2 boots don't pay
+         * the dispatch table entry. The handler is single-PC; we
+         * install only once. */
+        static bool installed;
+        if (!installed) {
+            installed = true;
+            hle_install("halo2_intro_dispatcher",
+                        HALO2_INTRO_DISPATCHER_LO,
+                        hle_h2_intro_dispatcher);
+        }
     }
     if (in_xbe_vsh) {
         /* Probes don't depend on PE resolution — install on first hit. */
         install_xbe_probes_once();
     }
+    if (in_dsound) {
+        /* DSound table is hardcoded for halo2-default.xbe — no PE walk
+         * needed. Install lazily on first hit so cold boots that never
+         * touch DSound (e.g. SS2 video probe) pay nothing. */
+        install_dsound_hooks_once();
+    }
     if (in_kernel && !g_hle_resolved) {
-        /* Throttle the PE walk — it touches guest memory which isn't
-         * mapped early in boot. Try every ~256 calls until it lands. */
-        static uint32_t throttle;
-        if ((throttle++ & 0xFF) == 0) {
-            xbox_hle_resolve_kernel(cs);
-        }
+        /*
+         * Pre-warm HLE install: try resolving every kernel TB until it
+         * lands. The PE walk's first read goes through cpu_get_phys_page
+         * _attrs_debug — when the kernel image isn't mapped yet, that
+         * fails fast (~100ns) and we bail. Once kernel pages map, the
+         * very next kernel TB triggers a successful walk + handler
+         * installs, catching the boot-time SHA-1 / Mm / Rtl traffic that
+         * the prior 256-throttle missed.
+         *
+         * On SS2 the prior throttle missed ~234K XcShaTransform body
+         * calls during boot (kernel ran SHA-1 file-integrity checks
+         * BEFORE HLE installed). Same shape for any title with a long
+         * boot init phase.
+         *
+         * Throttle still exists as a safety belt: skip the walk if
+         * resolve attempts are accumulating with no progress (indicates
+         * a non-Xbox kernel image, e.g. running a homebrew with custom
+         * krnl). g_resolve_attempts/g_resolve_failures track this in
+         * stats so a future regression shows up as runaway counter
+         * growth.
+         */
+        xbox_hle_resolve_kernel(cs);
         if (!g_hle_resolved) return false;
     }
     struct hle_entry *e = hle_lookup(pc);
@@ -2287,9 +3328,13 @@ void xbox_hle_log_stats(void)
         }
     }
     HLE_LOG("idle_loop idle=%" PRIu64 " dpc_pending=%" PRIu64
-            " next_thread_pending=%" PRIu64 " halts=%" PRIu64,
+            " next_thread_pending=%" PRIu64 " halts=%" PRIu64
+            " yields=%" PRIu64,
             g_idle_loop_idle, g_idle_loop_dpc_pending,
-            g_idle_loop_next_thread_pending, g_idle_loop_halts);
+            g_idle_loop_next_thread_pending, g_idle_loop_halts,
+            g_idle_loop_yields);
+    HLE_LOG("keqpc_fast_hits=%" PRIu64 " (inline cntvct path)",
+            g_keqpc_fast_hits);
 
     /* Cross-check: how many SET_TRANSFORM_CONSTANT slot writes pgraph saw
      * vs. how many of those slot writes were redundant (value unchanged).
@@ -2323,5 +3368,32 @@ void xbox_hle_log_stats(void)
             HLE_LOG("unhooked-pc[%u] 0x%08x hits=%" PRIu64,
                     t, top[t].pc, top[t].count);
         }
+    }
+
+    /* Top 10 user-mode (XBE) PCs — when the guest wedges in user code
+     * (g frozen but chains running), this tells us where the spin is.
+     * The counters are sampled 1-in-64 so multiply by ~64 for real
+     * hit rate. Frozen counters across samples = the wedge location. */
+    struct { uint32_t pc; uint64_t count; } xbe_top[10] = {0};
+    for (unsigned i = 0; i < HLE_PROFILE_SLOTS; i++) {
+        if (!g_xbe_pcs[i].count) continue;
+        for (unsigned t = 0; t < 10; t++) {
+            if (g_xbe_pcs[i].count > xbe_top[t].count) {
+                for (unsigned s = 9; s > t; s--) xbe_top[s] = xbe_top[s-1];
+                xbe_top[t].pc = g_xbe_pcs[i].pc;
+                xbe_top[t].count = g_xbe_pcs[i].count;
+                break;
+            }
+        }
+    }
+    for (unsigned t = 0; t < 10; t++) {
+        if (xbe_top[t].count) {
+            HLE_LOG("xbe-pc[%u] 0x%08x sampled=%" PRIu64,
+                    t, xbe_top[t].pc, xbe_top[t].count);
+        }
+    }
+
+    if (g_gate_dsound) {
+        hle_audio_log_stats();
     }
 }

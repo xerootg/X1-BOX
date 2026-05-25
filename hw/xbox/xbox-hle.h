@@ -62,4 +62,26 @@ bool xbox_hle_resolve_kernel(CPUState *cs);
  */
 void xbox_hle_log_stats(void);
 
+/*
+ * True when DSound HLE is taking over voice work — MCPX vp.c reads this
+ * to short-circuit voice_process so we don't double-process audio that
+ * the HLE has already routed to its own backend. Cheap (one branch on a
+ * static bool, predicted-not-taken in normal flow).
+ *
+ * Set once by xbox_hle_init() from the X1BOX_HLE_DSOUND env var. Stays
+ * stable for the session — flipping live would race with vp's frame
+ * pump.
+ */
+bool xbox_hle_dsound_active(void);
+
+/*
+ * True when the per-voice voice_process bypass is opted in via
+ * X1BOX_HLE_DSOUND_BYPASS=1. Separate gate from xbox_hle_dsound_active()
+ * because the bypass needs a minimal voice state-machine (CBO advance +
+ * voice_off at end-of-buffer) to keep MCPX IRQ generation flowing —
+ * without that, guest threads HLT-wait on audio IRQs that never come.
+ * vp.c reads this in voice_process to skip the expensive sample math.
+ */
+bool xbox_hle_dsound_bypass_active(void);
+
 #endif /* HW_XBOX_HLE_H */

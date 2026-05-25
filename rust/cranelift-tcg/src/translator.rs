@@ -161,37 +161,23 @@ impl Translator {
          */
 
         /*
-         * STI-shadow filter — RESTORED PERMANENTLY 2026-05-21 after a
-         * full guest wedge (vCPU stats frozen ~110s → Android ANR
-         * force-remove) reproduced the scenario the dispatch-perf memo
-         * warned about: "the interrupt-inhibit shadow stretches across
-         * the dispatcher loop forever, and kernel polling loops like
-         * the wait-for-bit pattern at 0x8004edd3 never get interrupted."
+         * STI-shadow filter — RESTORED 2026-05-24 (3rd attempt failed).
          *
-         * The audio surges observed earlier this session are the same
-         * root cause: when the post-STI TB compiles in tier-2 without
-         * this filter, an IRQ that arrives during the shadow is gated
-         * on the inhibit bit at delivery time. A guest polling loop
-         * waiting for an IRQ-set bit then spins forever; audio FIFO
-         * refills miss their delivery windows; eventually the main
-         * thread can't respond to UI events → ANR.
+         * Three attempts to remove the filter all caused either guest
+         * wedge (May 21 ANR) or guest-state corruption (May 24 title
+         * corruption + audio loss). The chain-dispatcher inhibit-gate
+         * wasn't enough; trusting x86_cpu_pending_interrupt's native
+         * inhibit gate wasn't enough either. The bug is somewhere
+         * deeper in Cranelift's codegen for post-STI TBs — possibly
+         * MemFlags::trusted() permitting an alias optimisation, or an
+         * op-ordering issue when env writes intermix with goto_tb
+         * patterns. Needs offline investigation with a minimal
+         * reproducer (single post-STI TB → diff Cranelift IR vs
+         * tier-1 TCG output for the same TB).
          *
-         * `chain_continue`'s interrupt-check break does NOT save us
-         * because the issue isn't chain length — it's the dispatcher's
-         * interrupt-delivery gate, which honours the inhibit bit
-         * regardless of whether we got back to the dispatcher quickly.
-         *
-         * The filter must stay even though it costs ~27 tier-2 entries
-         * per Halo 2 session. Anything that touches hflags via a 1/2/4
-         * byte store has to run in tier-1, where TCG-aarch64's patched
-         * `goto_tb` keeps STI and post-STI back-to-back without a
-         * dispatcher round-trip.
-         *
-         * Detection via offset: hflags isn't a TCG global (only cc_op/
-         * dst/src/src2, regs, eip, df are). We derive its offset as
-         * `cc_op.offset + 8` (target/i386/cpu.h:1850-1866). Offset-
-         * based detection is robust to optimizer rewrites of the bit
-         * mask (e.g. `AND ~0x8` → `andc 0x8`).
+         * Restore filter; the ~37 opc56 bails on SS2 + ~27 on Halo 2
+         * are the tax for correctness. The chain inhibit-gate also
+         * removed since it's now dead code with the filter in place.
          */
         let hflags_offset: Option<u32> = self
             .env
@@ -216,7 +202,6 @@ impl Translator {
                 }
             }
         }
-
 
         let name = format!("tb_{tb_pc:016x}");
         let host_ptr_ty = self.host_ptr_ty;

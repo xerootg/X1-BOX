@@ -17,12 +17,52 @@ extern "C" {
 #include "x87_lib_shim.h"
 
 #include <atomic>
+#include <cstdlib>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <sys/system_properties.h>
+#include <time.h>
+#endif
 
 namespace {
 
 using namespace x87;
 
 std::atomic<bool> g_x87_lib_enabled{false};
+
+/*
+ * Per-op enable bitmask. Bit i (= X87_LIB_OP_*) set ⇒ that opcode uses
+ * lib when xemu_get_x87_lib() is true. Init lazily on first read from the
+ * X1BOX_X87_LIB_MASK env var; default 0xFFFFFFFF = all ops on. See header
+ * for the bisection workflow.
+ */
+std::atomic<uint32_t> g_x87_lib_op_mask{0xFFFFFFFFu};
+std::atomic<int> g_x87_lib_mask_inited{0};
+
+void init_op_mask_from_env_once()
+{
+    int expected = 0;
+    if (!g_x87_lib_mask_inited.compare_exchange_strong(
+            expected, 1, std::memory_order_acq_rel)) {
+        return;
+    }
+    const char *v = std::getenv("X1BOX_X87_LIB_MASK");
+    if (v && v[0] != '\0') {
+        char *end = nullptr;
+        unsigned long m = std::strtoul(v, &end, 0); /* base 0 → accepts 0x/0/dec */
+        if (end != v && *end == '\0') {
+            g_x87_lib_op_mask.store(static_cast<uint32_t>(m),
+                                    std::memory_order_relaxed);
+        }
+    }
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "x1box-x87lib",
+                        "op_mask=0x%08x (env X1BOX_X87_LIB_MASK=%s)",
+                        g_x87_lib_op_mask.load(std::memory_order_relaxed),
+                        v ? v : "<unset>");
+#endif
+}
 
 inline x87::fp80_t &to_lib(floatx80 &v)
 {
@@ -48,23 +88,68 @@ inline floatx80 from_lib(const x87::fp80_t &v)
 inline x87::x87cw_t cw_from_status(float_status *st)
 {
     if (!st) {
-        return X87CW_ROUNDING_NEAREST;
+        return X87CW_PRECISION_EXTENDED | X87CW_ROUNDING_NEAREST |
+               X87CW_MASK_ALL_EX;
     }
+    /* Rounding mode bits. */
+    x87::x87cw_t rc;
     switch (st->float_rounding_mode) {
-    case float_round_nearest_even: return X87CW_ROUNDING_NEAREST;
-    case float_round_down:         return X87CW_ROUNDING_DOWN;
-    case float_round_up:           return X87CW_ROUNDING_UP;
-    case float_round_to_zero:      return X87CW_ROUNDING_ZERO;
-    default:                       return X87CW_ROUNDING_NEAREST;
+    case float_round_nearest_even: rc = X87CW_ROUNDING_NEAREST; break;
+    case float_round_down:         rc = X87CW_ROUNDING_DOWN; break;
+    case float_round_up:           rc = X87CW_ROUNDING_UP; break;
+    case float_round_to_zero:      rc = X87CW_ROUNDING_ZERO; break;
+    default:                       rc = X87CW_ROUNDING_NEAREST; break;
     }
+    /* Precision-control bits — load-bearing for guest-x87 emulation.
+     * Halo 2 sets PC=single (24-bit mantissa) for physics integration;
+     * the lib's hand-rolled do_div/do_mul on aarch64 reads its CW via
+     * read_x87_cw() which on non-x86 falls back to a global override.
+     * We pipe st->floatx80_rounding_precision through that override at
+     * each scope (via rounding_scope below) so do_* honor PC properly. */
+    x87::x87cw_t pc;
+    switch (st->floatx80_rounding_precision) {
+    case floatx80_precision_s: pc = X87CW_PRECISION_SINGLE; break;
+    case floatx80_precision_d: pc = X87CW_PRECISION_DOUBLE; break;
+    case floatx80_precision_x:
+    default:                   pc = X87CW_PRECISION_EXTENDED; break;
+    }
+    /* Always mask exceptions — the shim translates SW bits to softfloat
+     * float_flag_* explicitly via x87lib_apply_status_flags; we never
+     * want the lib's internal paths to throw SIGFPE. */
+    return rc | pc | X87CW_MASK_ALL_EX;
 }
 
-/* RAII wrapper: install the requested rounding mode on entry and restore
- * the previous one on scope exit. */
+/* X1BOX_CW_OVERRIDE_PATCH installs these into the lib on non-x86. On
+ * x86 hosts the lib reads the real FPU CW via FNSTCW so the override
+ * functions are absent; we provide weak no-op fallbacks here so the
+ * shim compiles regardless. */
+extern "C" {
+#if !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+void  x1box_x87_set_cw_override(x87::x87cw_t cw);
+x87::x87cw_t x1box_x87_get_cw_override(void);
+#else
+__attribute__((weak)) inline void  x1box_x87_set_cw_override(x87::x87cw_t) {}
+__attribute__((weak)) inline x87::x87cw_t x1box_x87_get_cw_override(void) { return 0; }
+#endif
+}
+
+/* RAII wrapper: install the requested rounding mode + PC override on
+ * entry and restore the previous on scope exit. Sets BOTH the host FPU
+ * rounding mode (for hardware-fast lib paths on x86) AND the thread-
+ * local x87 CW override (for software paths on aarch64 — see
+ * x87fp80.cpp::read_x87_cw on non-x86). */
 struct rounding_scope {
     x87::fpround_t guard;
+    x87::x87cw_t prev_override;
     explicit rounding_scope(float_status *st)
-        : guard(cw_from_status(st)) {}
+        : guard(cw_from_status(st)),
+          prev_override(x1box_x87_get_cw_override())
+    {
+        x1box_x87_set_cw_override(cw_from_status(st));
+    }
+    ~rounding_scope() {
+        x1box_x87_set_cw_override(prev_override);
+    }
 };
 
 } /* namespace */
@@ -79,6 +164,90 @@ bool xemu_get_x87_lib(void)
 void xemu_set_x87_lib(bool enable)
 {
     g_x87_lib_enabled.store(enable, std::memory_order_relaxed);
+}
+
+uint32_t xemu_get_x87_lib_mask(void)
+{
+    init_op_mask_from_env_once();
+    return g_x87_lib_op_mask.load(std::memory_order_relaxed);
+}
+
+void xemu_set_x87_lib_mask(uint32_t mask)
+{
+    /* Mark inited so env-var parse doesn't clobber a programmatic set. */
+    g_x87_lib_mask_inited.store(1, std::memory_order_release);
+    g_x87_lib_op_mask.store(mask, std::memory_order_relaxed);
+}
+
+#ifdef __ANDROID__
+/*
+ * On Android, also poll the `debug.x1box.x87mask` system property so
+ * the bisection mask can be flipped live with `adb shell setprop` (no
+ * rebuild).
+ *
+ * Refresh cadence: was wall-clock 500ms via `clock_gettime` per call.
+ * That ate 4.47% of vCPU CPU because Halo 2 hits x87 ops millions of
+ * times/sec and each call paid a vDSO `clock_gettime` to validate the
+ * cache age. Switched 2026-05-24 to a per-thread CALL COUNTER —
+ * refresh every 0x10000 (65536) calls. At 5M x87 ops/sec that's a
+ * property re-read every ~13 ms, much faster than wall-clock 500 ms,
+ * and with ZERO syscalls in the hot path. The setprop-based runtime
+ * override still feels instantaneous to a human.
+ *
+ * setprop is the user-facing knob; the env var still works for
+ * boot-time defaults. Property wins when present (non-empty).
+ */
+static thread_local uint32_t s_prop_mask_cache = 0xFFFFFFFFu;
+static thread_local uint32_t s_prop_mask_calls_left = 0;
+static thread_local bool     s_prop_mask_seen = false;
+static constexpr uint32_t PROP_MASK_REFRESH_CALLS = 0x10000u;
+
+static uint32_t resolve_op_mask_android(uint32_t fallback)
+{
+    if (__builtin_expect(s_prop_mask_seen && s_prop_mask_calls_left > 0, 1)) {
+        s_prop_mask_calls_left--;
+        return s_prop_mask_cache;
+    }
+    s_prop_mask_calls_left = PROP_MASK_REFRESH_CALLS;
+
+    /* Use `debug.*` namespace — SELinux's default policy lets shell write
+     * arbitrary debug.* props without an explicit allowlist. (Bare
+     * `x1box.x87.mask` fails with "failed to set property".)
+     * Set live with:  adb shell setprop debug.x1box.x87mask 0xFF */
+    char buf[PROP_VALUE_MAX] = {0};
+    int n = __system_property_get("debug.x1box.x87mask", buf);
+    if (n > 0 && buf[0] != '\0') {
+        char *end = nullptr;
+        unsigned long m = std::strtoul(buf, &end, 0);
+        if (end != buf && (*end == '\0' || *end == '\n')) {
+            s_prop_mask_cache = static_cast<uint32_t>(m);
+            s_prop_mask_seen = true;
+            return s_prop_mask_cache;
+        }
+    }
+    /* Property absent or unparseable — fall back to env-derived mask. */
+    s_prop_mask_cache = fallback;
+    s_prop_mask_seen = true;
+    return fallback;
+}
+#endif
+
+bool xemu_get_x87_lib_op(unsigned op)
+{
+    if (!g_x87_lib_enabled.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    if (op >= 32) {
+        /* Out-of-range bit can't be selected by uint32 mask — treat as off
+         * so a future op enum extension past 32 entries fails closed. */
+        return false;
+    }
+    init_op_mask_from_env_once();
+    uint32_t m = g_x87_lib_op_mask.load(std::memory_order_relaxed);
+#ifdef __ANDROID__
+    m = resolve_op_mask_android(m);
+#endif
+    return ((m >> op) & 1u) != 0u;
 }
 
 void x87lib_apply_status_flags(uint16_t sw, float_status *status)
@@ -98,6 +267,14 @@ void x87lib_apply_status_flags(uint16_t sw, float_status *status)
     }
 }
 
+/*
+ * Precision-control wiring. The lib's hand-rolled do_div/do_mul on
+ * non-x86 hosts uses read_x87_cw() to decide where to round, and
+ * that function reads our thread-local override which rounding_scope
+ * sets from st->floatx80_rounding_precision. The lib now produces
+ * the correct PC-rounded result directly — no second softfloat
+ * round-pack step (which would double-round and violate IEEE 754).
+ */
 #define LIB_UNARY(LIB_OP)                                            \
     rounding_scope _scope(st);                                       \
     x87::fp80_t out;                                                 \
@@ -122,16 +299,28 @@ uint16_t x87lib_fadd(floatx80 src1, floatx80 src2, floatx80 *dst,
     LIB_BINARY(x87_fadd);
 }
 
+/*
+ * x87 lib FSUB convention compensation — same FDIVP-encoding gotcha
+ * as the FDIV pair above (see comment there). The lib defines:
+ *   x87_fsub (a, b) returns b - a   (matches FSUBP encoding)
+ *   x87_fsubr(a, b) returns a - b   (matches FSUBRP encoding)
+ * QEMU's helper_fsub_ST0_FT0 wants src1 - src2 = ST0 - FT0, which
+ * means we must call x87_fsubr (a - b) to get that. Symmetric swap
+ * for fsubr. Without this, subtractions return their NEGATION —
+ * which doesn't crash on its own (FADD+FSUB-only bisection was
+ * cosmetically OK) but produces wrong audio amplitudes + texture
+ * coordinates downstream when other ops feed it real data.
+ */
 uint16_t x87lib_fsub(floatx80 src1, floatx80 src2, floatx80 *dst,
                      float_status *st)
 {
-    LIB_BINARY(x87_fsub);
+    LIB_BINARY(x87_fsubr);
 }
 
 uint16_t x87lib_fsubr(floatx80 src1, floatx80 src2, floatx80 *dst,
                       float_status *st)
 {
-    LIB_BINARY(x87_fsubr);
+    LIB_BINARY(x87_fsub);
 }
 
 uint16_t x87lib_fmul(floatx80 src1, floatx80 src2, floatx80 *dst,
@@ -140,16 +329,42 @@ uint16_t x87lib_fmul(floatx80 src1, floatx80 src2, floatx80 *dst,
     LIB_BINARY(x87_fmul);
 }
 
+/*
+ * x87 lib FDIV convention compensation.
+ *
+ * The lib uses FDIVP-encoding semantics for its API: per x87fp80.cpp:1459
+ *   x87_fdiv (a, b) returns b / a   (matches FDIVP)
+ *   x87_fdivr(a, b) returns a / b   (matches FDIVRP)
+ *
+ * QEMU's helper_fdiv_ST0_FT0 expects mathematical convention:
+ *   x87lib_fdiv (src1, src2, dst) → *dst = src1 / src2
+ *   x87lib_fdivr(src1, src2, dst) → *dst = src2 / src1
+ *
+ * To get src1/src2 from the lib we call x87_fdivr (which returns a/b),
+ * and for src2/src1 we call x87_fdiv (which returns b/a). Without this
+ * swap, every division produced its RECIPROCAL — values were typically
+ * off by a factor of (numerator/denominator)², which propagated as
+ * out-of-range floats into integer pointer math in Bink's audio decoder.
+ * The cascading garbage corrupted the kernel Rtl heap's free-list and
+ * triggered KMODE_EXCEPTION_NOT_HANDLED (0x1E / STATUS_ACCESS_VIOLATION)
+ * at the next free, bugcheck-halting Halo 2's title screen
+ * (2026-05-24, isolated via X1BOX_X87_LIB_MASK bisection).
+ *
+ * Sibling x87fp80.cpp callers that get this right for reference:
+ *   - operator/(a,b): uses x87_fdivr to get a/b
+ *   - x87fp80trans.cpp:1801: x87_fdivr(one, pio2_fp80, …) for 1/(π/2)
+ *   - test/x87aarch64_smoke.cpp:81: explicit "Asm convention" comment
+ */
 uint16_t x87lib_fdiv(floatx80 src1, floatx80 src2, floatx80 *dst,
                      float_status *st)
 {
-    LIB_BINARY(x87_fdiv);
+    LIB_BINARY(x87_fdivr);
 }
 
 uint16_t x87lib_fdivr(floatx80 src1, floatx80 src2, floatx80 *dst,
                       float_status *st)
 {
-    LIB_BINARY(x87_fdivr);
+    LIB_BINARY(x87_fdiv);
 }
 
 uint16_t x87lib_fxam(floatx80 src)
