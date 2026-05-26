@@ -28,6 +28,7 @@
 #include "tcg/tcg-ldst.h"
 #include "tcg/cranelift_bridge.h"
 #include "tb-cache-hints.h"
+#include "tb-internal.h"  /* GETPC_ADJ for the unwind index */
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -119,6 +120,19 @@ extern void helper_cc_compute_all(void);
  * provably hot TBs where the per-iter savings outweigh chain cost.
  */
 uint32_t cranelift_bridge_g_tier2_threshold = 4;
+
+/*
+ * Tier-1 helper-tail-call -> shim routing gate.
+ *
+ * 0 = legacy behaviour: helper_lookup_tb_ptr returns tier-1 tb->tc.ptr.
+ * 1 = consult cranelift_bridge_lookup_shim and prefer the tier-2 shim
+ *     when present, so tier-1 tail-call chains hop into tier-2 code.
+ *
+ * Read from X1BOX_HELPER_ROUTE_SHIM at init. Read on the hot path via
+ * qatomic_read; the value flipping mid-run is safe (we either return
+ * tier-1 or tier-2 code, both currently runnable for the TB).
+ */
+uint32_t cranelift_bridge_g_helper_route_shim = 0;
 
 /*
  * Master switch for installing Cranelift-compiled shims into the TB
@@ -502,6 +516,41 @@ static void cranelift_bridge_lazy_init(void)
         swap_on = false;
     }
     qatomic_set(&g_swap_install_enabled, swap_on);
+
+    /*
+     * Route tier-1 tail-call chains through the shim.
+     *
+     * helper_lookup_tb_ptr historically returns tb->tc.ptr (always
+     * tier-1 code). Tier-1 generated code does `bl helper; br x0`, so
+     * the tail-call goes to tier-1 even when the TB has been tier-2
+     * compiled and has a shim installed. This caps tier-2 dispatch
+     * coverage at the 5-6% that enters via cpu_loop_exec_tb +
+     * cranelift_chain_continue (which DO consult the shim).
+     *
+     * When X1BOX_HELPER_ROUTE_SHIM=1 is set, helper_lookup_tb_ptr will
+     * also consult cranelift_bridge_lookup_shim, routing tail-call
+     * chains into the tier-2 path. Trade-off (measured 2026-05-25):
+     *
+     *   + Tier-2 guest-code execution share rises from ~5% to ~95%.
+     *     If cranelift codegen is faster per insn than TCG-aarch64,
+     *     the ~50% of vCPU running guest code gets cheaper.
+     *
+     *   - Each tail-call now exits to chain_continue via the shim's
+     *     epilogue (~30 ns extra round-trip) and adds a ~10 ns shim
+     *     hash probe per helper call. At 3M helper calls/sec that's
+     *     ~3% of vCPU added dispatch cost.
+     *
+     * Net is positive iff cranelift is meaningfully faster per insn
+     * for Halo 2. Default OFF until measured; flip via env var for
+     * A/B with the same scene.
+     */
+    const char *route_env = getenv("X1BOX_HELPER_ROUTE_SHIM");
+    bool route_on = false;
+    if (route_env && (*route_env == '1' || *route_env == 'y' ||
+                      *route_env == 'Y')) {
+        route_on = true;
+    }
+    qatomic_set(&cranelift_bridge_g_helper_route_shim, route_on ? 1u : 0u);
 
     /* Per-chain quantum tuning: reads X1BOX_CHAIN_MAX + X1BOX_CHAIN_JITTER.
      * Defined in accel/tcg/cpu-exec.c next to cranelift_chain_continue. */
@@ -954,6 +1003,15 @@ typedef struct PendingSwap {
     uint64_t    tb_pc;
     const void *code;
     size_t      size;
+    /*
+     * Per-TB synchronous-fault unwind metadata. Pointers reference
+     * Rust-owned arrays; the install path in try_swap_slow deep-copies
+     * them into the C-side unwind index and then calls
+     * cranelift_tcg_release_unwind(unwind_handle) to drop the Rust
+     * backing. The handle is zero when the Rust side didn't produce
+     * unwind data (e.g. older poll path); install handles either case.
+     */
+    CraneliftTcgUnwindMeta unwind;
 } PendingSwap;
 
 #define PENDING_SWAP_RING 64
@@ -981,17 +1039,28 @@ void cranelift_bridge_drain(void)
     uint64_t tb_pc = 0;
     const void *code = NULL;
     size_t size = 0;
-    while (cranelift_tcg_poll_result(g_cranelift_ctx,
-                                     &tb_pc, &code, &size)) {
+    CraneliftTcgUnwindMeta unwind = {0};
+    while (cranelift_tcg_poll_result_v2(g_cranelift_ctx,
+                                        &tb_pc, &code, &size,
+                                        &unwind)) {
         qemu_mutex_lock(&pending_ring_mutex);
         unsigned next = (cranelift_bridge_g_pending_head + 1) % PENDING_SWAP_RING;
         if (next == cranelift_bridge_g_pending_tail) {
-            /* Ring full - drop oldest. */
+            /* Ring full - drop oldest. Release its unwind backing so
+             * the Rust heap doesn't accumulate orphans. */
+            void *orphan = pending_ring[cranelift_bridge_g_pending_tail].unwind._handle;
+            if (orphan) {
+                cranelift_tcg_release_unwind(orphan);
+                pending_ring[cranelift_bridge_g_pending_tail].unwind._handle = NULL;
+            }
             cranelift_bridge_g_pending_tail = (cranelift_bridge_g_pending_tail + 1) % PENDING_SWAP_RING;
         }
-        pending_ring[cranelift_bridge_g_pending_head].tb_pc = tb_pc;
-        pending_ring[cranelift_bridge_g_pending_head].code  = code;
-        pending_ring[cranelift_bridge_g_pending_head].size  = size;
+        pending_ring[cranelift_bridge_g_pending_head].tb_pc  = tb_pc;
+        pending_ring[cranelift_bridge_g_pending_head].code   = code;
+        pending_ring[cranelift_bridge_g_pending_head].size   = size;
+        pending_ring[cranelift_bridge_g_pending_head].unwind = unwind;
+        /* Reset the local meta so an early-exit doesn't double-free. */
+        unwind = (CraneliftTcgUnwindMeta){0};
         cranelift_bridge_g_pending_head = next;
         qemu_mutex_unlock(&pending_ring_mutex);
 
@@ -1034,6 +1103,12 @@ const void *cranelift_bridge_take_pending(uint64_t tb_pc, size_t *out_size)
             const void *code = pending_ring[i].code;
             if (out_size) {
                 *out_size = pending_ring[i].size;
+            }
+            /* Caller doesn't want the unwind data; release the Rust
+             * backing so the heap doesn't accumulate orphans. */
+            if (pending_ring[i].unwind._handle) {
+                cranelift_tcg_release_unwind(pending_ring[i].unwind._handle);
+                pending_ring[i].unwind._handle = NULL;
             }
             /* Shift remaining entries left. */
             unsigned j = i;
@@ -1112,6 +1187,34 @@ static bool      g_shim_mutex_inited;
 #define CRANELIFT_SHIM_MAP_MASK  (CRANELIFT_SHIM_MAP_CAP - 1u)
 typedef struct CraneliftShimEntry {
     const TranslationBlock *tb;
+    /*
+     * Guest PC at the time the shim was installed.
+     *
+     * The shim map is keyed by tb-pointer. Per the (intentional)
+     * comment in the flush path, we DON'T remove individual entries
+     * on tb_phys_invalidate — open-addressing with linear probing
+     * doesn't support partial deletion without tombstones, so the
+     * whole table is only cleared on full tb_flush.
+     *
+     * But QEMU's TB allocator recycles freed TB memory. After
+     * tb_phys_invalidate frees a TB at address P, the allocator can
+     * hand out P again for a DIFFERENT guest PC. Without `pc` in the
+     * slot, lookup(new_tb) finds slot {P, old_shim} and dispatches
+     * tier-2 code compiled for the OLD guest PC — geometry corruption,
+     * subtle misexecution.
+     *
+     * 2026-05-25 reproduction: bumping tb->exec_count from
+     * chain_continue accelerated tier1_maybe_promote's
+     * tb_phys_invalidate cadence, which inflated the rate of stale-
+     * slot hits to the point of visible room-layout corruption in
+     * Halo 2 gameplay. (The bug was always latent; the rate of
+     * recycled-pointer-with-stale-shim hits was just usually low
+     * enough to fly under the radar.)
+     *
+     * Lookup now checks `slot.tb == tb && slot.pc == tb->pc` to
+     * reject stale slots; install overwrites a same-tb slot in place.
+     */
+    vaddr                   pc;
     void                   *shim;
 } CraneliftShimEntry;
 static CraneliftShimEntry g_shim_map[CRANELIFT_SHIM_MAP_CAP];
@@ -1293,6 +1396,339 @@ static void *cranelift_emit_shim(uintptr_t cranelift_fn,
 /* TB swap                                                              */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Synchronous-fault unwind index                                       */
+/* ------------------------------------------------------------------ */
+/*
+ * Per-TB metadata enabling cpu_restore_state_from_tb to unwind guest
+ * state from a host_pc inside a cranelift-compiled function. See the
+ * block comment in cranelift-bridge.h for context.
+ *
+ * The arrays are deep-copied from the Rust-owned UnwindBuf at install
+ * time so the lifecycle is C-side-only: alloc on install, free on drop
+ * (per-TB) or on tb_flush (bulk). One QemuMutex serialises writers;
+ * readers also take it briefly (bsearch + memcpy out the 3 data words),
+ * which is fine because faults are rare relative to the dispatch hot
+ * path and we want the simplest correct concurrency story.
+ */
+
+#include "tcg/insn-start-words.h"  /* INSN_START_WORDS */
+
+typedef struct CraneliftUnwindEntry {
+    uintptr_t              host_lo;   /* JIT function start (== meta.code) */
+    uintptr_t              host_hi;   /* host_lo + code_size               */
+    const TranslationBlock *tb;
+    vaddr                  tb_pc;     /* recycle defence — mirrors shim_map */
+    uint32_t               n_insns;
+    uint32_t               n_rows;
+    uint32_t              *host_end;  /* row[i].end, ascending — owned     */
+    uint32_t              *loc;       /* row[i].loc                — owned */
+    uint64_t              *insn_data; /* n_insns * INSN_START_WORDS — owned */
+} CraneliftUnwindEntry;
+
+/* Sorted by host_lo. memmove-insert / memmove-delete; reallocs in
+ * power-of-two steps. */
+static CraneliftUnwindEntry *g_unwind_vec;
+static unsigned              g_unwind_len;
+static unsigned              g_unwind_cap;
+static QemuMutex             g_unwind_mutex;
+static bool                  g_unwind_mutex_inited;
+
+/* Telemetry counters (writes under g_unwind_mutex; reads are
+ * best-effort qatomic). */
+static uint64_t g_unwind_hits;
+static uint64_t g_unwind_misses;
+static uint64_t g_unwind_stale_tb_pc;
+
+static inline void cranelift_unwind_init_once(void)
+{
+    if (!g_unwind_mutex_inited) {
+        qemu_mutex_init(&g_unwind_mutex);
+        g_unwind_mutex_inited = true;
+    }
+}
+
+/* Lower-bound bsearch by host_lo. Returns the insertion index. */
+static unsigned cranelift_unwind_lb_locked(uintptr_t host_lo)
+{
+    unsigned lo = 0, hi = g_unwind_len;
+    while (lo < hi) {
+        unsigned mid = (lo + hi) >> 1;
+        if (g_unwind_vec[mid].host_lo < host_lo) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/* Locate the entry whose [host_lo, host_hi) contains host_pc, or NULL. */
+static CraneliftUnwindEntry *
+cranelift_unwind_lookup_locked(uintptr_t host_pc)
+{
+    /*
+     * Upper-bound search on host_lo to find candidate index; the
+     * entry at idx-1 is the largest host_lo <= host_pc. Verify it
+     * also contains host_pc (host_pc < host_hi).
+     */
+    unsigned lo = 0, hi = g_unwind_len;
+    while (lo < hi) {
+        unsigned mid = (lo + hi) >> 1;
+        if (g_unwind_vec[mid].host_lo <= host_pc) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo == 0) {
+        return NULL;
+    }
+    CraneliftUnwindEntry *e = &g_unwind_vec[lo - 1];
+    if (host_pc < e->host_hi) {
+        return e;
+    }
+    return NULL;
+}
+
+static void cranelift_unwind_free_entry_inplace(CraneliftUnwindEntry *e)
+{
+    g_free(e->host_end);
+    g_free(e->loc);
+    g_free(e->insn_data);
+    e->host_end = NULL;
+    e->loc = NULL;
+    e->insn_data = NULL;
+}
+
+/*
+ * Deep-copy meta into a freshly-allocated entry and insert into the
+ * sorted vec. Caller must call cranelift_tcg_release_unwind(meta->_handle)
+ * after this returns to drop the Rust-side backing.
+ *
+ * If an entry for the same `tb` already exists (e.g. tier-2 install
+ * after a previous compile of the same TB), replace it in place.
+ */
+static void cranelift_unwind_install(const TranslationBlock *tb,
+                                     const void *host_lo,
+                                     size_t code_size,
+                                     const CraneliftTcgUnwindMeta *meta)
+{
+    cranelift_unwind_init_once();
+    if (!meta || meta->n_rows == 0) {
+        /* No srcloc data — without rows we can't resolve any host_pc.
+         * Refuse to install; caller should also refuse the tier-2 shim
+         * (we never want code-with-MMIO-faults installed without unwind). */
+        return;
+    }
+
+    size_t host_end_bytes = (size_t)meta->n_rows * sizeof(uint32_t);
+    size_t loc_bytes      = (size_t)meta->n_rows * sizeof(uint32_t);
+    size_t data_bytes     =
+        (size_t)meta->n_insns * INSN_START_WORDS * sizeof(uint64_t);
+
+    uint32_t *he = g_malloc(host_end_bytes);
+    uint32_t *lc = g_malloc(loc_bytes);
+    uint64_t *id = data_bytes ? g_malloc(data_bytes) : NULL;
+    memcpy(he, meta->host_end, host_end_bytes);
+    memcpy(lc, meta->loc,      loc_bytes);
+    if (id) {
+        memcpy(id, meta->insn_data, data_bytes);
+    }
+
+    qemu_mutex_lock(&g_unwind_mutex);
+
+    /* Replace existing entry for the same TB pointer, if any. */
+    for (unsigned i = 0; i < g_unwind_len; i++) {
+        if (g_unwind_vec[i].tb == tb) {
+            cranelift_unwind_free_entry_inplace(&g_unwind_vec[i]);
+            g_unwind_vec[i].host_lo   = (uintptr_t)host_lo;
+            g_unwind_vec[i].host_hi   = (uintptr_t)host_lo + code_size;
+            g_unwind_vec[i].tb_pc     = tb->pc;
+            g_unwind_vec[i].n_insns   = meta->n_insns;
+            g_unwind_vec[i].n_rows    = meta->n_rows;
+            g_unwind_vec[i].host_end  = he;
+            g_unwind_vec[i].loc       = lc;
+            g_unwind_vec[i].insn_data = id;
+            /* host_lo could have changed -- re-sort by host_lo. Cheap
+             * because the existing vec is already sorted; we just need
+             * to bubble this one entry to its correct place. */
+            while (i > 0 &&
+                   g_unwind_vec[i - 1].host_lo > g_unwind_vec[i].host_lo) {
+                CraneliftUnwindEntry tmp = g_unwind_vec[i - 1];
+                g_unwind_vec[i - 1] = g_unwind_vec[i];
+                g_unwind_vec[i] = tmp;
+                i--;
+            }
+            while (i + 1 < g_unwind_len &&
+                   g_unwind_vec[i + 1].host_lo < g_unwind_vec[i].host_lo) {
+                CraneliftUnwindEntry tmp = g_unwind_vec[i + 1];
+                g_unwind_vec[i + 1] = g_unwind_vec[i];
+                g_unwind_vec[i] = tmp;
+                i++;
+            }
+            qemu_mutex_unlock(&g_unwind_mutex);
+            return;
+        }
+    }
+
+    /* Grow vec if needed (power-of-two). */
+    if (g_unwind_len + 1 > g_unwind_cap) {
+        unsigned new_cap = g_unwind_cap ? g_unwind_cap * 2 : 1024;
+        g_unwind_vec = g_realloc(g_unwind_vec,
+                                 new_cap * sizeof(*g_unwind_vec));
+        g_unwind_cap = new_cap;
+    }
+
+    unsigned idx = cranelift_unwind_lb_locked((uintptr_t)host_lo);
+    if (idx < g_unwind_len) {
+        memmove(&g_unwind_vec[idx + 1], &g_unwind_vec[idx],
+                (g_unwind_len - idx) * sizeof(*g_unwind_vec));
+    }
+    g_unwind_vec[idx].host_lo   = (uintptr_t)host_lo;
+    g_unwind_vec[idx].host_hi   = (uintptr_t)host_lo + code_size;
+    g_unwind_vec[idx].tb        = tb;
+    g_unwind_vec[idx].tb_pc     = tb->pc;
+    g_unwind_vec[idx].n_insns   = meta->n_insns;
+    g_unwind_vec[idx].n_rows    = meta->n_rows;
+    g_unwind_vec[idx].host_end  = he;
+    g_unwind_vec[idx].loc       = lc;
+    g_unwind_vec[idx].insn_data = id;
+    g_unwind_len++;
+    qemu_mutex_unlock(&g_unwind_mutex);
+}
+
+void cranelift_unwind_drop(const TranslationBlock *tb)
+{
+    if (!g_unwind_mutex_inited) {
+        return;
+    }
+    qemu_mutex_lock(&g_unwind_mutex);
+    for (unsigned i = 0; i < g_unwind_len; i++) {
+        if (g_unwind_vec[i].tb == tb) {
+            cranelift_unwind_free_entry_inplace(&g_unwind_vec[i]);
+            if (i + 1 < g_unwind_len) {
+                memmove(&g_unwind_vec[i], &g_unwind_vec[i + 1],
+                        (g_unwind_len - i - 1) * sizeof(*g_unwind_vec));
+            }
+            g_unwind_len--;
+            break;
+        }
+    }
+    qemu_mutex_unlock(&g_unwind_mutex);
+}
+
+TranslationBlock *cranelift_unwind_tb_lookup(uintptr_t host_pc)
+{
+    if (!g_unwind_mutex_inited) {
+        return NULL;
+    }
+    qemu_mutex_lock(&g_unwind_mutex);
+    CraneliftUnwindEntry *e = cranelift_unwind_lookup_locked(host_pc);
+    TranslationBlock *tb = e ? (TranslationBlock *)e->tb : NULL;
+    qemu_mutex_unlock(&g_unwind_mutex);
+    return tb;
+}
+
+bool cranelift_unwind_data_from_tb(const TranslationBlock *tb,
+                                   uintptr_t host_pc,
+                                   uint64_t *data,
+                                   int *out_insns_left)
+{
+    if (!g_unwind_mutex_inited || !tb || !data || !out_insns_left) {
+        return false;
+    }
+
+    /*
+     * Match the GETPC_ADJ semantic from cpu_unwind_data_from_tb:
+     * host_pc is the return address from a call; subtract so the
+     * search lands on the CALL site rather than the next insn.
+     */
+    host_pc -= GETPC_ADJ;
+
+    qemu_mutex_lock(&g_unwind_mutex);
+    CraneliftUnwindEntry *e = cranelift_unwind_lookup_locked(host_pc);
+    if (!e) {
+        qatomic_inc(&g_unwind_misses);
+        qemu_mutex_unlock(&g_unwind_mutex);
+        return false;
+    }
+    /* TB-pointer recycle defence: the QEMU TB allocator can hand the
+     * same address out to two different guest TBs. Verify identity. */
+    if (e->tb != tb || e->tb_pc != tb->pc) {
+        qatomic_inc(&g_unwind_stale_tb_pc);
+        qemu_mutex_unlock(&g_unwind_mutex);
+        return false;
+    }
+
+    uint32_t off = (uint32_t)(host_pc - e->host_lo);
+
+    /* Smallest i with host_end[i] > off. */
+    unsigned lo = 0, hi = e->n_rows;
+    while (lo < hi) {
+        unsigned mid = (lo + hi) >> 1;
+        if (e->host_end[mid] > off) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    if (lo >= e->n_rows) {
+        /* host_pc is one-past-end of the last row; clamp to last. */
+        lo = e->n_rows - 1;
+    }
+    uint32_t guest_idx = e->loc[lo];
+    if (guest_idx >= e->n_insns) {
+        qatomic_inc(&g_unwind_misses);
+        qemu_mutex_unlock(&g_unwind_mutex);
+        return false;
+    }
+
+    /* Mirror cpu_unwind_data_from_tb's seed: zero, then for non-PCREL
+     * TBs seed data[0] with tb->pc. Cranelift's recorded insn_start
+     * cargs already encode absolute (or PCREL page-offset) values, so
+     * the seed is functionally redundant for our flat-table format —
+     * but kept for bit-for-bit parity with the tier-1 unwind output
+     * that x86_restore_state_to_opc has been validated against. */
+    memset(data, 0, sizeof(uint64_t) * INSN_START_WORDS);
+    if (!(tb_cflags(tb) & CF_PCREL)) {
+        data[0] = tb->pc;
+    }
+    for (unsigned j = 0; j < INSN_START_WORDS; j++) {
+        data[j] = e->insn_data[(size_t)guest_idx * INSN_START_WORDS + j];
+    }
+    *out_insns_left = (int)(e->n_insns - guest_idx);
+
+    qatomic_inc(&g_unwind_hits);
+    qemu_mutex_unlock(&g_unwind_mutex);
+    return true;
+}
+
+void cranelift_unwind_get_stats(uint64_t *hits, uint64_t *misses,
+                                uint64_t *stale_tb_pc, uint32_t *entries)
+{
+    if (hits) *hits = qatomic_read(&g_unwind_hits);
+    if (misses) *misses = qatomic_read(&g_unwind_misses);
+    if (stale_tb_pc) *stale_tb_pc = qatomic_read(&g_unwind_stale_tb_pc);
+    if (entries) *entries = qatomic_read(&g_unwind_len);
+}
+
+/* Bulk wipe — called from cranelift_bridge_on_tb_flush. */
+static void cranelift_unwind_clear_all(void)
+{
+    if (!g_unwind_mutex_inited) {
+        return;
+    }
+    qemu_mutex_lock(&g_unwind_mutex);
+    for (unsigned i = 0; i < g_unwind_len; i++) {
+        cranelift_unwind_free_entry_inplace(&g_unwind_vec[i]);
+    }
+    g_unwind_len = 0;
+    qemu_mutex_unlock(&g_unwind_mutex);
+}
+
+/* ------------------------------------------------------------------ */
+
 /*
  * Hot-path hook: invoked just before cpu_loop_exec_tb dispatches `tb`.
  *
@@ -1340,6 +1776,7 @@ void cranelift_bridge_try_swap_slow(TranslationBlock *tb)
 
     const void *new_code = NULL;
     size_t      new_size = 0;
+    CraneliftTcgUnwindMeta new_unwind = {0};
     /* Pending entries are keyed by (uintptr_t)tb (the value we passed
      * to cranelift_tcg_enqueue in maybe_compile). Match by that, not
      * tb->pc -- CF_PCREL TBs all have pc=0. */
@@ -1351,6 +1788,7 @@ void cranelift_bridge_try_swap_slow(TranslationBlock *tb)
         if (pending_ring[i].tb_pc == want_key) {
             new_code = pending_ring[i].code;
             new_size = pending_ring[i].size;
+            new_unwind = pending_ring[i].unwind;
             /* Shift remaining entries left (same as take_pending). */
             unsigned j = i;
             while (j != cranelift_bridge_g_pending_head) {
@@ -1374,6 +1812,25 @@ void cranelift_bridge_try_swap_slow(TranslationBlock *tb)
     qatomic_and(&tb->cranelift_pending, (uint8_t)~CRANELIFT_PEND_SWAP);
 
     if (!new_code) {
+        /* No-op path: still release any unwind handle that came along
+         * for the ride (shouldn't happen, but be defensive). */
+        if (new_unwind._handle) {
+            cranelift_tcg_release_unwind(new_unwind._handle);
+        }
+        return;
+    }
+
+    /*
+     * Refuse to install a tier-2 shim without matching unwind data.
+     * Otherwise an MMIO / watchpoint fault inside the JIT code would
+     * crash via cpu_io_recompile -> tcg_tb_lookup -> cpu_abort -- which
+     * is the precise bug Plan A exists to eliminate. Keep the TB on
+     * tier-1; the next compile attempt will retry.
+     */
+    if (new_unwind.n_rows == 0 || !new_unwind.host_end) {
+        if (new_unwind._handle) {
+            cranelift_tcg_release_unwind(new_unwind._handle);
+        }
         return;
     }
 
@@ -1390,8 +1847,21 @@ void cranelift_bridge_try_swap_slow(TranslationBlock *tb)
     static uint64_t s_install_count;
     void *shim = cranelift_emit_shim((uintptr_t)new_code, ret_addr);
     if (!shim) {
+        cranelift_tcg_release_unwind(new_unwind._handle);
         return;
     }
+
+    /*
+     * Install the unwind entry BEFORE the shim-map publication. The
+     * shim map is what makes the tier-2 dispatch observable to other
+     * vCPU threads; any fault landing in new_code (via a helper called
+     * from cranelift code) must find the unwind entry, so it has to
+     * be in place first. cranelift_unwind_install deep-copies the
+     * arrays — we can release the Rust handle immediately afterwards.
+     */
+    cranelift_unwind_install(tb, new_code, new_size, &new_unwind);
+    cranelift_tcg_release_unwind(new_unwind._handle);
+    new_unwind._handle = NULL;
 
     uint64_t ic = qatomic_fetch_inc(&s_install_count) + 1;
     CL_LOG("install#%" PRIu64 " tb=%p pc=0x%" PRIx64 " cs_base=0x%" PRIx64
@@ -1421,18 +1891,30 @@ void cranelift_bridge_try_swap_slow(TranslationBlock *tb)
         unsigned idx = cranelift_shim_hash(tb);
         for (unsigned i = 0; i < CRANELIFT_SHIM_MAP_CAP; i++) {
             unsigned slot = (idx + i) & CRANELIFT_SHIM_MAP_MASK;
-            if (g_shim_map[slot].tb == NULL) {
-                g_shim_map[slot].shim = shim;
+            const TranslationBlock *cur = g_shim_map[slot].tb;
+            if (cur == NULL || cur == tb) {
                 /*
-                 * Publish tb LAST so readers see a fully-formed slot.
-                 * cranelift_bridge_lookup_shim does qatomic_read on tb
-                 * and stops at the first NULL it sees.
+                 * Empty slot OR same tb-pointer with a stale entry
+                 * (TB pool recycled this address since the last
+                 * install — the old shim is dead). Either way we
+                 * write the new entry here. Overwriting the stale
+                 * shim doesn't leak: the arena is reset on tb_flush
+                 * and individual shim bytes were never going to be
+                 * freed anyway.
+                 *
+                 * Order: shim + pc FIRST, then tb LAST (qatomic_set
+                 * as a publication boundary so lockless readers see
+                 * a fully-formed slot).
                  */
+                g_shim_map[slot].shim = shim;
+                g_shim_map[slot].pc   = tb->pc;
                 qatomic_set(&g_shim_map[slot].tb, tb);
-                qatomic_set(&g_shim_map_count, g_shim_map_count + 1);
+                if (cur == NULL) {
+                    qatomic_set(&g_shim_map_count, g_shim_map_count + 1);
+                }
                 break;
             }
-            /* Collision; keep probing. */
+            /* Collision with a different tb; keep probing. */
         }
     } else {
         CL_LOG("shim map at half-full (%u entries); refusing install#%" PRIu64,
@@ -1650,6 +2132,12 @@ const void *cranelift_bridge_lookup_shim(const TranslationBlock *tb)
     /*
      * Hot path: O(1) average. We never remove entries, so probing
      * stops cleanly at the first NULL slot.
+     *
+     * Slot validity requires BOTH slot.tb == tb AND slot.pc == tb->pc.
+     * The pc match catches recycled-TB-pointer cases where the slot
+     * holds a stale shim from a TB at the same memory address that
+     * has since been tb_phys_invalidated and recycled to a different
+     * guest PC. See CraneliftShimEntry's comment.
      */
     if (qatomic_read(&g_shim_map_count) == 0) {
         return NULL;
@@ -1663,9 +2151,19 @@ const void *cranelift_bridge_lookup_shim(const TranslationBlock *tb)
             return NULL;          /* miss */
         }
         if (slot_tb == tb) {
-            return g_shim_map[slot].shim;
+            /* Same tb pointer — verify it's the SAME TB by PC. */
+            if (g_shim_map[slot].pc == tb->pc) {
+                return g_shim_map[slot].shim;
+            }
+            /*
+             * Stale slot (tb pointer recycled by the TB allocator
+             * for a different guest PC). Treat as miss; the install
+             * path will overwrite this slot in place next time the
+             * NEW tb gets a fresh shim.
+             */
+            return NULL;
         }
-        /* Collision; keep probing. */
+        /* Collision with different tb pointer; keep probing. */
     }
     return NULL;
 }
@@ -1770,6 +2268,20 @@ void cranelift_bridge_log_stats(void)
               (g_ir_cache_take_misses * 10000 /
                (g_ir_cache_take_hits + g_ir_cache_take_misses)) % 100 : 0);
 
+    /* Synchronous-fault unwind index: hits = MMIO/watchpoint/SMC fault
+     * inside cranelift code that resolved cleanly via the index;
+     * misses = a known cranelift host_pc with no matching entry (should
+     * stay 0 in steady state; nonzero indicates either an install/drop
+     * race or a TB pointer recycle escaping the tb_pc verify); entries
+     * is the live index size. */
+    uint64_t unw_hits = 0, unw_misses = 0, unw_stale = 0;
+    uint32_t unw_entries = 0;
+    cranelift_unwind_get_stats(&unw_hits, &unw_misses, &unw_stale,
+                               &unw_entries);
+    CL_LOG("unwind index: hits=%" PRIu64 " misses=%" PRIu64
+           " stale_tb_pc=%" PRIu64 " entries=%u",
+           unw_hits, unw_misses, unw_stale, unw_entries);
+
 #ifdef XBOX
     /* Per-thread BQL wait/hold contention dump (tag "x1-bql"). */
     bql_stats_dump();
@@ -1803,13 +2315,27 @@ void cranelift_bridge_on_tb_flush(void)
     }
 
     /* Drain the pending-swap ring. Code pointers in there reference
-     * Cranelift entries whose TBs have just evaporated. */
+     * Cranelift entries whose TBs have just evaporated. Release any
+     * pending unwind buffers so the Rust heap doesn't accumulate
+     * orphans across a flush. */
     if (pending_ring_mutex_inited) {
         qemu_mutex_lock(&pending_ring_mutex);
+        for (unsigned i = cranelift_bridge_g_pending_tail;
+             i != cranelift_bridge_g_pending_head;
+             i = (i + 1) % PENDING_SWAP_RING) {
+            if (pending_ring[i].unwind._handle) {
+                cranelift_tcg_release_unwind(pending_ring[i].unwind._handle);
+                pending_ring[i].unwind._handle = NULL;
+            }
+        }
         cranelift_bridge_g_pending_head = 0;
         cranelift_bridge_g_pending_tail = 0;
         qemu_mutex_unlock(&pending_ring_mutex);
     }
+
+    /* Wipe the synchronous-fault unwind index. Backing arrays are
+     * g_free'd so the C heap doesn't accumulate across flush events. */
+    cranelift_unwind_clear_all();
 
     /* Zero the shim map. Open-addressing with linear probing means
      * partial deletion would truncate probe chains; tb_flush wipes

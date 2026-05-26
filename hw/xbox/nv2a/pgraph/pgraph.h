@@ -184,6 +184,29 @@ typedef struct PGRAPHState {
     uint32_t pipeline_state_gen;
     uint32_t any_reg_gen;
     uint32_t non_dynamic_reg_gen;
+    /*
+     * Bumped only when a register that actually feeds a uniform value
+     * (via set_vsh_uniform_values / set_psh_uniform_values) changes, OR
+     * when an inline vertex-attribute value used as a uniform changes
+     * (the SET_VERTEX_xF, SET_TEXCOORD_xF, SET_DIFFUSE_COLOR_xF, etc.
+     * DEF_METHODs).
+     *
+     * Narrower than any_reg_gen (which bumps on every reg write, incl.
+     * texture binding state that doesn't feed uniforms). The Vulkan
+     * uniform fast-skip at pgraph/vk/shaders.c gates on this counter so
+     * texture state changes don't force ~15 KB of redundant UBO memcpy
+     * per draw. Tagged via REG_CAT_UNIFORM_INPUT in
+     * pgraph_init_reg_category_table().
+     */
+    uint32_t uniform_inputs_gen;
+
+    /* Phase 1.3: Bump on any state that could move where
+     * update_surface_part needs to look (surface clip/format/pitch/
+     * offset/dma; plus every site that sets surface_color.buffer_dirty
+     * or surface_zeta.buffer_dirty). The Vulkan surface-part cache
+     * keys on this so it can short-circuit the dirty-bitmap walk
+     * when nothing relevant has moved. */
+    uint32_t surface_binding_inputs_gen;
 
     bool texture_matrix_enable[NV2A_MAX_TEXTURES];
 
@@ -334,9 +357,19 @@ extern NV2AState *g_nv2a;
 
 // FIXME: Add new function pgraph_is_texture_sampler_active()
 
-#define REG_CAT_SHADER   (1 << 0)
-#define REG_CAT_PIPELINE (1 << 1)
-#define REG_CAT_TEXTURE  (1 << 2)
+#define REG_CAT_SHADER         (1 << 0)
+#define REG_CAT_PIPELINE       (1 << 1)
+#define REG_CAT_TEXTURE        (1 << 2)
+/*
+ * Set on regs whose value (or any bits thereof) is read by
+ * pgraph_glsl_set_vsh_uniform_values / pgraph_glsl_set_psh_uniform_values
+ * and uploaded into the per-draw UBO. Independent of dynamic_mask:
+ * even if a reg's bit lives in dynamic_mask (so shader_state_gen
+ * doesn't bump), a write to that bit still needs to invalidate the
+ * uniform-skip cache because the UBO bytes change. See
+ * pgraph_init_reg_category_table().
+ */
+#define REG_CAT_UNIFORM_INPUT  (1 << 3)
 extern uint8_t pgraph_reg_category_table[];
 extern uint32_t pgraph_reg_dynamic_mask_table[];
 void pgraph_init_reg_dynamic_masks(bool eds1, bool eds3);
@@ -362,6 +395,7 @@ static inline void pgraph_reg_w(PGRAPHState *pg, unsigned int r, uint32_t v)
             if (non_dyn_changed) pg->pipeline_state_gen++;
         }
         if (cat & REG_CAT_TEXTURE)  pg->texture_state_gen++;
+        if (cat & REG_CAT_UNIFORM_INPUT) pg->uniform_inputs_gen++;
         bool tex_only = cat && !(cat & ~REG_CAT_TEXTURE);
         if (non_dyn_changed && !tex_only)
             pg->non_dynamic_reg_gen++;
@@ -399,6 +433,8 @@ static inline void pgraph_reg_w_atomic(PGRAPHState *pg, unsigned int r,
         }
         if (cat & REG_CAT_TEXTURE)
             __atomic_fetch_add(&pg->texture_state_gen, 1, __ATOMIC_RELAXED);
+        if (cat & REG_CAT_UNIFORM_INPUT)
+            __atomic_fetch_add(&pg->uniform_inputs_gen, 1, __ATOMIC_RELAXED);
         bool tex_only = cat && !(cat & ~REG_CAT_TEXTURE);
         if (non_dyn_changed && !tex_only)
             __atomic_fetch_add(&pg->non_dynamic_reg_gen, 1,

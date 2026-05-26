@@ -326,25 +326,72 @@ bool xemu_settings_load(void)
      * lands. Set X1BOX_HLE=0 to disable, or per-family
      * X1BOX_HLE_YIELD=0 / _KF=0. */
     setenv("X1BOX_HLE", "1", 0);
-    /* SSE scalar inline emit: default OFF.
+    /* SSE scalar inline emit: default OFF — drift is architectural.
      *
-     * Was default-ON for ~1.55% TCG savings on Halo 2 hardware-FPU
-     * builds — but the inline path emits tcg_gen_mul_f32/f64 which
-     * lower to NEON FMUL/FADD on aarch64. NEON's FPCR rounding +
-     * denormal handling doesn't exactly match Intel SSE MXCSR
-     * semantics, and the ~1-ULP/op drift accumulates into Halo 2's
-     * physics integrator: persistent momentum on walk-stop, sliding
-     * static characters, can't step up on minor surfaces. Bisected
-     * 2026-05-24 against the x87 lib op mask (all lib ops on with
-     * SSE_INLINE off ⇒ physics correct; all lib ops on with
-     * SSE_INLINE on ⇒ drift independent of which lib bits are set).
+     * Default-ON was attempted twice and reverted both times:
      *
-     * Set X1BOX_SSE_INLINE=1 to opt in for the perf win on builds /
-     * games that don't depend on bit-exact SSE rounding. Per-op gates
-     * X1BOX_SSE_INLINE_{ADD,SUB,MUL,DIV,SQRT,COMI}=1 are still
-     * available for fine-grained bisection. See
-     * project_sse_scalar_inline_gated.md. */
+     *   2026-05-24: enabled with no FPCR work. NEON FPCR default
+     *     (FZ=1, flush-to-zero) didn't match SSE MXCSR (FZ=0).
+     *     Reverted.
+     *
+     *   2026-05-25: enabled paired with (a) vCPU-thread FPCR.FZ=0
+     *     / FZ16=0 / DN=0 at startup (mttcg_cpu_thread_fn), and
+     *     (b) full guest MXCSR → host FPCR routing on every
+     *     LDMXCSR (update_mxcsr_status → update_host_fpcr_from_mxcsr).
+     *     With BOTH in place — denormals preserved, rounding mode
+     *     mirrored — Halo 2 NPCs STILL slid. The drift is below the
+     *     FPCR-configurable surface: NEON FMUL.S / FADD.S do not
+     *     produce bit-identical results to x86 MULSS / ADDSS in
+     *     every input pattern even when the FPCR semantic bits
+     *     match. Best current theory is mixed-precision via the
+     *     SS-inline + PS-via-helper + x87-lib triplet (each correct
+     *     in isolation, the combination accumulates ULP-level drift
+     *     that Halo 2's physics integrator amplifies). Confirming
+     *     and structurally fixing that is offline work.
+     *
+     * The FPCR plumbing (startup write + MXCSR routing) is kept —
+     * it's correct and free when SSE_INLINE=0 (helpers ignore host
+     * FPCR), and it's required if SSE_INLINE is ever re-enabled
+     * per-op via X1BOX_SSE_INLINE_{ADD,SUB,MUL,DIV,SQRT,COMI}=1
+     * for bisection. See project_sse_neon_physics_drift.md for the
+     * full bisection record.
+     */
     setenv("X1BOX_SSE_INLINE", "0", 0);
+
+    /* Tier-1 helper-tail-call → tier-2 shim routing. Default OFF.
+     *
+     * 0 = helper returns tb->tc.ptr (tier-1 code) on tail-call;
+     *     tier-2 dispatch only happens via cpu_loop_exec_tb +
+     *     cranelift_chain_continue.
+     * 1 = helper consults cranelift_bridge_lookup_shim and tail-calls
+     *     into tier-2 code when the next TB has a shim installed.
+     *
+     * 2026-05-25 A/B measured on Halo 2 gameplay (Zenfone X3):
+     *   OFF: 15.53 FPS user-visible, 14.99 median, 13.45 5%-low
+     *   ON : 15.53 FPS user-visible, 14.95 median, 11.92 5%-low (worse jitter)
+     *   ON  route_hit% peaked at 9% AFTER the chain-side install
+     *       fix landed. Even at 9% hit, ~91% of 2.8M helper calls/sec
+     *       pay the ~10ns shim-probe cost without finding a shim;
+     *       net is a slight 5%-low regression with no upside.
+     *
+     * The blocker for "ON" to pay off is the population of TBs that
+     * never reach cpu_loop_exec_tb's outer dispatch (they only run
+     * via chain or tier-1 tail-call). Those TBs never go through
+     * cranelift_bridge_maybe_compile and stay tier-1 forever.
+     * Calling maybe_compile from chain_continue was tried 2026-05-25
+     * and tripped a tier-2 codegen bug that crashed Halo 2's Bink
+     * intro a few seconds in — the previously-cold TBs hit codegen
+     * paths the 1.28% bail rate analysis never covered.
+     *
+     * Re-enable only with both:
+     *   1. chain_continue calling maybe_compile (so more TBs get
+     *      compiled and have shims for the helper to find), AND
+     *   2. the chain-side compile codegen bug found + fixed (the
+     *      specific TB that crashes Bink needs to be bisected).
+     *
+     * See project_cranelift_helper_shim_routing.md (TBD).
+     */
+    setenv("X1BOX_HELPER_ROUTE_SHIM", "0", 0);
     /* x87 lib per-instruction bisection mask. Production default 0x4FF
      * = bits 0-7 lib (arith/log/sqrt class) + bit 10 FSCALE lib;
      * bits 8/9/11/12 (FSINCOS/FRNDINT/FSIN/FCOS) fall through to QEMU

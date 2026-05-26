@@ -956,6 +956,10 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
  * In !user-mode, if @rm_from_page_list is set, call with the TB's pages'
  * locks held.
  */
+#if XEMU_HAVE_CRANELIFT
+extern uint64_t xemu_jit_tb_phys_inval_count;
+#endif
+
 static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
 {
     uint32_t h;
@@ -964,6 +968,10 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
     void *existing = NULL;
 
     assert_memory_lock();
+
+#if XEMU_HAVE_CRANELIFT
+    qatomic_inc(&xemu_jit_tb_phys_inval_count);
+#endif
 
     /* make sure no further incoming jumps will be chained to this TB */
     qemu_spin_lock(&tb->jmp_lock);
@@ -1012,6 +1020,32 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
         tb->superblock = NULL;
     }
 #endif
+
+    /*
+     * Intentionally do NOT drop the cranelift unwind index entry here.
+     *
+     * The shim arena and cranelift code arena are both leaked-on-purpose
+     * across per-TB invalidate — only tb_flush wipes them. The unwind
+     * index MUST follow the same rule, because a vCPU thread can have
+     * already snapshotted the tier-2 shim pointer for this TB (during
+     * cranelift_bridge_try_swap or chain_continue) and be about to
+     * dispatch into the now-orphaned cranelift code. If we drop the
+     * unwind entry here, a subsequent MMIO inside that orphaned shim
+     * lands in cpu_io_recompile -> tcg_tb_lookup (NULL) ->
+     * cranelift_unwind_tb_lookup (NULL now) -> cpu_abort. That's signal
+     * 6 from helper_ldul_mmu, observed in the stable-scene crash at
+     * 2026-05-25 19:52:07.
+     *
+     * Entries leak until tb_flush -> cranelift_unwind_clear_all wipes
+     * them all atomically with the shim map and Rust LRU. TB-pointer
+     * recycle is handled by the e->tb_pc==tb->pc check in
+     * cranelift_unwind_data_from_tb (stale entries return false; a
+     * fresh install for the recycled tb pointer replaces in-place via
+     * cranelift_unwind_install's same-tb-pointer fast path).
+     *
+     * The cranelift_unwind_drop function is retained in case a future
+     * change needs it for a different lifecycle event.
+     */
 }
 
 static void tb_phys_invalidate__locked(TranslationBlock *tb)
@@ -1129,6 +1163,11 @@ bool tb_invalidate_phys_page_unwind(CPUState *cpu, tb_page_addr_t addr,
 
     assert_memory_lock();
     current_tb = tcg_tb_lookup(pc);
+    if (!current_tb) {
+        /* Tier-2 fallback: pc may live in the cranelift JIT arena
+         * (e.g. a tier-2 helper detected an SMC fault). */
+        current_tb = cranelift_unwind_tb_lookup(pc);
+    }
 
     last = addr | ~TARGET_PAGE_MASK;
     addr &= TARGET_PAGE_MASK;
@@ -1181,6 +1220,11 @@ tb_invalidate_phys_page_range__locked(CPUState *cpu,
 
     if (retaddr && cpu && cpu->cc->tcg_ops->precise_smc) {
         current_tb = tcg_tb_lookup(retaddr);
+        if (!current_tb) {
+            /* Tier-2 fallback: retaddr may live in the cranelift JIT
+             * arena rather than the canonical tier-1 code-gen buffer. */
+            current_tb = cranelift_unwind_tb_lookup(retaddr);
+        }
     }
 
     /*

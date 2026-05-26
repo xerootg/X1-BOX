@@ -36,6 +36,23 @@ extern void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
                                        unsigned *chain_max, uint32_t *jitter);
 extern void cranelift_get_helper_lookup_tb_lru_stats(uint64_t *hits,
                                                       uint64_t *misses);
+extern void cranelift_get_helper_phys_pc_hint_stats(uint64_t *hits,
+                                                     uint64_t *misses);
+extern void cranelift_get_tb_jc_stats(uint64_t *hits, uint64_t *misses);
+extern void cranelift_get_tb_pool_stats(uint64_t *gen, uint64_t *inval,
+                                         uint64_t *flush);
+extern void cranelift_get_vcpu_fpcr_observed(uint64_t *fpcr);
+extern void cranelift_get_helper_dispatch_shim_stats(uint64_t *hits,
+                                                      uint64_t *misses);
+extern uint32_t cranelift_bridge_g_helper_route_shim;
+extern void pfifo_get_ring_stats(uint64_t *samples, uint64_t *depth_sum,
+                                  uint32_t *depth_max, uint64_t *empty,
+                                  uint64_t *full, uint64_t *pusher_calls,
+                                  uint64_t *words, uint32_t *dma_len,
+                                  uint64_t *wait_spin, uint64_t *wait_idle,
+                                  uint64_t *wait_ns);
+extern void xbox_hle_get_idle_stats(uint64_t *idle_iters, uint64_t *yields,
+                                     uint64_t *yield_ns_total);
 #endif
 
 NV2AStats g_nv2a_stats;
@@ -77,6 +94,7 @@ void nv2a_profile_increment(void)
     static unsigned baseline_idx;
     static uint64_t last_chain_runs, last_chain_iters, last_irq_exits;
     static uint64_t last_lru_hits, last_lru_misses;
+    static uint64_t last_phint_hits, last_phint_misses;
     static int64_t last_long_log_us;
 
     int64_t interval = last_flip_us ? (now - last_flip_us) : 0;
@@ -102,18 +120,400 @@ void nv2a_profile_increment(void)
                                   &irq_exits, NULL, NULL, NULL);
         uint64_t lru_hits = 0, lru_misses = 0;
         cranelift_get_helper_lookup_tb_lru_stats(&lru_hits, &lru_misses);
+        uint64_t phint_hits = 0, phint_misses = 0;
+        cranelift_get_helper_phys_pc_hint_stats(&phint_hits, &phint_misses);
 
         uint64_t d_runs   = chain_runs   - last_chain_runs;
         uint64_t d_iters  = chain_iters  - last_chain_iters;
         uint64_t d_irq    = irq_exits    - last_irq_exits;
         uint64_t d_lhit   = lru_hits     - last_lru_hits;
         uint64_t d_lmiss  = lru_misses   - last_lru_misses;
+        uint64_t d_phit   = phint_hits   - last_phint_hits;
+        uint64_t d_pmiss  = phint_misses - last_phint_misses;
 
-        last_chain_runs  = chain_runs;
-        last_chain_iters = chain_iters;
-        last_irq_exits   = irq_exits;
-        last_lru_hits    = lru_hits;
-        last_lru_misses  = lru_misses;
+        last_chain_runs   = chain_runs;
+        last_chain_iters  = chain_iters;
+        last_irq_exits    = irq_exits;
+        last_lru_hits     = lru_hits;
+        last_lru_misses   = lru_misses;
+        last_phint_hits   = phint_hits;
+        last_phint_misses = phint_misses;
+
+        /*
+         * Periodic JIT stats: emit a structured `xemu-jit:` line every
+         * ~2 seconds regardless of spikes. The long_frame line above
+         * only fires on outliers; for steady-state diagnosis (TB churn,
+         * jmp_cache hit rate, helper LRU + phint hit rate, chain depth)
+         * we need a regular pulse so the MCP `jit_stats` tool always has
+         * a fresh sample to read. 2 s smooths Halo 2's 15-20 Hz flip
+         * cadence (~30-40 flips per sample) without burying logcat.
+         *
+         * d_jchit / d_jcmiss come from the per-CPU tb_jmp_cache; gen /
+         * inval / flush come from the global TB-pool counters. Same
+         * delta basis as the spike log so we can compare apples-to-
+         * apples.
+         */
+        static int64_t last_jit_log_us;
+        static uint64_t last_jc_hits, last_jc_misses;
+        static uint64_t last_tb_gen, last_tb_inval, last_tb_flush;
+        if (now - last_jit_log_us >= 2000000) {
+            uint64_t jc_hits = 0, jc_misses = 0;
+            cranelift_get_tb_jc_stats(&jc_hits, &jc_misses);
+            uint64_t tb_gen = 0, tb_inval = 0, tb_flush = 0;
+            cranelift_get_tb_pool_stats(&tb_gen, &tb_inval, &tb_flush);
+
+            int64_t window_us = last_jit_log_us ? (now - last_jit_log_us) : 1;
+            uint64_t d_jchit  = jc_hits   - last_jc_hits;
+            uint64_t d_jcmiss = jc_misses - last_jc_misses;
+            uint64_t d_gen    = tb_gen    - last_tb_gen;
+            uint64_t d_inval  = tb_inval  - last_tb_inval;
+            uint64_t d_flush  = tb_flush  - last_tb_flush;
+
+            /* Re-read chain/lru/phint snapshots so they're delta'd over
+             * the SAME 2-second window. The long_frame path above bumps
+             * its "last_*" trackers on every flip, so we keep a
+             * separate cadence here. */
+            uint64_t cr = 0, ci = 0, ie = 0;
+            cranelift_chain_get_stats(&cr, &ci, NULL, &ie, NULL, NULL, NULL);
+            uint64_t lh = 0, lm = 0;
+            cranelift_get_helper_lookup_tb_lru_stats(&lh, &lm);
+            uint64_t ph = 0, pm = 0;
+            cranelift_get_helper_phys_pc_hint_stats(&ph, &pm);
+
+            static uint64_t last_cr, last_ci, last_ie;
+            static uint64_t last_lh, last_lm, last_ph, last_pm;
+            uint64_t d_cr = cr - last_cr, d_ci = ci - last_ci;
+            uint64_t d_lh = lh - last_lh, d_lm = lm - last_lm;
+            uint64_t d_ph = ph - last_ph, d_pm = pm - last_pm;
+
+            uint64_t lru_total   = d_lh + d_lm;
+            uint64_t phint_total = d_ph + d_pm;
+            uint64_t jc_total    = d_jchit + d_jcmiss;
+            unsigned lru_hit_pct   = lru_total   ? (unsigned)(d_lh * 100 / lru_total)   : 0;
+            unsigned phint_hit_pct = phint_total ? (unsigned)(d_ph * 100 / phint_total) : 0;
+            unsigned jc_hit_pct    = jc_total    ? (unsigned)(d_jchit * 100 / jc_total) : 0;
+            uint64_t avg_chain_x100 = d_cr ? (d_ci * 100 / d_cr) : 0;
+
+            uint64_t fpcr = 0;
+            cranelift_get_vcpu_fpcr_observed(&fpcr);
+            unsigned fz   = (unsigned)((fpcr >> 24) & 1);
+            unsigned fz16 = (unsigned)((fpcr >> 19) & 1);
+            unsigned dn   = (unsigned)((fpcr >> 25) & 1);
+
+            uint64_t rh = 0, rm = 0;
+            cranelift_get_helper_dispatch_shim_stats(&rh, &rm);
+            static uint64_t last_rh, last_rm;
+            uint64_t d_rh    = rh - last_rh;
+            uint64_t d_rm    = rm - last_rm;
+            last_rh = rh;
+            last_rm = rm;
+            uint64_t route_total = d_rh + d_rm;
+            unsigned route_hit_pct = route_total
+                ? (unsigned)(d_rh * 100 / route_total) : 0;
+            unsigned route_on = qatomic_read(&cranelift_bridge_g_helper_route_shim);
+
+            __android_log_print(ANDROID_LOG_INFO, "xemu-jit",
+                "win=%lld_ms "
+                "tb_gen/s=%llu tb_inval/s=%llu tb_flush/s=%llu "
+                "jc_hit%%=%u jc_miss/s=%llu "
+                "lru_hit%%=%u lru_call/s=%llu "
+                "phint_hit%%=%u phint_call/s=%llu "
+                "chain_runs/s=%llu chain_avg=%llu.%02llu "
+                "irq/s=%llu "
+                "fpcr=0x%llx FZ=%u FZ16=%u DN=%u "
+                "route_shim=%u route_hit%%=%u route_call/s=%llu",
+                (long long)(window_us / 1000),
+                (unsigned long long)(d_gen   * 1000000 / window_us),
+                (unsigned long long)(d_inval * 1000000 / window_us),
+                (unsigned long long)(d_flush * 1000000 / window_us),
+                jc_hit_pct,
+                (unsigned long long)(d_jcmiss * 1000000 / window_us),
+                lru_hit_pct,
+                (unsigned long long)(lru_total * 1000000 / window_us),
+                phint_hit_pct,
+                (unsigned long long)(phint_total * 1000000 / window_us),
+                (unsigned long long)(d_cr * 1000000 / window_us),
+                (unsigned long long)(avg_chain_x100 / 100),
+                (unsigned long long)(avg_chain_x100 % 100),
+                (unsigned long long)((ie - last_ie) * 1000000 / window_us),
+                (unsigned long long)fpcr, fz, fz16, dn,
+                route_on, route_hit_pct,
+                (unsigned long long)(route_total * 1000000 / window_us));
+
+            last_jit_log_us  = now;
+            last_jc_hits     = jc_hits;
+            last_jc_misses   = jc_misses;
+            last_tb_gen      = tb_gen;
+            last_tb_inval    = tb_inval;
+            last_tb_flush    = tb_flush;
+            last_cr          = cr;
+            last_ci          = ci;
+            last_ie          = ie;
+            last_lh          = lh;
+            last_lm          = lm;
+            last_ph          = ph;
+            last_pm          = pm;
+        }
+
+        /*
+         * Periodic PIPELINE stats: PGRAPH ring fill-level + pfifo
+         * wait reasons + vCPU HLE-nanosleep wall-time. Diagnoses
+         * who-is-blocking-whom in the vCPU → pgraph-ring → pfifo →
+         * vulkan render chain. Same 2-second cadence as xemu-jit so
+         * the MCP `pipeline_stats` tool can correlate.
+         *
+         * Diagnostic key:
+         *   ring_full% high   → pfifo can't drain fast enough; pfifo
+         *                       is the bottleneck; CPU optimisations
+         *                       on vCPU won't help.
+         *   ring_empty% high  → vCPU produces commands slowly; vCPU
+         *                       is the producer constraint; pfifo
+         *                       sits waiting; CPU optimisations help.
+         *   ring_full + ring_empty both low → balanced pipeline; the
+         *                       bottleneck is elsewhere (audio sync,
+         *                       wall-clock pacing, etc.).
+         *   wait_idle/s high  → pfifo blocks on cond_wait often; vCPU
+         *                       is feeding it bursty or sparse work.
+         *   wait_spin/s high  → pfifo waking from short spin; vCPU is
+         *                       producing in fast bursts.
+         *   hle_yield_ms/s    → vCPU wall-time spent in our explicit
+         *                       KiIdleLoop nanosleep. Subtract from
+         *                       overall Sleep% to find "other" sleep
+         *                       (BQL wait, futex on other devices).
+         */
+        static int64_t last_pipe_log_us;
+        static uint64_t last_pfifo_samples, last_pfifo_depth_sum;
+        static uint64_t last_pfifo_empty,   last_pfifo_full;
+        static uint64_t last_pfifo_pcalls,  last_pfifo_words;
+        static uint64_t last_pfifo_wspin,   last_pfifo_widle;
+        static uint64_t last_pfifo_wait_ns;
+        static uint64_t last_hle_idle, last_hle_yields, last_hle_yield_ns;
+        static uint64_t last_uni_hits, last_uni_misses;
+        /* Phase 1.2 (index rewrite LRU) + 1.3 (surface part skip) */
+        static uint64_t last_idx_hits, last_idx_misses, last_idx_evicts;
+        static uint64_t last_surf_skip, last_surf_calls;
+        if (now - last_pipe_log_us >= 2000000) {
+            uint64_t ps = 0, pd_sum = 0, pe = 0, pf = 0;
+            uint64_t pc = 0, pw = 0;
+            uint32_t pmax = 0, pdma_len = 0;
+            uint64_t pws = 0, pwi = 0, pwn = 0;
+            pfifo_get_ring_stats(&ps, &pd_sum, &pmax, &pe, &pf, &pc,
+                                 &pw, &pdma_len, &pws, &pwi, &pwn);
+
+            uint64_t hi = 0, hy = 0, hyn = 0;
+            xbox_hle_get_idle_stats(&hi, &hy, &hyn);
+
+            int64_t pipe_window_us = last_pipe_log_us
+                ? (now - last_pipe_log_us) : 1;
+
+            uint64_t d_samples = ps  - last_pfifo_samples;
+            uint64_t d_dsum    = pd_sum - last_pfifo_depth_sum;
+            uint64_t d_empty   = pe  - last_pfifo_empty;
+            uint64_t d_full    = pf  - last_pfifo_full;
+            uint64_t d_pcalls  = pc  - last_pfifo_pcalls;
+            uint64_t d_words   = pw  - last_pfifo_words;
+            uint64_t d_wspin   = pws - last_pfifo_wspin;
+            uint64_t d_widle   = pwi - last_pfifo_widle;
+            uint64_t d_wait_ns = pwn - last_pfifo_wait_ns;
+
+            uint64_t d_hyields = hy - last_hle_yields;
+            uint64_t d_hidle   = hi - last_hle_idle;
+            uint64_t d_hyn     = hyn - last_hle_yield_ns;
+
+            uint64_t uh = g_nv2a_stats.shader_stats.uniform_fast_skip_hits;
+            uint64_t um = g_nv2a_stats.shader_stats.uniform_fast_skip_misses;
+            uint64_t d_uh = uh - last_uni_hits;
+            uint64_t d_um = um - last_uni_misses;
+            uint64_t d_un_total = d_uh + d_um;
+            unsigned uni_hit_pct = d_un_total
+                ? (unsigned)(d_uh * 100 / d_un_total) : 0;
+
+            /* Phase 1.2: index-rewrite LRU cache */
+            uint64_t ih = g_nv2a_stats.shader_stats.prim_rewrite_cache_hits;
+            uint64_t im = g_nv2a_stats.shader_stats.prim_rewrite_cache_misses;
+            uint64_t iv = g_nv2a_stats.shader_stats.prim_rewrite_cache_evicts;
+            uint64_t d_ih = ih - last_idx_hits;
+            uint64_t d_im = im - last_idx_misses;
+            uint64_t d_iv = iv - last_idx_evicts;
+            uint64_t d_idx_total = d_ih + d_im;
+            unsigned idx_hit_pct = d_idx_total
+                ? (unsigned)(d_ih * 100 / d_idx_total) : 0;
+
+            /* Phase 1.3: update_surface_part short-circuit.
+             * "calls" is the total entry count; "skip" is the fraction
+             * that returned via the cache early-exit without rebuilding
+             * the binding target or walking the full dirty bitmap. */
+            uint64_t sc = g_nv2a_stats.surf_working.update_calls;
+            uint64_t ss = g_nv2a_stats.surf_working.update_skip;
+            uint64_t d_sc = sc - last_surf_calls;
+            uint64_t d_ss = ss - last_surf_skip;
+            unsigned surf_skip_pct = d_sc
+                ? (unsigned)(d_ss * 100 / d_sc) : 0;
+
+            unsigned ring_empty_pct = d_samples
+                ? (unsigned)(d_empty * 100 / d_samples) : 0;
+            unsigned ring_full_pct  = d_samples
+                ? (unsigned)(d_full  * 100 / d_samples) : 0;
+            uint64_t ring_avg = d_samples ? (d_dsum / d_samples) : 0;
+            /*
+             * pct_x100 = (wait_ns / total_ns) * 10000
+             *          = wait_ns * 10000 / (window_us * 1000)
+             *          = wait_ns * 10 / window_us
+             *
+             * Worst-case overflow: wait_ns ≈ 2e9 (2 sec window),
+             * × 10 = 2e10, well below u64 max (1.8e19). Safe.
+             */
+            uint64_t pfifo_wait_pct_x100 = pipe_window_us
+                ? (d_wait_ns * 10) / pipe_window_us : 0;
+            uint64_t hle_yield_pct_x100 = pipe_window_us
+                ? (d_hyn * 10) / pipe_window_us : 0;
+
+            __android_log_print(ANDROID_LOG_INFO, "xemu-pipe",
+                "win=%lld_ms "
+                "ring avg=%llu max=%u dma_len=%u empty%%=%u full%%=%u "
+                "pusher_calls/s=%llu words/s=%llu "
+                "pfifo wait_spin/s=%llu wait_idle/s=%llu wait%%=%llu.%02llu "
+                "vcpu hle_yield/s=%llu hle_iters/s=%llu hle_yield_ms/s=%llu "
+                "hle_yield%%=%llu.%02llu "
+                "uni_skip_hit%%=%u uni_skip_total/s=%llu "
+                "idx_cache_hit%%=%u idx_cache_total/s=%llu idx_cache_evicts/s=%llu "
+                "surf_skip%%=%u surf_total/s=%llu",
+                (long long)(pipe_window_us / 1000),
+                (unsigned long long)ring_avg,
+                pmax, pdma_len,
+                ring_empty_pct, ring_full_pct,
+                (unsigned long long)(d_pcalls * 1000000 / pipe_window_us),
+                (unsigned long long)(d_words  * 1000000 / pipe_window_us),
+                (unsigned long long)(d_wspin  * 1000000 / pipe_window_us),
+                (unsigned long long)(d_widle  * 1000000 / pipe_window_us),
+                (unsigned long long)(pfifo_wait_pct_x100 / 100),
+                (unsigned long long)(pfifo_wait_pct_x100 % 100),
+                (unsigned long long)(d_hyields * 1000000 / pipe_window_us),
+                (unsigned long long)(d_hidle   * 1000000 / pipe_window_us),
+                (unsigned long long)(d_hyn / 1000000),  /* ms/s */
+                (unsigned long long)(hle_yield_pct_x100 / 100),
+                (unsigned long long)(hle_yield_pct_x100 % 100),
+                uni_hit_pct,
+                (unsigned long long)(d_un_total * 1000000 / pipe_window_us),
+                idx_hit_pct,
+                (unsigned long long)(d_idx_total * 1000000 / pipe_window_us),
+                (unsigned long long)(d_iv * 1000000 / pipe_window_us),
+                surf_skip_pct,
+                (unsigned long long)(d_sc * 1000000 / pipe_window_us));
+
+            last_pipe_log_us       = now;
+            last_pfifo_samples     = ps;
+            last_pfifo_depth_sum   = pd_sum;
+            last_pfifo_empty       = pe;
+            last_pfifo_full        = pf;
+            last_pfifo_pcalls      = pc;
+            last_pfifo_words       = pw;
+            last_pfifo_wspin       = pws;
+            last_pfifo_widle       = pwi;
+            last_pfifo_wait_ns     = pwn;
+            last_hle_idle          = hi;
+            last_hle_yields        = hy;
+            last_hle_yield_ns      = hyn;
+            last_uni_hits          = uh;
+            last_uni_misses        = um;
+            last_idx_hits          = ih;
+            last_idx_misses        = im;
+            last_idx_evicts        = iv;
+            last_surf_skip         = ss;
+            last_surf_calls        = sc;
+        }
+
+        /*
+         * Phase 2.1 + 2.2: per-NV2A-method-class histogram and per-draw
+         * phase p99 + draws_per_submit. Emitted as the "xemu-method"
+         * logcat tag on the same 2 s cadence as xemu-pipe so the MCP
+         * tool can correlate.
+         *
+         * Method class indices must match METHOD_CLASS_* enum order in
+         * hw/xbox/nv2a/pgraph/pgraph.c.
+         */
+        static int64_t last_method_log_us;
+        static uint64_t last_mc_count[NV2A_METHOD_CLASS_COUNT];
+        static uint64_t last_mc_cycles[NV2A_METHOD_CLASS_COUNT];
+        if (now - last_method_log_us >= 2000000) {
+            int64_t method_window_us = last_method_log_us
+                ? (now - last_method_log_us) : 1;
+
+            uint64_t d_count[NV2A_METHOD_CLASS_COUNT];
+            uint64_t d_cycles[NV2A_METHOD_CLASS_COUNT];
+            uint64_t total_cycles = 0;
+            for (unsigned i = 0; i < NV2A_METHOD_CLASS_COUNT; i++) {
+                uint64_t c = g_nv2a_stats.method_class_stats.count[i];
+                uint64_t cy = g_nv2a_stats.method_class_stats.cycles[i];
+                d_count[i]  = c  - last_mc_count[i];
+                d_cycles[i] = cy - last_mc_cycles[i];
+                total_cycles += d_cycles[i];
+                last_mc_count[i]  = c;
+                last_mc_cycles[i] = cy;
+            }
+
+            /* count/s by class, scaled to 1 s. */
+            uint64_t r_vertex  = d_count[0] * 1000000 / method_window_us;
+            uint64_t r_tex     = d_count[1] * 1000000 / method_window_us;
+            uint64_t r_shader  = d_count[2] * 1000000 / method_window_us;
+            uint64_t r_light   = d_count[3] * 1000000 / method_window_us;
+            uint64_t r_render  = d_count[4] * 1000000 / method_window_us;
+            uint64_t r_inline  = d_count[5] * 1000000 / method_window_us;
+            uint64_t r_other   = d_count[6] * 1000000 / method_window_us;
+
+            /* Cycle share % per class (integer percent, 0-100). */
+            unsigned s_vertex = total_cycles
+                ? (unsigned)(d_cycles[0] * 100 / total_cycles) : 0;
+            unsigned s_tex    = total_cycles
+                ? (unsigned)(d_cycles[1] * 100 / total_cycles) : 0;
+            unsigned s_shader = total_cycles
+                ? (unsigned)(d_cycles[2] * 100 / total_cycles) : 0;
+            unsigned s_light  = total_cycles
+                ? (unsigned)(d_cycles[3] * 100 / total_cycles) : 0;
+            unsigned s_render = total_cycles
+                ? (unsigned)(d_cycles[4] * 100 / total_cycles) : 0;
+            unsigned s_inline = total_cycles
+                ? (unsigned)(d_cycles[5] * 100 / total_cycles) : 0;
+            unsigned s_other  = total_cycles
+                ? (unsigned)(d_cycles[6] * 100 / total_cycles) : 0;
+
+            FramePhaseTimingStats *ph = &g_nv2a_stats.phase;
+            /* draws_per_submit is smoothed in the snapshot path. */
+            unsigned dps_int   = (unsigned)ph->draws_per_submit;
+            unsigned dps_frac  =
+                (unsigned)((ph->draws_per_submit - (float)dps_int) * 100.0f);
+
+            __android_log_print(ANDROID_LOG_INFO, "xemu-method",
+                "win=%lld_ms "
+                "vertex/s=%llu(%u%%) tex_state/s=%llu(%u%%) "
+                "shader_state/s=%llu(%u%%) light/s=%llu(%u%%) "
+                "render_state/s=%llu(%u%%) inline_draw/s=%llu(%u%%) "
+                "other/s=%llu(%u%%) | draws_per_submit=%u.%02u | "
+                "draw_vk_cmd_p99_us=%.2f draw_setup_p99_us=%.2f "
+                "draw_vtx_attr_p99_us=%.2f draw_vtx_sync_p99_us=%.2f "
+                "draw_prim_rw_p99_us=%.2f "
+                "pipe_bind_tex_p99_us=%.2f pipe_bind_shd_p99_us=%.2f "
+                "pipe_lookup_p99_us=%.2f",
+                (long long)(method_window_us / 1000),
+                (unsigned long long)r_vertex, s_vertex,
+                (unsigned long long)r_tex,    s_tex,
+                (unsigned long long)r_shader, s_shader,
+                (unsigned long long)r_light,  s_light,
+                (unsigned long long)r_render, s_render,
+                (unsigned long long)r_inline, s_inline,
+                (unsigned long long)r_other,  s_other,
+                dps_int, dps_frac,
+                ph->draw_vk_cmd_max_us,
+                ph->draw_setup_max_us,
+                ph->draw_vtx_attr_max_us,
+                ph->draw_vtx_sync_max_us,
+                ph->draw_prim_rw_max_us,
+                ph->pipe_bind_tex_max_us,
+                ph->pipe_bind_shd_max_us,
+                ph->pipe_lookup_max_us);
+
+            last_method_log_us = now;
+        }
 
         /* Trigger: this frame > 2× baseline AND >50ms long.
          * Throttle to one log per 1s so we don't flood. */
@@ -123,7 +523,8 @@ void nv2a_profile_increment(void)
             __android_log_print(ANDROID_LOG_INFO, "x1-stall",
                 "long_frame: interval=%lld ms baseline=%lld ms "
                 "chain_runs=%llu chain_iters=%llu avg=%llu.%02llu "
-                "irq_exits=%llu lru_hits=%llu lru_misses=%llu",
+                "irq_exits=%llu lru_hits=%llu lru_misses=%llu "
+                "phint_hits=%llu phint_misses=%llu",
                 (long long)(interval / 1000),
                 (long long)(base_avg / 1000),
                 (unsigned long long)d_runs,
@@ -132,7 +533,9 @@ void nv2a_profile_increment(void)
                 (unsigned long long)(avg_chain % 100),
                 (unsigned long long)d_irq,
                 (unsigned long long)d_lhit,
-                (unsigned long long)d_lmiss);
+                (unsigned long long)d_lmiss,
+                (unsigned long long)d_phit,
+                (unsigned long long)d_pmiss);
             last_long_log_us = now;
         }
     }
@@ -175,9 +578,34 @@ static void snapshot_phase_timing(void)
     SMOOTH(gpu_nonrender);
 #undef SMOOTH
 
+    /* Phase 2.2: per-window max (p99 proxy). Take the raw _max_ns,
+     * convert to microseconds, and smooth so a single noisy outlier
+     * doesn't dominate the displayed value. */
+#define SMOOTH_MAX_US(field) \
+    p->field##_max_us = p->field##_max_us * (1.0f - alpha) + \
+                        (float)(w->field##_max_ns) / 1e3f * alpha
+    SMOOTH_MAX_US(draw_vtx_attr);
+    SMOOTH_MAX_US(draw_vtx_sync);
+    SMOOTH_MAX_US(draw_prim_rw);
+    SMOOTH_MAX_US(draw_setup);
+    SMOOTH_MAX_US(draw_vk_cmd);
+    SMOOTH_MAX_US(pipe_bind_tex);
+    SMOOTH_MAX_US(pipe_bind_shd);
+    SMOOTH_MAX_US(pipe_lookup);
+#undef SMOOTH_MAX_US
+
 #define SMOOTH_CNT(dst, src) \
     (dst) = (dst) * (1.0f - alpha) + (float)(src) * alpha
     SMOOTH_CNT(p->gpu_rp_count, w->gpu_rp_count);
+    /* Phase 2.2: draws_per_submit ratio. submits_this_window is bumped
+     * once per pgraph_vk_finish; draws_this_window is bumped per
+     * vkCmdDraw* call. Ratio reflects how many draws each submit
+     * batched together — high values motivate Phase 3 split. */
+    if (w->submits_this_window > 0) {
+        float dps =
+            (float)w->draws_this_window / (float)w->submits_this_window;
+        SMOOTH_CNT(p->draws_per_submit, dps);
+    }
 #undef SMOOTH_CNT
 
     p->total_ms = p->surface_update_ms + p->texture_upload_ms +

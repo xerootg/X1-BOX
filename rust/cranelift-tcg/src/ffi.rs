@@ -288,7 +288,7 @@ pub unsafe extern "C" fn cranelift_tcg_compile_sync(
         Err(e) => return e.to_ffi(),
     };
     match t.compile(&ctx, tb_pc, &snap) {
-        Ok(entry) => {
+        Ok((entry, _unwind)) => {
             if !out_code.is_null() {
                 unsafe { *out_code = entry.code as *const c_void };
             }
@@ -308,6 +308,47 @@ pub unsafe extern "C" fn cranelift_tcg_poll_result(
     out_tb_pc: *mut u64,
     out_code: *mut *const c_void,
     out_size: *mut usize,
+) -> i32 {
+    // Legacy ABI: discard the unwind metadata since the caller didn't
+    // ask for it. Kept for tests / verify-mode call sites that don't
+    // care about synchronous-fault unwind support.
+    unsafe {
+        cranelift_tcg_poll_result_v2(
+            handle,
+            out_tb_pc,
+            out_code,
+            out_size,
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+/// Mirror of `CraneliftTcgUnwindMeta` in the C header. Pointers belong
+/// to the Rust-owned `Box<UnwindBuf>` referenced by `_handle`; the
+/// caller must invoke `cranelift_tcg_release_unwind(_handle)` once it
+/// has finished consuming the arrays (typically right after copying
+/// them into the C-side unwind index slab).
+#[repr(C)]
+pub struct CraneliftTcgUnwindMeta {
+    pub n_insns: u32,
+    pub n_rows: u32,
+    pub host_end: *const u32,
+    pub loc: *const u32,
+    pub insn_data: *const u64,
+    pub _handle: *mut c_void,
+}
+
+/// Drain one completed compile and (optionally) hand back its unwind
+/// metadata. The unwind buffer lives on the Rust heap until the caller
+/// passes its `_handle` to `cranelift_tcg_release_unwind`; ownership
+/// transfers to the C side at poll time.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cranelift_tcg_poll_result_v2(
+    handle: *mut c_void,
+    out_tb_pc: *mut u64,
+    out_code: *mut *const c_void,
+    out_size: *mut usize,
+    out_unwind: *mut CraneliftTcgUnwindMeta,
 ) -> i32 {
     let Some(ctx) = ctx_from_handle(handle) else {
         return 0;
@@ -333,7 +374,45 @@ pub unsafe extern "C" fn cranelift_tcg_poll_result(
             *out_size = rsp.entry.size;
         }
     }
+
+    // Leak the Box; ownership now belongs to the C side via the
+    // returned `_handle`. If the caller passes a NULL `out_unwind`,
+    // they've opted out of unwind support -- drop the Box right here.
+    if out_unwind.is_null() {
+        drop(rsp.unwind);
+    } else {
+        let raw: *mut crate::context::UnwindBuf = Box::into_raw(rsp.unwind);
+        // SAFETY: `raw` is a unique pointer (we just leaked it); the
+        // Box from_raw call lives long enough for the field reads.
+        let buf: &crate::context::UnwindBuf = unsafe { &*raw };
+        let meta = CraneliftTcgUnwindMeta {
+            n_insns: buf.n_insns,
+            n_rows: buf.host_end.len() as u32,
+            host_end: buf.host_end.as_ptr(),
+            loc: buf.loc.as_ptr(),
+            insn_data: buf.insn_data.as_ptr(),
+            _handle: raw as *mut c_void,
+        };
+        unsafe {
+            *out_unwind = meta;
+        }
+    }
     1
+}
+
+/// Drop the unwind buffer referenced by `_handle`. Must be paired with
+/// each non-NULL `out_unwind` returned by `cranelift_tcg_poll_result_v2`;
+/// safe to call with a NULL handle (no-op).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cranelift_tcg_release_unwind(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+    // SAFETY: `handle` was produced by Box::into_raw in poll_result_v2;
+    // C side guarantees it calls this exactly once per non-NULL handle.
+    let _: Box<crate::context::UnwindBuf> = unsafe {
+        Box::from_raw(handle as *mut crate::context::UnwindBuf)
+    };
 }
 
 #[unsafe(no_mangle)]

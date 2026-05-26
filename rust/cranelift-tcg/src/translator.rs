@@ -28,7 +28,8 @@ use std::sync::Arc;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, Function, InstBuilder, MemFlags, Signature, UserFuncName, Type, Value,
+    AbiParam, BlockArg, Function, InstBuilder, MemFlags, Signature, SourceLoc,
+    UserFuncName, Type, Value,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
@@ -43,7 +44,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
-use crate::context::{JitContext, TierTwoEntry};
+use crate::context::{JitContext, TierTwoEntry, UnwindBuf};
 use crate::env::EnvDesc;
 use crate::ir::{DecodedOp, OpSnapshot};
 use crate::opc::{flags, Op, Opc, TcgCond, TcgType};
@@ -115,13 +116,17 @@ impl Translator {
         })
     }
 
-    /// Compile a single TB. Returns the emitted code entry on success.
+    /// Compile a single TB. Returns the emitted code entry plus the
+    /// per-TB synchronous-fault unwind metadata on success. The C side
+    /// is expected to install the unwind data BEFORE publishing the
+    /// tier-2 shim (so any subsequent helper fault that points into the
+    /// JIT arena has an entry in the unwind index to resolve against).
     pub fn compile(
         &mut self,
         ctx: &Arc<JitContext>,
         tb_pc: u64,
         snap: &OpSnapshot,
-    ) -> Result<TierTwoEntry, TransError> {
+    ) -> Result<(TierTwoEntry, UnwindBuf), TransError> {
         /*
          * Bail on TBs that touch HF_INHIBIT_IRQ_MASK (set or clear).
          *
@@ -222,6 +227,7 @@ impl Translator {
         self.func_index = self.func_index.wrapping_add(1);
 
         let mut fb_ctx = FunctionBuilderContext::new();
+        let insn_start_words: Vec<[u64; 3]>;
         {
             let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
             let mut lower = Lowering::new(
@@ -242,6 +248,8 @@ impl Translator {
                 return Err(TransError::UnsupportedOp(0));
             }
             lower.terminate_if_needed();
+            // Move out before the FunctionBuilder is dropped.
+            insn_start_words = std::mem::take(&mut lower.insn_start_words);
         }
         // finalize() consumes the FunctionBuilder; we created a new
         // one for each compile so dropping it is fine.
@@ -266,6 +274,69 @@ impl Translator {
             .unwrap_or_default();
         let code_size = code_bytes_for_dump.len();
 
+        /*
+         * Harvest the SourceLoc rows Cranelift attached during lowering.
+         * `get_srclocs_sorted` returns rows sorted by `start`; within a
+         * contiguous loc-tagged region `end` is also monotonically
+         * non-decreasing. Cranelift may reorder basic blocks, so two
+         * adjacent guest insns can produce rows that are sorted-by-start
+         * but interleave on the guest_idx axis -- that's fine because
+         * the fault path bsearches `host_end` and follows the `loc`
+         * column directly to the matching insn_start data.
+         *
+         * loc == 0 means "no guest insn" (prologue, register-allocator
+         * spill code, peephole-synthesized insns); drop those rows. A
+         * fault landing in such a gap then resolves to the next row's
+         * loc, which corresponds to the next guest insn -- equivalent
+         * to tier-1's "last completed instruction" semantics.
+         */
+        let mut host_end: Vec<u32> = Vec::new();
+        let mut loc: Vec<u32> = Vec::new();
+        if let Some(cc) = cg_ctx.compiled_code() {
+            let rows = cc.buffer.get_srclocs_sorted();
+            host_end.reserve(rows.len());
+            loc.reserve(rows.len());
+            for row in rows {
+                let bits = row.loc.bits();
+                if bits == 0 {
+                    continue;
+                }
+                host_end.push(row.end);
+                // Convert 1-based guest idx back to 0-based for the
+                // insn_data lookup. checked_sub guards against an out-
+                // of-band loc value (shouldn't happen but stay safe).
+                let g = bits.saturating_sub(1);
+                loc.push(g);
+            }
+        }
+        // Defensive: keep host_end weakly monotonic so a downstream
+        // bsearch is well-defined. Cranelift block reordering can
+        // produce rows where end[i+1] < end[i] when both rows belong to
+        // distinct basic blocks placed out of guest-PC order. We need
+        // bsearch correctness, not strict guest order -- so re-sort by
+        // host_end (carrying loc along) instead of trying to enforce
+        // monotonicity in-place.
+        if host_end.len() > 1 {
+            let mut pairs: Vec<(u32, u32)> = host_end
+                .iter()
+                .zip(loc.iter())
+                .map(|(&h, &l)| (h, l))
+                .collect();
+            pairs.sort_by_key(|p| p.0);
+            for (i, (h, l)) in pairs.into_iter().enumerate() {
+                host_end[i] = h;
+                loc[i] = l;
+            }
+        }
+
+        let n_insns = insn_start_words.len() as u32;
+        let mut insn_data: Vec<u64> =
+            Vec::with_capacity(insn_start_words.len() * 3);
+        for row in &insn_start_words {
+            insn_data.extend_from_slice(row);
+        }
+        let n_rows = host_end.len() as u32;
+
         // Dump the first few compiled functions as hex so we can
         // disassemble them offline and see whether they actually
         // advance the guest state.
@@ -284,15 +355,26 @@ impl Translator {
                 .collect::<Vec<_>>()
                 .join("");
             crate::dispatcher::log_to_android(&format!(
-                "tb#{dc} pc=0x{tb_pc:x} ptr={code_ptr:p} size={code_size} bytes={hex}"
+                "tb#{dc} pc=0x{tb_pc:x} ptr={code_ptr:p} size={code_size} bytes={hex} \
+                 n_insns={n_insns} n_rows={n_rows} \
+                 first_end={} last_end={}",
+                host_end.first().copied().unwrap_or(0),
+                host_end.last().copied().unwrap_or(0),
             ));
         }
 
-        Ok(TierTwoEntry {
+        let entry = TierTwoEntry {
             code: code_ptr,
             size: code_size,
             tb_pc,
-        })
+        };
+        let unwind = UnwindBuf {
+            host_end,
+            loc,
+            insn_data,
+            n_insns,
+        };
+        Ok((entry, unwind))
     }
 }
 
@@ -319,6 +401,18 @@ pub(crate) struct Lowering<'a, 'b> {
     /// compiled TBs missing guest writes — a freeze-class bug when
     /// many such TBs were compiled at threshold=1.
     pub(crate) aborted: bool,
+    /// 1-based guest-instruction counter. Bumped on every InsnStart op;
+    /// stamped via `set_srcloc(SourceLoc::new(idx))` so every Cranelift
+    /// IR insn emitted after the InsnStart carries the originating
+    /// guest-insn index. 0 reserved for prologue / between-insn gaps.
+    pub(crate) current_guest_idx: u32,
+    /// One row per guest insn, captured from the InsnStart cargs at
+    /// translate time. Each row is the INSN_START_WORDS=3 uint64_t
+    /// values that `restore_state_to_opc` consumes on synchronous-fault
+    /// unwind. Tier-1 stores these as sleb128 deltas appended to the
+    /// code buffer; tier-2 doesn't have an appendable arena, so we
+    /// hand them off to the C-side unwind index instead.
+    pub(crate) insn_start_words: Vec<[u64; 3]>,
 }
 
 impl<'a, 'b> Lowering<'a, 'b> {
@@ -345,6 +439,8 @@ impl<'a, 'b> Lowering<'a, 'b> {
             block_terminated: false,
             entry_block,
             aborted: false,
+            current_guest_idx: 0,
+            insn_start_words: Vec::new(),
         }
     }
 
@@ -805,7 +901,33 @@ impl<'a, 'b> Lowering<'a, 'b> {
     fn lower_known(&mut self, opc: Opc, op: &DecodedOp) -> Result<(), TransError> {
         use Opc::*;
         match opc {
-            Discard | InsnStart | PluginCb | PluginMemCb => Ok(()),
+            Discard | PluginCb | PluginMemCb => Ok(()),
+            InsnStart => {
+                /*
+                 * Tag the rest of this guest insn's lowering with a
+                 * SourceLoc carrying its 1-based index. Every subsequent
+                 * `builder.ins().*` (incl. the fp/vec dispatch arms,
+                 * since they all emit through `lower.builder`) inherits
+                 * the sticky srcloc until the next InsnStart.
+                 *
+                 * After codegen, `compiled_code().buffer.get_srclocs_sorted()`
+                 * gives us (start, end, loc) rows we use to map a fault
+                 * host_pc back to the originating guest insn.
+                 */
+                self.current_guest_idx = self
+                    .current_guest_idx
+                    .checked_add(1)
+                    .ok_or(TransError::UnsupportedOp(0))?;
+                self.builder
+                    .set_srcloc(SourceLoc::new(self.current_guest_idx));
+                let mut row = [0u64; 3];
+                let n = (op.nb_cargs as usize).min(3);
+                for j in 0..n {
+                    row[j] = op.carg(j);
+                }
+                self.insn_start_words.push(row);
+                Ok(())
+            }
             Mb => {
                 self.builder.ins().fence();
                 Ok(())

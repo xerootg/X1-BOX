@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
-use crate::context::{JitContext, TierTwoEntry};
+use crate::context::{JitContext, TierTwoEntry, UnwindBuf};
 use crate::ffi;
 use crate::ir::OpSnapshot;
 use crate::translator::Translator;
@@ -70,9 +70,17 @@ pub struct CompileReq {
 }
 
 /// One compile response.
+///
+/// Carries the per-TB unwind metadata alongside the compiled code so
+/// the C-side drain (`cranelift_bridge_drain`) can hand both to the
+/// pending-swap ring atomically. The C side deep-copies the unwind
+/// arrays into its own allocation during install (so the Rust-owned
+/// Box can be dropped immediately afterwards via
+/// `cranelift_tcg_release_unwind`).
 pub struct CompileRsp {
     pub tb_pc: u64,
     pub entry: TierTwoEntry,
+    pub unwind: Box<UnwindBuf>,
 }
 
 pub struct Dispatcher {
@@ -168,13 +176,14 @@ fn worker_loop(
                 let elapsed_ns = t0.elapsed().as_nanos() as u64;
                 total_compiles += 1;
                 match result {
-                    Ok(entry) => {
+                    Ok((entry, unwind)) => {
                         ctx.stats
                             .note_compile(elapsed_ns, entry.size as u64, true);
                         ctx.insert_entry(entry.clone());
                         let _ = rsp_tx.try_send(CompileRsp {
                             tb_pc: req.tb_pc,
                             entry,
+                            unwind: Box::new(unwind),
                         });
                     }
                     Err(crate::translator::TransError::UnsupportedOp(opc)) => {

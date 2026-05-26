@@ -585,22 +585,58 @@ void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
     }
 
     if (r->uniforms_changed) {
-        if (!pgraph_vk_buffer_has_space_for(
-                pg, BUFFER_UNIFORM_STAGING, ubo_buffer_total_size,
-                r->device_props.limits.minUniformBufferOffsetAlignment)) {
-            OPT_STAT_INC(buf_ubo_full);
-            pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
-        }
+        /*
+         * Per-binding stage cache: r->last_*_uniform_hash holds the
+         * hash of THIS binding's layout->allocation computed in
+         * pgraph_vk_update_shader_uniforms a few microseconds ago. If
+         * that matches what we recorded the last time we staged THIS
+         * binding (within the same staging generation), the uniform
+         * staging-buffer region we wrote then still holds those exact
+         * bytes — reuse the cached offsets and skip the staging memcpy.
+         *
+         * 2026-05-25: pfifo callgraph on Halo 2 showed
+         * pgraph_vk_append_to_buffer → memmove at 91.93% of that
+         * branch, and apply_uniform_updates → memmove at 36.80% of
+         * its branch. The global r->last_*_uniform_hash check handles
+         * consecutive same-binding draws, but materials interleaved
+         * A→B→A→B in a scene defeat it. This per-binding cache catches
+         * that pattern.
+         */
+        if (binding->stage_cache_valid
+            && binding->cached_uniform_staging_gen == r->uniform_staging_gen
+            && binding->cached_vsh_uniform_hash == r->last_vsh_uniform_hash
+            && binding->cached_psh_uniform_hash == r->last_psh_uniform_hash) {
+            r->uniform_buffer_offsets[0] = binding->cached_uniform_buffer_offsets[0];
+            r->uniform_buffer_offsets[1] = binding->cached_uniform_buffer_offsets[1];
+            OPT_STAT_INC(buf_ubo_cache_hit);
+            r->uniforms_changed = false;
+        } else {
+            if (!pgraph_vk_buffer_has_space_for(
+                    pg, BUFFER_UNIFORM_STAGING, ubo_buffer_total_size,
+                    r->device_props.limits.minUniformBufferOffsetAlignment)) {
+                OPT_STAT_INC(buf_ubo_full);
+                pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
+            }
 
-        for (int i = 0; i < ARRAY_SIZE(layouts); i++) {
-            void *data = layouts[i]->allocation;
-            VkDeviceSize size = layouts[i]->total_size;
-            r->uniform_buffer_offsets[i] = pgraph_vk_append_to_buffer(
-                pg, BUFFER_UNIFORM_STAGING, &data, &size, 1,
-                r->device_props.limits.minUniformBufferOffsetAlignment);
-        }
+            for (int i = 0; i < ARRAY_SIZE(layouts); i++) {
+                void *data = layouts[i]->allocation;
+                VkDeviceSize size = layouts[i]->total_size;
+                r->uniform_buffer_offsets[i] = pgraph_vk_append_to_buffer(
+                    pg, BUFFER_UNIFORM_STAGING, &data, &size, 1,
+                    r->device_props.limits.minUniformBufferOffsetAlignment);
+            }
 
-        r->uniforms_changed = false;
+            /* Record the just-staged state on the binding for future
+             * cache hits. */
+            binding->cached_uniform_buffer_offsets[0] = r->uniform_buffer_offsets[0];
+            binding->cached_uniform_buffer_offsets[1] = r->uniform_buffer_offsets[1];
+            binding->cached_vsh_uniform_hash = r->last_vsh_uniform_hash;
+            binding->cached_psh_uniform_hash = r->last_psh_uniform_hash;
+            binding->cached_uniform_staging_gen = r->uniform_staging_gen;
+            binding->stage_cache_valid = true;
+
+            r->uniforms_changed = false;
+        }
     }
 
     if (push_desc && r->texture_bindings_changed) {
@@ -970,6 +1006,7 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
      * never been populated for this state, so the uniform fast-skip
      * must run the full set+apply path on first use. */
     binding->uniforms_layout_populated = false;
+    binding->stage_cache_valid = false;
     if (r->last_uniforms_binding == binding) {
         r->last_uniforms_binding = NULL;
     }
@@ -1057,6 +1094,7 @@ static void shader_cache_entry_post_evict(Lru *lru, LruNode *node)
         r->last_uniforms_binding = NULL;
     }
     snode->uniforms_layout_populated = false;
+    snode->stage_cache_valid = false;
 
     ShaderModuleInfo *modules[] = {
         snode->vsh.module_info,
@@ -1342,8 +1380,12 @@ void pgraph_vk_update_shader_uniforms(PGRAPHState *pg)
      *
      * Conservative gate — any of the following invalidates the skip:
      *   - constant/light dirty bits set since last clear
-     *   - any register write since last apply (any_reg_gen ticks on every
-     *     pg register touch, covering fogParam / surfaceSize / etc.)
+     *   - a uniform-feeding register changed since last apply
+     *     (uniform_inputs_gen ticks only when the register is tagged
+     *     REG_CAT_UNIFORM_INPUT or when an inline vertex-attribute
+     *     value used as a uniform changes — narrower than any_reg_gen
+     *     which also bumps on texture / surface state changes that
+     *     don't affect uniforms)
      *   - different binding than last apply (uniform layout differs)
      *   - this binding hasn't been populated yet (LRU-fresh slot)
      *
@@ -1355,10 +1397,12 @@ void pgraph_vk_update_shader_uniforms(PGRAPHState *pg)
     if (!constants_dirty
         && binding == r->last_uniforms_binding
         && binding->uniforms_layout_populated
-        && pg->any_reg_gen == r->last_uniforms_reg_gen) {
+        && pg->uniform_inputs_gen == r->last_uniforms_reg_gen) {
+        g_nv2a_stats.shader_stats.uniform_fast_skip_hits++;
         NV2A_VK_DGROUP_END();
         return;
     }
+    g_nv2a_stats.shader_stats.uniform_fast_skip_misses++;
 
     VshUniformValues vsh_values;
     pgraph_glsl_set_vsh_uniform_values(pg, &binding->state.vsh,
@@ -1416,14 +1460,15 @@ void pgraph_vk_update_shader_uniforms(PGRAPHState *pg)
 
     /*
      * Update fast-skip tracking. From this point until any of (a) a
-     * constant/light dirty bit being set, (b) a register write bumping
-     * any_reg_gen, (c) a different shader binding being selected, or (d)
-     * this binding's LRU slot being recycled, we can safely skip the
-     * set_*_uniform_values + apply_uniform_updates path.
+     * constant/light dirty bit being set, (b) a uniform-feeding
+     * register write bumping uniform_inputs_gen, (c) a different shader
+     * binding being selected, or (d) this binding's LRU slot being
+     * recycled, we can safely skip the set_*_uniform_values +
+     * apply_uniform_updates path.
      */
     binding->uniforms_layout_populated = true;
     r->last_uniforms_binding = binding;
-    r->last_uniforms_reg_gen = pg->any_reg_gen;
+    r->last_uniforms_reg_gen = pg->uniform_inputs_gen;
 
     NV2A_VK_DGROUP_END();
 }

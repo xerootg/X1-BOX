@@ -4160,6 +4160,85 @@ void helper_xsetbv(CPUX86State *env, uint32_t ecx, uint64_t mask)
 #define SSE_RC_MASK         (3 << SSE_RC_SHIFT)
 #define SSE_FZ              0x8000
 
+#if defined(XBOX) && defined(__aarch64__) && defined(__ANDROID__)
+/*
+ * Propagate guest MXCSR -> host aarch64 FPCR.
+ *
+ * Why this exists: with X1BOX_SSE_INLINE=1, scalar SSE ops
+ * (MULSS/ADDSS/SUBSS/DIVSS) lower to NEON FMUL.S / FADD.S etc.
+ * NEON respects FPCR for rounding mode and flush-to-zero, but
+ * helper_ldmxcsr only updated the softfloat env->sse_status —
+ * which is what helper-based SSE reads. Mismatch:
+ *
+ *   guest LDMXCSR (MXCSR.RM=01)
+ *     -> env->mxcsr  updated  ✓
+ *     -> env->sse_status      ✓  (helper-based MULPS uses this)
+ *     -> host FPCR           ✗  (inline MULSS uses this — diverges)
+ *
+ * Halo 2 physics integrator drifts ~1 ULP/op when the two paths
+ * use different rounding (sliding NPCs, walk-stop momentum). Fix
+ * is to keep FPCR in sync with MXCSR on every store.
+ *
+ * Mapping:
+ *   MXCSR.FZ  (bit 15) -> FPCR.FZ  (bit 24)  - direct
+ *   MXCSR.RM  (13..14) -> FPCR.RM  (22..23)  - SEMI-direct, see below
+ *   MXCSR.DAZ (bit 6)  -> FPCR.FIZ (bit 0)   - input-flush (Armv8.7+)
+ *                                              (best-effort; ignored
+ *                                              on older cores)
+ *
+ * MXCSR.RM encoding (Intel SDM Vol 1 §10.2.3.4):
+ *   00 = Round to nearest (even)
+ *   01 = Round down toward -inf
+ *   10 = Round up   toward +inf
+ *   11 = Round toward zero (truncate)
+ *
+ * FPCR.RM encoding (ARM ARM D17.4.3):
+ *   00 = Round to nearest
+ *   01 = Round toward +inf
+ *   10 = Round toward -inf
+ *   11 = Round toward zero
+ *
+ * Note the SWAP between MXCSR 01/10 and FPCR 01/10 — the two
+ * "toward infinity" encodings are reversed.
+ */
+static inline void update_host_fpcr_from_mxcsr(uint32_t mxcsr)
+{
+    static const uint8_t mxcsr_rm_to_fpcr_rm[4] = {
+        0,  /* MXCSR RN -> FPCR RN */
+        2,  /* MXCSR RD (-inf) -> FPCR RM (-inf) */
+        1,  /* MXCSR RU (+inf) -> FPCR RP (+inf) */
+        3,  /* MXCSR RZ -> FPCR RZ */
+    };
+    uint32_t rm   = (mxcsr & SSE_RC_MASK) >> SSE_RC_SHIFT;
+    uint32_t fz   = (mxcsr & SSE_FZ)   ? 1u : 0u;
+    uint32_t daz  = (mxcsr & SSE_DAZ)  ? 1u : 0u;
+
+    uint64_t fpcr;
+    asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+
+    /* Clear all the bits we manage; leave the rest (e.g. AHP,
+     * exception trap enables, NEP) untouched so we don't fight
+     * ABI defaults. */
+    fpcr &= ~((3ULL << 22) |        /* RMode  */
+              (1ULL << 24) |        /* FZ     */
+              (1ULL << 19) |        /* FZ16 — pair with FZ */
+              (1ULL << 0));         /* FIZ    */
+
+    fpcr |= ((uint64_t)mxcsr_rm_to_fpcr_rm[rm] << 22);
+    if (fz) {
+        fpcr |= (1ULL << 24) | (1ULL << 19);
+    }
+    if (daz) {
+        fpcr |= (1ULL << 0);
+    }
+    /* Keep DN=0 (matches SSE NaN-payload preservation). */
+
+    asm volatile("msr fpcr, %0" : : "r"(fpcr));
+}
+#else
+static inline void update_host_fpcr_from_mxcsr(uint32_t mxcsr) { (void)mxcsr; }
+#endif
+
 void update_mxcsr_status(CPUX86State *env)
 {
     uint32_t mxcsr = env->mxcsr;
@@ -4183,6 +4262,9 @@ void update_mxcsr_status(CPUX86State *env)
 
     /* set flush to zero */
     set_flush_to_zero((mxcsr & SSE_FZ) ? 1 : 0, &env->sse_status);
+
+    /* Mirror MXCSR semantics into host FPCR for the SSE-inline path. */
+    update_host_fpcr_from_mxcsr(mxcsr);
 }
 
 void update_mxcsr_from_sse_status(CPUX86State *env)

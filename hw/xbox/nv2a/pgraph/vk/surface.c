@@ -1505,11 +1505,13 @@ static void unbind_surface(NV2AState *d, bool color)
             r->color_binding = NULL;
             r->framebuffer_dirty = true;
         }
+        r->surface_part_cache[0].valid = false;
     } else {
         if (r->zeta_binding) {
             r->zeta_binding = NULL;
             r->framebuffer_dirty = true;
         }
+        r->surface_part_cache[1].valid = false;
     }
 }
 
@@ -2734,6 +2736,64 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
 
     g_nv2a_stats.surf_working.update_calls++;
 
+    Surface *pg_surface = color ? &pg->surface_color : &pg->surface_zeta;
+    SurfaceBinding *current_binding_pre = color ? r->color_binding
+                                                : r->zeta_binding;
+
+    /*
+     * Phase 1.3 short-circuit. When (a) we already have a binding,
+     * (b) the surface-input gen counter hasn't moved, and
+     * (c) pg_surface->buffer_dirty is clean, the binding's
+     * vram_addr+size cannot have changed since the last call. Run the
+     * dirty-bitmap walk over just the cached window. If the window is
+     * clean AND upload was not requested, return early — we skip
+     * populate_surface_binding_target (memset + multiple field reads)
+     * and the binding-rebind branch entirely.
+     */
+    {
+        int idx = color ? 0 : 1;
+        if (r->surface_part_cache[idx].valid &&
+            r->surface_part_cache[idx].gen == pg->surface_binding_inputs_gen &&
+            current_binding_pre && !pg_surface->buffer_dirty) {
+
+            int64_t _st1 = nv2a_clock_ns();
+            bool mem_dirty = false;
+            if (!tcg_enabled() && r->surface_part_cache[idx].last_size > 0) {
+                ram_addr_t start = r->vram_ram_addr +
+                                   r->surface_part_cache[idx].last_addr;
+                unsigned long page = start >> TARGET_PAGE_BITS;
+                unsigned long end_page =
+                    TARGET_PAGE_ALIGN(start +
+                                      r->surface_part_cache[idx].last_size) >>
+                    TARGET_PAGE_BITS;
+
+                RCU_READ_LOCK_GUARD();
+                DirtyMemoryBlocks *blocks =
+                    qatomic_rcu_read(&ram_list.dirty_memory[DIRTY_MEMORY_NV2A]);
+
+                while (page < end_page) {
+                    unsigned long bidx = page / DIRTY_MEMORY_BLOCK_SIZE;
+                    unsigned long ofs = page % DIRTY_MEMORY_BLOCK_SIZE;
+                    unsigned long num = MIN(end_page - page,
+                                            DIRTY_MEMORY_BLOCK_SIZE - ofs);
+                    mem_dirty |= bitmap_test_and_clear_atomic(
+                        blocks->blocks[bidx], ofs, num);
+                    page += num;
+                }
+            }
+            g_nv2a_stats.surf_working.dirty_ns += nv2a_clock_ns() - _st1;
+
+            if (!mem_dirty && !upload && !pg_surface->draw_dirty) {
+                g_nv2a_stats.surf_working.update_skip++;
+                return;
+            }
+            /* Walk picked up dirty pages OR caller wants upload.
+             * Fall through to the full path; we already drained the
+             * dirty bits for the window so the full bitmap walk below
+             * will only re-check the (rare) outside-window pages. */
+        }
+    }
+
     int64_t _st0 = nv2a_clock_ns();
     SurfaceBinding target;
     memset(&target, 0, sizeof(target));
@@ -2741,7 +2801,16 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
     populate_surface_binding_target(d, color, &target);
     g_nv2a_stats.surf_working.populate_ns += nv2a_clock_ns() - _st0;
 
-    Surface *pg_surface = color ? &pg->surface_color : &pg->surface_zeta;
+    /* Refresh the cache window. We always update this — the cache is
+     * only consulted on the fast path above; here we rebuild it for
+     * the next call. */
+    {
+        int idx = color ? 0 : 1;
+        r->surface_part_cache[idx].last_addr = target.vram_addr;
+        r->surface_part_cache[idx].last_size = target.size;
+        r->surface_part_cache[idx].gen = pg->surface_binding_inputs_gen;
+        r->surface_part_cache[idx].valid = true;
+    }
 
     int64_t _st1 = nv2a_clock_ns();
     bool mem_dirty = false;
@@ -2756,12 +2825,12 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
             qatomic_rcu_read(&ram_list.dirty_memory[DIRTY_MEMORY_NV2A]);
 
         while (page < end_page) {
-            unsigned long idx = page / DIRTY_MEMORY_BLOCK_SIZE;
+            unsigned long bidx = page / DIRTY_MEMORY_BLOCK_SIZE;
             unsigned long ofs = page % DIRTY_MEMORY_BLOCK_SIZE;
             unsigned long num = MIN(end_page - page,
                                     DIRTY_MEMORY_BLOCK_SIZE - ofs);
             mem_dirty |= bitmap_test_and_clear_atomic(
-                blocks->blocks[idx], ofs, num);
+                blocks->blocks[bidx], ofs, num);
             page += num;
         }
     }
@@ -2866,6 +2935,9 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                 pg->surface_binding_dim.clip_height = surface->shape.clip_height;
                 surface->upload_pending |= mem_dirty;
                 pg->surface_zeta.buffer_dirty |= color;
+                if (color) {
+                    pg->surface_binding_inputs_gen++;
+                }
                 should_create = false;
                 g_nv2a_stats.surf_working.lk_hit_ns += nv2a_clock_ns() - _gt1;
             } else {
@@ -2997,6 +3069,7 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                 (r->zeta_binding->width != target.width ||
                  r->zeta_binding->height != target.height)) {
                 pg->surface_zeta.buffer_dirty = true;
+                pg->surface_binding_inputs_gen++;
             }
         }
 
@@ -3071,6 +3144,7 @@ void pgraph_vk_surface_update(NV2AState *d, bool upload, bool color_write,
                    sizeof(SurfaceShape));
             pg->surface_color.buffer_dirty = true;
             pg->surface_zeta.buffer_dirty = true;
+            pg->surface_binding_inputs_gen++;
         }
 
         if (pg->surface_color.buffer_dirty) {

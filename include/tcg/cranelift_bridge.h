@@ -231,6 +231,66 @@ int cranelift_tcg_poll_result(CraneliftTcgContext *ctx,
                               size_t *out_size);
 
 /*
+ * Synchronous-fault unwind metadata for a single compiled TB. Produced
+ * by the Rust translator from cranelift's per-IR-insn SourceLoc tags;
+ * consumed by the C-side unwind index installer.
+ *
+ * Field semantics:
+ *   - n_insns   : number of guest instructions in this TB. Same value
+ *                 as `tb->icount` would carry on the tier-1 side.
+ *   - n_rows    : number of (host_end, loc) rows. Cranelift may split
+ *                 one guest insn across multiple non-contiguous host
+ *                 byte ranges (block reordering, peephole), so n_rows
+ *                 is in general >= n_insns.
+ *   - host_end  : n_rows entries, each a byte offset (relative to the
+ *                 cranelift function's start, i.e. the `code` pointer
+ *                 returned via poll_result) one past the last byte of
+ *                 the corresponding row. Sorted ascending so a fault
+ *                 path can bsearch by host_pc - code_lo.
+ *   - loc       : n_rows entries, parallel to host_end. loc[i] is the
+ *                 0-based guest instruction index covering that range.
+ *   - insn_data : n_insns * INSN_START_WORDS=3 uint64_t entries. Row
+ *                 `loc[i]` of this table holds the values
+ *                 `restore_state_to_opc` consumes when rewinding guest
+ *                 state on synchronous fault.
+ *   - _handle   : opaque pointer for cranelift_tcg_release_unwind.
+ *                 Caller must invoke release exactly once per non-NULL
+ *                 _handle returned by poll_result_v2.
+ *
+ * Lifetime: the pointer fields stay valid until the matching
+ * cranelift_tcg_release_unwind(_handle) call. The C-side installer is
+ * expected to memcpy the arrays into its own slab and immediately call
+ * release; that decouples the C-side index lifetime from the Rust LRU.
+ */
+typedef struct CraneliftTcgUnwindMeta {
+    uint32_t        n_insns;
+    uint32_t        n_rows;
+    const uint32_t *host_end;
+    const uint32_t *loc;
+    const uint64_t *insn_data;
+    void           *_handle;
+} CraneliftTcgUnwindMeta;
+
+/*
+ * Same as cranelift_tcg_poll_result, but additionally fills `out_unwind`
+ * with the per-TB unwind metadata. Pass NULL for `out_unwind` to opt
+ * out of unwind support (rust drops the buffer on poll). Returns 1 on
+ * success, 0 if the queue is empty.
+ */
+int cranelift_tcg_poll_result_v2(CraneliftTcgContext *ctx,
+                                 uint64_t *out_tb_pc,
+                                 const void **out_code,
+                                 size_t *out_size,
+                                 CraneliftTcgUnwindMeta *out_unwind);
+
+/*
+ * Drop the Rust-owned unwind buffer referenced by `_handle`. Must be
+ * called exactly once per non-NULL `_handle` returned by poll_result_v2.
+ * Safe to invoke with NULL (no-op).
+ */
+void cranelift_tcg_release_unwind(void *handle);
+
+/*
  * Blacklist a TB PC range after a crash inside Cranelift code.
  * Future enqueues with `tb_pc` in this range return
  * CRANELIFT_TCG_ERR_BLACKLISTED.

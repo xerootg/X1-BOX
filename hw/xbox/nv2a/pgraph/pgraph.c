@@ -147,6 +147,73 @@ static void pgraph_init_reg_category_table(void)
     };
     for (int i = 0; i < ARRAY_SIZE(pipeline_regs); i++)
         pgraph_reg_category_table[pipeline_regs[i] / 4] |= REG_CAT_PIPELINE;
+
+    /*
+     * Tag regs that feed uniform values. set_psh_uniform_values reads:
+     *   CONTROL_0  (alpha_ref, color write mask, alpha_test, z_persp)
+     *   CONTROL_3  (smooth_shading flag)  -- subset, but treat as full
+     *   SETUPRASTER (point_sprite, z_format, smooth_shading)
+     *   FOGCOLOR, FOGPARAM0/1
+     *   SPECFOGFACTOR0/1, COMBINEFACTOR0/1 (x8 each)
+     *   COMBINECTL, COMBINECOLOR/ALPHA I/O (x8 each), COMBINESPECFOG0/1
+     *   SHADERCTL, SHADERPROG, SHADERCLIPMODE, POINTSIZE
+     *   COLORKEYCOLOR0-3
+     *   BUMPMAT00/01/10/11 (x3 stages), BUMPSCALE1/BUMPOFFSET1 (x3)
+     *   ZOFFSETBIAS, ZOFFSETFACTOR
+     *   WINDOWCLIPX/Y 0-3
+     *   SHADOWCTL, ZCOMPRESSOCCLUDE
+     *   CSV0_C, CSV0_D, CSV1_A, CSV1_B (vsh control regs — uniform-influencing)
+     * Tag every reg in this list with REG_CAT_UNIFORM_INPUT. Dynamic-mask
+     * bits (e.g. CONTROL_0's ALPHAREF) feed uniforms even though they
+     * don't bump shader_state_gen — that's why the bump is non-gated on
+     * non_dyn_changed in pgraph_reg_w.
+     */
+    unsigned int uniform_input_regs[] = {
+        NV_PGRAPH_CONTROL_0,     NV_PGRAPH_CONTROL_3,
+        NV_PGRAPH_SETUPRASTER,   NV_PGRAPH_FOGCOLOR,
+        NV_PGRAPH_FOGPARAM0,     NV_PGRAPH_FOGPARAM1,
+        NV_PGRAPH_SPECFOGFACTOR0, NV_PGRAPH_SPECFOGFACTOR1,
+        NV_PGRAPH_COMBINECTL,    NV_PGRAPH_COMBINESPECFOG0,
+        NV_PGRAPH_COMBINESPECFOG1, NV_PGRAPH_SHADERCTL,
+        NV_PGRAPH_SHADERPROG,    NV_PGRAPH_SHADERCLIPMODE,
+        NV_PGRAPH_POINTSIZE,     NV_PGRAPH_SHADOWCTL,
+        NV_PGRAPH_ZCOMPRESSOCCLUDE,
+        NV_PGRAPH_CSV0_C,        NV_PGRAPH_CSV0_D,
+        NV_PGRAPH_CSV1_A,        NV_PGRAPH_CSV1_B,
+        NV_PGRAPH_ZOFFSETBIAS,   NV_PGRAPH_ZOFFSETFACTOR,
+        NV_PGRAPH_COLORKEYCOLOR0, NV_PGRAPH_COLORKEYCOLOR1,
+        NV_PGRAPH_COLORKEYCOLOR2, NV_PGRAPH_COLORKEYCOLOR3,
+    };
+    for (int i = 0; i < ARRAY_SIZE(uniform_input_regs); i++)
+        pgraph_reg_category_table[uniform_input_regs[i] / 4] |=
+            REG_CAT_UNIFORM_INPUT;
+
+    for (int i = 0; i < 8; i++) {
+        pgraph_reg_category_table[(NV_PGRAPH_COMBINEALPHAI0 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+        pgraph_reg_category_table[(NV_PGRAPH_COMBINEALPHAO0 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+        pgraph_reg_category_table[(NV_PGRAPH_COMBINECOLORI0 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+        pgraph_reg_category_table[(NV_PGRAPH_COMBINECOLORO0 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+        pgraph_reg_category_table[(NV_PGRAPH_COMBINEFACTOR0 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+        pgraph_reg_category_table[(NV_PGRAPH_COMBINEFACTOR1 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+    }
+
+    /* 4 windowclip slots */
+    for (int i = 0; i < 4; i++) {
+        pgraph_reg_category_table[(NV_PGRAPH_WINDOWCLIPX0 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+        pgraph_reg_category_table[(NV_PGRAPH_WINDOWCLIPY0 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+    }
+
+    /* 3 bump-map stages (slots 1..3 in psh.c — stage 0 has no bump map).
+     * BUMPMAT is a 2x2 matrix => 4 regs per stage; BUMPSCALE1/BUMPOFFSET1
+     * are one each per stage. */
+    for (int i = 0; i < 3; i++) {
+        pgraph_reg_category_table[(NV_PGRAPH_BUMPMAT00 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+        pgraph_reg_category_table[(NV_PGRAPH_BUMPMAT01 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+        pgraph_reg_category_table[(NV_PGRAPH_BUMPMAT10 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+        pgraph_reg_category_table[(NV_PGRAPH_BUMPMAT11 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+        pgraph_reg_category_table[(NV_PGRAPH_BUMPSCALE1 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+        pgraph_reg_category_table[(NV_PGRAPH_BUMPOFFSET1 + i * 4) / 4] |= REG_CAT_UNIFORM_INPUT;
+    }
 }
 
 #ifndef XEMU_OPT_METHOD_FAST_TABLE
@@ -1556,6 +1623,141 @@ static int pgraph_set_transform_constant_batched(
     return (int)count;
 }
 
+/*
+ * Phase 2.1: per-NV2A-method-class histogram support.
+ *
+ * Classify each guest NV097 method into one of 7 coarse buckets and
+ * accumulate raw cntvct_el0 ticks per bucket. The accumulator runs at
+ * the slow-path dispatcher entry only — pgraph_method_try_fast (the
+ * 90% lock-free hit path) is too hot for per-call timing.
+ *
+ * Cycle ticks (cntvct_el0) are used instead of nanoseconds because the
+ * ratio across classes is what matters for proportion analysis. Tensor
+ * G4 cntfrq_el0 is 19.2 MHz so 1 tick ~= 52 ns. The MCP tool can
+ * convert if needed; profile.c emits a relative cycle-share percent
+ * already.
+ */
+enum {
+    METHOD_CLASS_VERTEX_DATA = 0,
+    METHOD_CLASS_TEXTURE_STATE,
+    METHOD_CLASS_SHADER_STATE,
+    METHOD_CLASS_LIGHTING,
+    METHOD_CLASS_RENDER_STATE,
+    METHOD_CLASS_INLINE_DRAW,
+    METHOD_CLASS_OTHER,
+};
+
+#if defined(__aarch64__)
+static inline uint64_t pgm_cntvct(void)
+{
+    uint64_t v;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+}
+#else
+static inline uint64_t pgm_cntvct(void)
+{
+    return (uint64_t)nv2a_clock_ns();
+}
+#endif
+
+/* Hot — keep small. Single linear range test per class; falls through
+ * to OTHER for everything unhandled. The ordering is by Halo 2
+ * frequency: VERTEX/TEXTURE_STATE/SHADER_STATE dominate; rare classes
+ * (LIGHTING, RENDER_STATE) tested last. */
+static inline unsigned pgraph_method_classify(unsigned int method)
+{
+    /* VERTEX_DATA: inline vertex immediates + per-vertex-array inputs.
+     * SET_VERTEX3F(0x1500)..SET_WEIGHT4F(0x16C0+12) and the array
+     * descriptors at 0x1720/0x1760 (offset/format). */
+    if (method >= 0x1500 && method < 0x1700) {
+        return METHOD_CLASS_VERTEX_DATA;
+    }
+    if ((method >= 0x1720 && method < 0x1800) ||
+        /* SET_VERTEX_DATA2F_M..SET_VERTEX_DATA4S_M arrays */
+        (method >= 0x1880 && method < 0x1A00) ||
+        (method >= 0x1A00 && method < 0x1B00)) {
+        return METHOD_CLASS_VERTEX_DATA;
+    }
+    /* INLINE_DRAW: BEGIN_END(0x17FC), DRAW_ARRAYS(0x1810),
+     * INLINE_ARRAY(0x1818), INLINE_ELEMENTS via the array range above.
+     * The 17FC/1810/1818 trio is the actual draw kick. */
+    if (method == 0x17FC || method == 0x1810 || method == 0x1818) {
+        return METHOD_CLASS_INLINE_DRAW;
+    }
+    /* TEXTURE_STATE: SET_TEXTURE_OFFSET(0x1B00)..end of texture block
+     * around 0x1BFC; SET_COMBINER_ALPHA_ICW(0x260)..CW1(0x28C); plus
+     * COMBINER_FACTOR/OCW/ICW at 0xA60..0xAE0. */
+    if (method >= 0x1B00 && method < 0x1C00) {
+        return METHOD_CLASS_TEXTURE_STATE;
+    }
+    if (method >= 0x260 && method < 0x290) {
+        return METHOD_CLASS_TEXTURE_STATE;
+    }
+    if (method >= 0xA60 && method < 0xAE0) {
+        return METHOD_CLASS_TEXTURE_STATE;
+    }
+    /* SHADER_STATE: SET_TRANSFORM_PROGRAM(0xB00)..constants(0xB80+)
+     * up to 0xE00; SET_PROJECTION_MATRIX(0x440)..MODEL_VIEW(0x480)..
+     * INVERSE_MODEL_VIEW(0x580)..COMPOSITE(0x680)..TEXTURE_MATRIX
+     * (0x6C0)..end of matrix block (0x780).
+     * SET_TRANSFORM_DATA(0x1E80)..PROGRAM_START(0x1EA0) too. */
+    if (method >= 0xB00 && method < 0xE00) {
+        return METHOD_CLASS_SHADER_STATE;
+    }
+    if (method >= 0x440 && method < 0x780) {
+        return METHOD_CLASS_SHADER_STATE;
+    }
+    if (method >= 0x1E80 && method < 0x1EB0) {
+        return METHOD_CLASS_SHADER_STATE;
+    }
+    /* LIGHTING: SET_LIGHT_AMBIENT(0x1000)..attenuation(0x1068) range
+     * for 8 lights; SET_BACK_LIGHT(0xC00)..end of back-light block
+     * (~0xDFC); SET_SCENE_AMBIENT(0xA10); SET_MATERIAL_EMISSION
+     * (0x3A8)..ALPHA(0x3B4); SET_SPECULAR_PARAMS(0x9E0); EYE_POSITION
+     * (0xA50). */
+    if (method >= 0x1000 && method < 0x14FC) {
+        return METHOD_CLASS_LIGHTING;
+    }
+    if (method >= 0xC00 && method < 0xE00) {
+        /* Falls AFTER shader_state range guard above only because the
+         * 0xC00..0xE00 region overlaps with SET_TRANSFORM_DATA above —
+         * but that earlier check is on 0xB00..0xE00, which already
+         * captures this. So this branch is unreachable. Kept for
+         * defence in depth. */
+        return METHOD_CLASS_LIGHTING;
+    }
+    if (method == 0x3A8 || method == 0x3B4 ||
+        method == 0x9E0 || method == 0xA10 || method == 0xA50) {
+        return METHOD_CLASS_LIGHTING;
+    }
+    /* RENDER_STATE: SET_SURFACE_*(0x200..0x214), SET_CONTROL0(0x290),
+     * blend/depth/stencil/cull state at 0x300..0x3A0. */
+    if (method >= 0x200 && method < 0x215) {
+        return METHOD_CLASS_RENDER_STATE;
+    }
+    if (method == 0x290) {
+        return METHOD_CLASS_RENDER_STATE;
+    }
+    if (method >= 0x300 && method < 0x3A0) {
+        return METHOD_CLASS_RENDER_STATE;
+    }
+    return METHOD_CLASS_OTHER;
+}
+
+static inline void pgraph_method_account(unsigned cls, uint64_t dt)
+{
+    g_nv2a_stats.method_class_stats.count[cls]  += 1;
+    g_nv2a_stats.method_class_stats.cycles[cls] += dt;
+}
+
+/* Macro: wrap each return path in pgraph_method to fold the accumulator
+ * into a single tail. Requires _pgm_t0_cyc + _pgm_class to be in scope. */
+#define PGM_RETURN(value) do { \
+    pgraph_method_account(_pgm_class, pgm_cntvct() - _pgm_t0_cyc); \
+    return (value); \
+} while (0)
+
 int pgraph_method(NV2AState *d, unsigned int subchannel,
                    unsigned int method, uint32_t parameter,
                    uint32_t *parameters, size_t num_words_available,
@@ -1565,14 +1767,20 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
 
     PGRAPHState *pg = &d->pgraph;
 
+    /* Phase 2.1: classify + start cycle counter. The classify is a
+     * static-inline range test; the cntvct read is a single MRS on
+     * arm64. Combined cost ~5-10 ns per call. */
+    unsigned _pgm_class = pgraph_method_classify(method);
+    uint64_t _pgm_t0_cyc = pgm_cntvct();
+
     /* Hot path: SET_TRANSFORM_CONSTANT — ~75% redundant in Halo 2.
      * See pgraph_set_transform_constant_batched for rationale. */
     if (inc && method >= NV097_SET_TRANSFORM_CONSTANT &&
         method < NV097_SET_TRANSFORM_CONSTANT + 32 * 4 &&
         subchannel == pg->last_subchannel &&
         pg->cached_graphics_class == NV_KELVIN_PRIMITIVE) {
-        return pgraph_set_transform_constant_batched(
-            pg, method, parameters, num_words_available);
+        PGM_RETURN(pgraph_set_transform_constant_batched(
+            pg, method, parameters, num_words_available));
     }
 
 #if XEMU_OPT_METHOD_FAST_TABLE
@@ -1633,7 +1841,7 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
             }
 coalesce_done:
             g_nv2a_stats.cpu_working.method_fast_hit += consumed;
-            return consumed;
+            PGM_RETURN(consumed);
         }
 slow_path:
         ;
@@ -1834,12 +2042,12 @@ slow_path:
         goto unhandled;
     }
 
-    return num_processed;
+    PGM_RETURN(num_processed);
 
 unhandled:
     trace_nv2a_pgraph_method_unhandled(subchannel, pg->cached_graphics_class,
                                            method, parameter);
-    return num_processed;
+    PGM_RETURN(num_processed);
 }
 
 DEF_METHOD(NV097, SET_OBJECT)
@@ -2166,12 +2374,14 @@ DEF_METHOD(NV097, SET_CONTEXT_DMA_COLOR)
 
     pg->dma_color = parameter;
     pg->surface_color.buffer_dirty = true;
+    pg->surface_binding_inputs_gen++;
 }
 
 DEF_METHOD(NV097, SET_CONTEXT_DMA_ZETA)
 {
     pg->dma_zeta = parameter;
     pg->surface_zeta.buffer_dirty = true;
+    pg->surface_binding_inputs_gen++;
 }
 
 DEF_METHOD(NV097, SET_CONTEXT_DMA_VERTEX_A)
@@ -2204,6 +2414,7 @@ DEF_METHOD(NV097, SET_SURFACE_CLIP_HORIZONTAL)
         GET_MASK(parameter, NV097_SET_SURFACE_CLIP_HORIZONTAL_X);
     pg->surface_shape.clip_width =
         GET_MASK(parameter, NV097_SET_SURFACE_CLIP_HORIZONTAL_WIDTH);
+    pg->surface_binding_inputs_gen++;
 }
 
 DEF_METHOD(NV097, SET_SURFACE_CLIP_VERTICAL)
@@ -2214,6 +2425,7 @@ DEF_METHOD(NV097, SET_SURFACE_CLIP_VERTICAL)
         GET_MASK(parameter, NV097_SET_SURFACE_CLIP_VERTICAL_Y);
     pg->surface_shape.clip_height =
         GET_MASK(parameter, NV097_SET_SURFACE_CLIP_VERTICAL_HEIGHT);
+    pg->surface_binding_inputs_gen++;
 }
 
 DEF_METHOD(NV097, SET_SURFACE_FORMAT)
@@ -2243,6 +2455,7 @@ DEF_METHOD(NV097, SET_SURFACE_FORMAT)
         pg->surface_color.buffer_dirty = true;
         pg->surface_zeta.buffer_dirty = true;
     }
+    pg->surface_binding_inputs_gen++;
 }
 
 DEF_METHOD(NV097, SET_SURFACE_PITCH)
@@ -2256,6 +2469,7 @@ DEF_METHOD(NV097, SET_SURFACE_PITCH)
 
     pg->surface_zeta.buffer_dirty |= (pg->surface_zeta.pitch != zeta_pitch);
     pg->surface_zeta.pitch = zeta_pitch;
+    pg->surface_binding_inputs_gen++;
 }
 
 DEF_METHOD(NV097, SET_SURFACE_COLOR_OFFSET)
@@ -2263,6 +2477,7 @@ DEF_METHOD(NV097, SET_SURFACE_COLOR_OFFSET)
     d->pgraph.renderer->ops.surface_update(d, false, true, true);
     pg->surface_color.buffer_dirty |= (pg->surface_color.offset != parameter);
     pg->surface_color.offset = parameter;
+    pg->surface_binding_inputs_gen++;
 }
 
 DEF_METHOD(NV097, SET_SURFACE_ZETA_OFFSET)
@@ -2270,6 +2485,7 @@ DEF_METHOD(NV097, SET_SURFACE_ZETA_OFFSET)
     d->pgraph.renderer->ops.surface_update(d, false, true, true);
     pg->surface_zeta.buffer_dirty |= (pg->surface_zeta.offset != parameter);
     pg->surface_zeta.offset = parameter;
+    pg->surface_binding_inputs_gen++;
 }
 
 DEF_METHOD_INC(NV097, SET_COMBINER_ALPHA_ICW)
@@ -3315,7 +3531,10 @@ DEF_METHOD_INC(NV097, SET_VERTEX3F)
     pgraph_allocate_inline_buffer_vertices(pg, NV2A_VERTEX_ATTR_POSITION);
     attribute->inline_value[slot] = *(float*)&parameter;
     attribute->inline_value[3] = 1.0f;
+    /* any_reg_gen for draw-queue equivalence; uniform_inputs_gen for
+     * the per-binding uniform fast-skip in pgraph_vk_update_shader_uniforms. */
     pg->any_reg_gen++;
+    pg->uniform_inputs_gen++;
     if (slot == 2) {
         pgraph_finish_inline_buffer_vertex(pg);
     }
@@ -3438,6 +3657,7 @@ DEF_METHOD_INC(NV097, SET_VERTEX4F)
     pgraph_allocate_inline_buffer_vertices(pg, NV2A_VERTEX_ATTR_POSITION);
     attribute->inline_value[slot] = *(float*)&parameter;
     pg->any_reg_gen++;
+    pg->uniform_inputs_gen++;
     if (slot == 3) {
         pgraph_finish_inline_buffer_vertex(pg);
     }
@@ -3452,6 +3672,7 @@ DEF_METHOD(NV097, SET_FOG_COORD)
     attribute->inline_value[2] = attribute->inline_value[0];
     attribute->inline_value[3] = attribute->inline_value[0];
     pg->any_reg_gen++;
+    pg->uniform_inputs_gen++;
 }
 
 DEF_METHOD(NV097, SET_WEIGHT1F)
@@ -3463,6 +3684,7 @@ DEF_METHOD(NV097, SET_WEIGHT1F)
     attribute->inline_value[2] = 0.f;
     attribute->inline_value[3] = 1.f;
     pg->any_reg_gen++;
+    pg->uniform_inputs_gen++;
 }
 
 DEF_METHOD_INC(NV097, SET_NORMAL3S)
@@ -3477,6 +3699,7 @@ DEF_METHOD_INC(NV097, SET_NORMAL3S)
     val = parameter >> 16;
     attribute->inline_value[part * 2 + 1] = MAX(-1.0f, (float)val / 32767.0f);
     pg->any_reg_gen++;
+    pg->uniform_inputs_gen++;
 }
 
 #define SET_VERTEX_ATTRIBUTE_4S(command, attr_index)                     \
@@ -3490,6 +3713,7 @@ DEF_METHOD_INC(NV097, SET_NORMAL3S)
         attribute->inline_value[part * 2 + 1] =                            \
             (float)(int16_t)(parameter >> 16);                             \
         pg->any_reg_gen++;                                                 \
+        pg->uniform_inputs_gen++;                                          \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_TEXCOORD0_4S)
@@ -3523,6 +3747,7 @@ DEF_METHOD_INC(NV097, SET_TEXCOORD3_4S)
         attribute->inline_value[2] = 0.0f;                                 \
         attribute->inline_value[3] = 1.0f;                                 \
         pg->any_reg_gen++;                                                 \
+        pg->uniform_inputs_gen++;                                          \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_TEXCOORD0_2S)
@@ -3555,6 +3780,7 @@ DEF_METHOD_INC(NV097, SET_TEXCOORD3_2S)
         attribute->inline_value[slot] = *(float*)&parameter;               \
         attribute->inline_value[3] = 1.0f;                                 \
         pg->any_reg_gen++;                                                 \
+        pg->uniform_inputs_gen++;                                          \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_DIFFUSE_COLOR3F)
@@ -3576,6 +3802,7 @@ DEF_METHOD_INC(NV097, SET_SPECULAR_COLOR3F)
         pgraph_allocate_inline_buffer_vertices(pg, (attr_index));          \
         attribute->inline_value[slot] = *(float*)&parameter;               \
         pg->any_reg_gen++;                                                 \
+        pg->uniform_inputs_gen++;                                          \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_NORMAL3F)
@@ -3631,6 +3858,7 @@ DEF_METHOD_INC(NV097, SET_WEIGHT2F)
     attribute->inline_value[2] = 0.0f;
     attribute->inline_value[3] = 1.0f;
     pg->any_reg_gen++;
+    pg->uniform_inputs_gen++;
 }
 
 DEF_METHOD_INC(NV097, SET_WEIGHT3F)
@@ -3642,6 +3870,7 @@ DEF_METHOD_INC(NV097, SET_WEIGHT3F)
     attribute->inline_value[slot] = *(float*)&parameter;
     attribute->inline_value[3] = 1.0f;
     pg->any_reg_gen++;
+    pg->uniform_inputs_gen++;
 }
 
 #define SET_VERTEX_ATRIBUTE_TEX_2F(command, attr_index)                    \
@@ -3653,6 +3882,7 @@ DEF_METHOD_INC(NV097, SET_WEIGHT3F)
         attribute->inline_value[2] = 0.0f;                                 \
         attribute->inline_value[3] = 1.0f;                                 \
         pg->any_reg_gen++;                                                 \
+        pg->uniform_inputs_gen++;                                          \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_TEXCOORD0_2F)
@@ -3690,6 +3920,7 @@ DEF_METHOD_INC(NV097, SET_TEXCOORD3_2F)
         attribute->inline_value[2] = ((parameter >> 16) & 0xFF) / 255.0f;  \
         attribute->inline_value[3] = ((parameter >> 24) & 0xFF) / 255.0f;  \
         pg->any_reg_gen++;                                                 \
+        pg->uniform_inputs_gen++;                                          \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_DIFFUSE_COLOR4UB)

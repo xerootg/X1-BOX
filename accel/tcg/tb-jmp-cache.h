@@ -15,40 +15,31 @@
 /*
  * Sizing the per-CPU TB jump cache.
  *
- * Default upstream: 12 bits → 4096 entries × 16 B = 64 KiB per CPU.
- * Diagnosed (2026-05-21, Halo 2 in-game @ scale=3): the X4-pinned vCPU
- * thread spends 10.93% in qht_lookup_custom + 5.13% in helper_lookup_tb_ptr
- * + 4.10% in tb_lookup_cmp — ~21% of TCG time. The hot path of
- * tb_lookup() returns via the per-CPU jc cache; the 21% number is what
- * we pay when that cache misses and falls through to the global QHT.
+ * 2026-05-25 (Zenfone 10 / Snapdragon 8 Gen 2 X3, 1 MiB private L2):
+ * tried 15 bits (32 K entries × 16 B = 512 KiB per CPU) on the
+ * hypothesis that the prior 14-bit regression was L2 saturation on the
+ * Pixel-only A720 (256 KiB L2), and X3's bigger L2 would absorb it.
+ * Halo 2 gameplay callgraph said otherwise:
  *
- * Working-set sizing math from the profile: at 13.9 FPS, vCPU is doing
- * roughly 50 ms of guest work per frame. With Halo 2's typical TB span
- * of ~50 instructions, that's ~600 k TBs touched per frame, sampling
- * something like 20-40 k unique TBs in steady-state. A 4 k-entry direct-
- * mapped cache thrashes hard against a 20 k unique set (~5x oversubscribed),
- * giving a hit rate around 60-70%. Bumping to 13 bits (8192 entries,
- * 128 KiB) halves the conflict-miss rate without overflowing the X4's
- * 256 KiB L2 — and since each lookup also touches the TB struct itself
- * (cs_base/flags/cflags compare), the working set per lookup is already
- * larger than a single line, so spilling the cache to L2 is a small marginal
- * cost compared to halving qht trips.
+ *     symbol                         8K (13b)   32K (15b)
+ *     helper_lookup_tb_ptr            3.62 %     9.78 %
+ *     qht_lookup_custom               2.76 %     4.97 %
+ *     tb_lookup_cmp                   ~0   %     1.56 %
+ *     tcg_flush_jmp_cache             ~0   %     1.75 %
  *
- * Net expected gain: qht_lookup_custom + tb_lookup_cmp drop from ~15%
- * combined to ~8%, recovering ~7% of TCG-per-frame on this scene.
+ * The 32K cache LOST hit rate too — qht_lookup_custom went UP, not down.
+ * Direct-mapped + 4× larger = more cold slots that displace hot ones
+ * under the working-set hash pattern Halo 2 generates. Plus
+ * tcg_flush_jmp_cache is a linear walk so the 4× bigger array costs 4×
+ * more per flush, and flushes happen often (CR3, tb_phys_invalidate).
  *
- * Followup #1 (2026-05-22, in-game): tried 14 bits (16 K entries =
- * 256 KiB exactly the X4 L2 size). qht_lookup_custom did NOT drop —
- * went up 4.07 → 4.52 — and `cpu_exec_loop` jumped to 4.53% on the
- * title screen (was ~1%), with tcg_flush_jmp_cache also up. The L2
- * saturation hypothesis won: 256 KiB jc + TB struct touches + other
- * working set evicts each other every lookup. Calibrated back to 13
- * bits (128 KiB jc) where qht stays bounded and flush walks are 2×
- * cheaper.
+ * 13 bits (8192 entries × 16 B = 128 KiB) is the calibrated optimum on
+ * both Pixel A720 (256 KiB L2) and Zenfone X3 (1 MiB L2). Fix forward
+ * means reverting size on fresh proof, not blind reverts on stale
+ * comments — and the proof now exists.
  *
- * If a future profile shows the working set has grown again, the next
- * lever is an associative or victim-cache structure rather than more
- * direct-mapped entries — at 13 bits we're already at half-L2.
+ * Next lever, if a future profile shows the working set has grown: an
+ * associative or victim-cache structure, not more direct-mapped entries.
  */
 #define TB_JMP_CACHE_BITS 13
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)

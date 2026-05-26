@@ -21,6 +21,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/fast-hash.h"
+#include "hw/xbox/nv2a/debug.h"
 #include "prim_rewrite.h"
 
 void pgraph_prim_rewrite_init(PrimRewriteBuf *buf)
@@ -34,6 +36,157 @@ void pgraph_prim_rewrite_finalize(PrimRewriteBuf *buf)
     g_free(buf->data);
     buf->data = NULL;
     buf->capacity = 0;
+}
+
+void pgraph_prim_rewrite_cache_init(PrimRewriteCache *cache)
+{
+    memset(cache, 0, sizeof(*cache));
+}
+
+void pgraph_prim_rewrite_cache_finalize(PrimRewriteCache *cache)
+{
+    for (unsigned i = 0; i < PRIM_REWRITE_CACHE_ENTRIES; i++) {
+        g_free(cache->entries[i].indices);
+        cache->entries[i].indices = NULL;
+    }
+    memset(cache, 0, sizeof(*cache));
+}
+
+void pgraph_prim_rewrite_cache_invalidate(PrimRewriteCache *cache)
+{
+    /* Drop validity, keep allocations so the next miss reuses them. */
+    for (unsigned i = 0; i < PRIM_REWRITE_CACHE_ENTRIES; i++) {
+        cache->entries[i].valid = false;
+    }
+    cache->lru_seq = 0;
+}
+
+/*
+ * Secondary collision-guard hash. Three sample points + count;
+ * cheap to compute, catches the trivial "same length different
+ * mesh" collisions without the full memcmp.
+ */
+static inline uint32_t prim_secondary_hash_indexed(
+        const uint32_t *idx, unsigned count)
+{
+    if (count == 0) {
+        return 0;
+    }
+    uint32_t a = idx[0];
+    uint32_t b = idx[count / 2];
+    uint32_t c = idx[count - 1];
+    return count * 0x9E3779B1u ^ (a * 0x85EBCA77u) ^
+           (b * 0xC2B2AE3Du) ^ (c * 0x27D4EB2Fu);
+}
+
+static inline uint32_t prim_secondary_hash_ranges(
+        const int32_t *starts, const int32_t *counts, unsigned num_ranges)
+{
+    if (num_ranges == 0) {
+        return 0;
+    }
+    uint32_t a = (uint32_t)starts[0];
+    uint32_t b = (uint32_t)counts[0];
+    uint32_t c = (uint32_t)starts[num_ranges - 1];
+    uint32_t d = (uint32_t)counts[num_ranges - 1];
+    return num_ranges * 0x9E3779B1u ^ (a * 0x85EBCA77u) ^
+           (b * 0xC2B2AE3Du) ^ (c * 0x27D4EB2Fu) ^
+           (d * 0x165667B1u);
+}
+
+static inline bool prim_mode_equal(const PrimAssemblyState *a,
+                                   const PrimAssemblyState *b)
+{
+    return a->primitive_mode == b->primitive_mode &&
+           a->polygon_mode == b->polygon_mode &&
+           a->last_provoking == b->last_provoking &&
+           a->flat_shading == b->flat_shading;
+}
+
+/*
+ * Look up a cached entry. Returns the index in `cache->entries` on
+ * hit, -1 on miss. Bumps lru_seq on hit.
+ */
+static int prim_cache_lookup(PrimRewriteCache *cache,
+                             uint64_t key_hash,
+                             uint32_t secondary_hash,
+                             const PrimAssemblyState *mode,
+                             uint32_t input_count)
+{
+    for (unsigned i = 0; i < PRIM_REWRITE_CACHE_ENTRIES; i++) {
+        PrimRewriteCacheEntry *e = &cache->entries[i];
+        if (!e->valid) {
+            continue;
+        }
+        if (e->key_hash == key_hash &&
+            e->secondary_hash == secondary_hash &&
+            e->input_count == input_count &&
+            prim_mode_equal(&e->mode, mode)) {
+            e->lru_seq = ++cache->lru_seq;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * Pick a slot for a fresh insertion. Prefers an invalid slot, falls
+ * back to the LRU entry. Returns the chosen index; sets *was_eviction
+ * to true if we displaced a valid entry.
+ */
+static unsigned prim_cache_pick_victim(PrimRewriteCache *cache,
+                                       bool *was_eviction)
+{
+    unsigned victim = 0;
+    uint32_t min_seq = UINT32_MAX;
+    bool any_invalid = false;
+    for (unsigned i = 0; i < PRIM_REWRITE_CACHE_ENTRIES; i++) {
+        PrimRewriteCacheEntry *e = &cache->entries[i];
+        if (!e->valid) {
+            victim = i;
+            any_invalid = true;
+            break;
+        }
+        if (e->lru_seq < min_seq) {
+            min_seq = e->lru_seq;
+            victim = i;
+        }
+    }
+    *was_eviction = !any_invalid;
+    return victim;
+}
+
+static void prim_cache_store(PrimRewriteCache *cache,
+                             uint64_t key_hash,
+                             uint32_t secondary_hash,
+                             const PrimAssemblyState *mode,
+                             uint32_t input_count,
+                             const uint32_t *indices,
+                             unsigned num_indices)
+{
+    bool was_eviction = false;
+    unsigned slot = prim_cache_pick_victim(cache, &was_eviction);
+    PrimRewriteCacheEntry *e = &cache->entries[slot];
+
+    if (was_eviction) {
+        g_nv2a_stats.shader_stats.prim_rewrite_cache_evicts++;
+    }
+
+    if (e->indices_cap < num_indices) {
+        unsigned new_cap = MAX(num_indices, e->indices_cap ? e->indices_cap * 2 : 32);
+        e->indices = g_realloc(e->indices, new_cap * sizeof(uint32_t));
+        e->indices_cap = new_cap;
+    }
+    if (num_indices > 0) {
+        memcpy(e->indices, indices, num_indices * sizeof(uint32_t));
+    }
+    e->num_indices = num_indices;
+    e->key_hash = key_hash;
+    e->secondary_hash = secondary_hash;
+    e->mode = *mode;
+    e->input_count = input_count;
+    e->lru_seq = ++cache->lru_seq;
+    e->valid = true;
 }
 
 static void ensure_capacity(PrimRewriteBuf *buf, unsigned int needed)
@@ -436,7 +589,66 @@ static void rewrite_indices(PrimRewrite *r, const PrimAssemblyState *mode,
     }
 }
 
+/*
+ * Build a stable 64-bit key from (mode, num_ranges, starts[], counts[]).
+ * Mode bits are folded into the seed so two different rewrite shapes
+ * with the same range layout don't collide.
+ */
+static uint64_t prim_key_ranges(PrimAssemblyState mode,
+                                const int32_t *starts,
+                                const int32_t *counts,
+                                unsigned int num_ranges)
+{
+    struct {
+        uint8_t pm;
+        uint8_t poly;
+        uint8_t lp;
+        uint8_t flat;
+        uint32_t num_ranges;
+    } header = {
+        (uint8_t)mode.primitive_mode,
+        (uint8_t)mode.polygon_mode,
+        (uint8_t)mode.last_provoking,
+        (uint8_t)mode.flat_shading,
+        num_ranges,
+    };
+    uint64_t h = fast_hash((const uint8_t *)&header, sizeof(header));
+    if (num_ranges > 0) {
+        h ^= fast_hash((const uint8_t *)starts,
+                       num_ranges * sizeof(int32_t));
+        h ^= fast_hash((const uint8_t *)counts,
+                       num_ranges * sizeof(int32_t));
+    }
+    return h;
+}
+
+static uint64_t prim_key_indexed(PrimAssemblyState mode,
+                                 const uint32_t *input_indices,
+                                 unsigned int num_input_indices)
+{
+    struct {
+        uint8_t pm;
+        uint8_t poly;
+        uint8_t lp;
+        uint8_t flat;
+        uint32_t num_input_indices;
+    } header = {
+        (uint8_t)mode.primitive_mode,
+        (uint8_t)mode.polygon_mode,
+        (uint8_t)mode.last_provoking,
+        (uint8_t)mode.flat_shading,
+        num_input_indices,
+    };
+    uint64_t h = fast_hash((const uint8_t *)&header, sizeof(header));
+    if (num_input_indices > 0) {
+        h ^= fast_hash((const uint8_t *)input_indices,
+                       num_input_indices * sizeof(uint32_t));
+    }
+    return h;
+}
+
 PrimRewrite pgraph_prim_rewrite_ranges(PrimRewriteBuf *buf,
+                                       PrimRewriteCache *cache,
                                        PrimAssemblyState mode,
                                        const int32_t *starts,
                                        const int32_t *counts,
@@ -452,13 +664,34 @@ PrimRewrite pgraph_prim_rewrite_ranges(PrimRewriteBuf *buf,
     }
 
     unsigned int total_max_output = 0;
+    unsigned int total_input = 0;
     for (unsigned int r = 0; r < num_ranges; r++) {
         total_max_output += max_output_indices(mode.primitive_mode,
                                                mode.polygon_mode, counts[r]);
+        total_input += (unsigned int)counts[r];
     }
 
     if (total_max_output == 0) {
         return result;
+    }
+
+    if (cache) {
+        uint64_t key = prim_key_ranges(mode, starts, counts, num_ranges);
+        uint32_t sec = prim_secondary_hash_ranges(starts, counts, num_ranges);
+        int hit = prim_cache_lookup(cache, key, sec, &mode, total_input);
+        if (hit >= 0) {
+            PrimRewriteCacheEntry *e = &cache->entries[hit];
+            ensure_capacity(buf, e->num_indices);
+            if (e->num_indices > 0) {
+                memcpy(buf->data, e->indices,
+                       e->num_indices * sizeof(uint32_t));
+            }
+            result.indices = buf->data;
+            result.num_indices = e->num_indices;
+            g_nv2a_stats.shader_stats.prim_rewrite_cache_hits++;
+            return result;
+        }
+        g_nv2a_stats.shader_stats.prim_rewrite_cache_misses++;
     }
 
     ensure_capacity(buf, total_max_output);
@@ -472,10 +705,18 @@ PrimRewrite pgraph_prim_rewrite_ranges(PrimRewriteBuf *buf,
         rewrite_indices(&result, &mode, NULL, starts[r], counts[r]);
     }
 
+    if (cache) {
+        uint64_t key = prim_key_ranges(mode, starts, counts, num_ranges);
+        uint32_t sec = prim_secondary_hash_ranges(starts, counts, num_ranges);
+        prim_cache_store(cache, key, sec, &mode, total_input,
+                         result.indices, result.num_indices);
+    }
+
     return result;
 }
 
 PrimRewrite pgraph_prim_rewrite_indexed(PrimRewriteBuf *buf,
+                                        PrimRewriteCache *cache,
                                         PrimAssemblyState mode,
                                         const uint32_t *input_indices,
                                         unsigned int num_input_indices)
@@ -496,10 +737,38 @@ PrimRewrite pgraph_prim_rewrite_indexed(PrimRewriteBuf *buf,
         return result;
     }
 
+    if (cache) {
+        uint64_t key = prim_key_indexed(mode, input_indices, num_input_indices);
+        uint32_t sec = prim_secondary_hash_indexed(input_indices,
+                                                   num_input_indices);
+        int hit = prim_cache_lookup(cache, key, sec, &mode, num_input_indices);
+        if (hit >= 0) {
+            PrimRewriteCacheEntry *e = &cache->entries[hit];
+            ensure_capacity(buf, e->num_indices);
+            if (e->num_indices > 0) {
+                memcpy(buf->data, e->indices,
+                       e->num_indices * sizeof(uint32_t));
+            }
+            result.indices = buf->data;
+            result.num_indices = e->num_indices;
+            g_nv2a_stats.shader_stats.prim_rewrite_cache_hits++;
+            return result;
+        }
+        g_nv2a_stats.shader_stats.prim_rewrite_cache_misses++;
+    }
+
     ensure_capacity(buf, max_output);
     result.indices = buf->data;
 
     rewrite_indices(&result, &mode, input_indices, 0, num_input_indices);
+
+    if (cache) {
+        uint64_t key = prim_key_indexed(mode, input_indices, num_input_indices);
+        uint32_t sec = prim_secondary_hash_indexed(input_indices,
+                                                   num_input_indices);
+        prim_cache_store(cache, key, sec, &mode, num_input_indices,
+                         result.indices, result.num_indices);
+    }
 
     return result;
 }

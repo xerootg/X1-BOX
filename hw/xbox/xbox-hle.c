@@ -1991,6 +1991,9 @@ static uint64_t g_idle_loop_dpc_pending;
 static uint64_t g_idle_loop_next_thread_pending;
 static uint64_t g_idle_loop_halts;            /* CPU_INTERRUPT_HALT set (legacy) */
 static uint64_t g_idle_loop_yields;           /* host nanosleep entered */
+/* Forward-declared; defined after g_idle_loop_yield_ns is in scope. */
+void xbox_hle_get_idle_stats(uint64_t *idle_iters, uint64_t *yields,
+                              uint64_t *yield_ns_total);
 
 /*
  * Boot gate RESTORED 2026-05-24 — removing it caused Halo 2 chain
@@ -2020,8 +2023,45 @@ static uint64_t g_idle_loop_yields;           /* host nanosleep entered */
  * Kept the proven config: 50µs nanosleep with BQL drop, every 16th
  * idle-spin iter. Audio gets its BQL window, governor sees demand.
  */
+/*
+ * KiIdleLoop yield duration: 50µs.
+ *
+ * 2026-05-25 false-positive bisection: vCPU thread on Zenfone X3
+ * shows 24.7% Sleep% / 6240 vCS/sec, almost entirely from this
+ * nanosleep. Cut to 20µs to recover the sleep budget — FPS DIDN'T
+ * MOVE. Why: vCPU sleep here isn't backpressure, it's the Xbox
+ * guest's own KiIdleLoop waiting for the next 1 kHz timer tick.
+ * Shortening the host yield means we wake before the timer fires,
+ * spin useless guest-idle iters (DPC list still empty, NextThread
+ * still null), hit /16 gate again, yield again. Total host-idle
+ * time per frame stays pinned to the Xbox guest's 1 kHz tick
+ * cadence × (idle ticks between renderable frames). We just burned
+ * extra host CPU to spin the guest's idle loop more.
+ *
+ * Lesson: Sleep% on the vCPU is a SYMPTOM of the guest's idle
+ * pattern, not a CAUSE of low FPS. To raise FPS we need fewer
+ * cycles per sim tick (faster JIT codegen / cranelift coverage /
+ * fewer dispatches), not less host sleep.
+ *
+ * Kept the 50µs that the original bisection landed on for audio /
+ * BQL fairness.
+ */
 #define IDLE_LOOP_YIELD_NS_DEFAULT  50000  /* 50µs */
 static long g_idle_loop_yield_ns = IDLE_LOOP_YIELD_NS_DEFAULT;
+
+void xbox_hle_get_idle_stats(uint64_t *idle_iters, uint64_t *yields,
+                              uint64_t *yield_ns_total)
+{
+    if (idle_iters) *idle_iters = qatomic_read(&g_idle_loop_idle);
+    if (yields)     *yields     = qatomic_read(&g_idle_loop_yields);
+    if (yield_ns_total) {
+        /* Approximation: each yield requested g_idle_loop_yield_ns
+         * of sleep. Actual wall-time is at least this much (Linux
+         * scheduler granularity rounds UP, never down). */
+        *yield_ns_total = qatomic_read(&g_idle_loop_yields) *
+                          (uint64_t)g_idle_loop_yield_ns;
+    }
+}
 
 static bool hle_ki_idle_loop_spin(X86CPU *cpu)
 {

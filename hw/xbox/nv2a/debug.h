@@ -151,39 +151,103 @@ typedef struct ShaderPipelineStats {
     unsigned int spv_cache_misses;
     unsigned int pipeline_cache_disk_loaded;
     unsigned int pipeline_cache_disk_saved;
+    /* pgraph_vk_update_shader_uniforms fast-skip hit rate. Hits are
+     * calls where (a) no constant/light dirty bit set, (b) same shader
+     * binding as last call, (c) layout populated, (d) uniform_inputs_gen
+     * hasn't moved -- meaning cached UBO bytes still valid and we skip
+     * ~15 KB of memcpy via apply_uniform_updates. */
+    unsigned int uniform_fast_skip_hits;
+    unsigned int uniform_fast_skip_misses;
+    /* Index-rewrite LRU cache (pgraph/prim_rewrite.c) — Halo 2 redraws
+     * the same meshes per-frame so the rewrite output is highly
+     * repetitive. Hits avoid the rewrite_indices() loop entirely.
+     * Evicts is the count of LRU evictions (cache-full reuses). */
+    unsigned int prim_rewrite_cache_hits;
+    unsigned int prim_rewrite_cache_misses;
+    unsigned int prim_rewrite_cache_evicts;
 } ShaderPipelineStats;
+
+/* Per-NV2A-method-class histogram (Phase 2.1).
+ *
+ * Coarse classification of every method that takes the pgraph_method
+ * slow path. Updated at function-entry and accumulated at every return
+ * site. Only the slow path is instrumented — pgraph_method_try_fast is
+ * too hot for per-call timing and short-circuits the dispatcher anyway.
+ *
+ * cycles[] is cumulative cntvct_el0 ticks (NOT nanoseconds — the ratio
+ * across classes is what matters for proportion analysis; absolute
+ * numbers convert at cntfrq_el0 = 19.2 MHz on Tensor G4, ~52 ns/tick).
+ *
+ * NB: the index order must match METHOD_CLASS_* enum order in pgraph.c.
+ */
+#define NV2A_METHOD_CLASS_COUNT 7
+typedef struct MethodClassStats {
+    uint64_t cycles[NV2A_METHOD_CLASS_COUNT];
+    uint64_t count[NV2A_METHOD_CLASS_COUNT];
+} MethodClassStats;
 
 typedef struct FramePhaseTimingWork {
     int64_t surface_update_ns;
+    int64_t surface_update_max_ns;
     int64_t texture_upload_ns;
+    int64_t texture_upload_max_ns;
     int64_t shader_compile_ns;
+    int64_t shader_compile_max_ns;
     int64_t draw_dispatch_ns;
+    int64_t draw_dispatch_max_ns;
     int64_t finish_ns;
+    int64_t finish_max_ns;
     int64_t flip_idle_ns;
+    int64_t flip_idle_max_ns;
     int64_t fifo_idle_ns;
+    int64_t fifo_idle_max_ns;
     int64_t fifo_idle_frame_ns;
+    int64_t fifo_idle_frame_max_ns;
     int64_t fifo_idle_starve_ns;
+    int64_t fifo_idle_starve_max_ns;
     bool post_flip;
     /* Sub-phases within draw_dispatch */
     int64_t draw_vtx_attr_ns;
+    int64_t draw_vtx_attr_max_ns;
     int64_t draw_vtx_sync_ns;
+    int64_t draw_vtx_sync_max_ns;
     int64_t draw_prim_rw_ns;
+    int64_t draw_prim_rw_max_ns;
     int64_t draw_pipeline_ns;
+    int64_t draw_pipeline_max_ns;
     int64_t draw_desc_set_ns;
+    int64_t draw_desc_set_max_ns;
     int64_t draw_setup_ns;
+    int64_t draw_setup_max_ns;
     int64_t draw_vk_cmd_ns;
+    int64_t draw_vk_cmd_max_ns;
     /* Sub-phases within draw_pipeline (create_pipeline) */
     int64_t pipe_bind_tex_ns;
+    int64_t pipe_bind_tex_max_ns;
     int64_t pipe_bind_shd_ns;
+    int64_t pipe_bind_shd_max_ns;
     int64_t pipe_lookup_ns;
+    int64_t pipe_lookup_max_ns;
     /* Sub-phases within finish */
     int64_t finish_fence_ns;
+    int64_t finish_fence_max_ns;
     int64_t finish_submit_ns;
+    int64_t finish_submit_max_ns;
     /* GPU-side timestamp measurements */
     int64_t gpu_total_ns;
+    int64_t gpu_total_max_ns;
     int64_t gpu_render_ns;
+    int64_t gpu_render_max_ns;
     int64_t gpu_nonrender_ns;
+    int64_t gpu_nonrender_max_ns;
     int gpu_rp_count;
+    /* Phase 2.2: draws_per_submit ratio components.
+     * draws_this_window counts vkCmdDraw{,Indexed,Indirect} calls; the
+     * sample for `submits_this_window` is bumped at pgraph_vk_finish
+     * entry (one finish == one submit boundary). profile.c snapshot
+     * computes the ratio and zeroes both. */
+    uint32_t draws_this_window;
+    uint32_t submits_this_window;
 } FramePhaseTimingWork;
 
 typedef struct FramePhaseTimingStats {
@@ -217,6 +281,19 @@ typedef struct FramePhaseTimingStats {
     float gpu_render_ms;
     float gpu_nonrender_ms;
     float gpu_rp_count;
+    /* Phase 2.2: per-window max (p99 proxy) in microseconds. Snapshot
+     * captures the single longest NV2A_PHASE_TIMER sample over the
+     * smoothing window (~5 frames @ alpha=0.2). Reset each snapshot. */
+    float draw_vtx_attr_max_us;
+    float draw_vtx_sync_max_us;
+    float draw_prim_rw_max_us;
+    float draw_setup_max_us;
+    float draw_vk_cmd_max_us;
+    float pipe_bind_tex_max_us;
+    float pipe_bind_shd_max_us;
+    float pipe_lookup_max_us;
+    /* Phase 2.2: smoothed draws-per-submit ratio (alpha=0.2 EMA). */
+    float draws_per_submit;
 } FramePhaseTimingStats;
 
 typedef struct CpuTimingWork {
@@ -292,6 +369,11 @@ typedef struct SurfTimingWork {
     uint32_t upload_count;
     uint32_t download_count;
     uint32_t miss_count;
+    /* update_surface_part short-circuit (Phase 1.3): incremented when
+     * the function returns early because surface_binding_inputs_gen
+     * is unchanged AND the cached dirty-walk window is clean AND
+     * upload was not requested. */
+    uint32_t update_skip;
 } SurfTimingWork;
 
 typedef struct SurfTimingStats {
@@ -337,6 +419,10 @@ typedef struct NV2AStats {
     VsyncTimingStats vsync;
     SurfTimingWork surf_working;
     SurfTimingStats surf;
+    /* Phase 2.1: per-NV2A-method-class histogram. Accumulated by
+     * pgraph_method on every slow-path entry; emitted by profile.c
+     * as the "xemu-method" log line every ~2 s. */
+    MethodClassStats method_class_stats;
 } NV2AStats;
 
 #ifdef __cplusplus
@@ -418,9 +504,14 @@ static inline void nv2a_profile_inc_counter(enum NV2A_PROF_COUNTERS_ENUM cnt)
 #define NV2A_PHASE_TIMER_BEGIN(phase) \
     int64_t _phase_t0_##phase = nv2a_clock_ns()
 
+/* Phase 2.2: also track per-window max in addition to the running sum.
+ * The cost is one branch + one store; per-draw phases fire at most
+ * ~20 kHz on Halo 2 so it's well under noise floor. */
 #define NV2A_PHASE_TIMER_END(phase) do { \
-    g_nv2a_stats.phase_working.phase##_ns += \
-        nv2a_clock_ns() - _phase_t0_##phase; \
+    int64_t _dt_##phase = nv2a_clock_ns() - _phase_t0_##phase; \
+    g_nv2a_stats.phase_working.phase##_ns += _dt_##phase; \
+    if (_dt_##phase > g_nv2a_stats.phase_working.phase##_max_ns) \
+        g_nv2a_stats.phase_working.phase##_max_ns = _dt_##phase; \
 } while (0)
 
 #else /* !NV2A_PERF_LOG */

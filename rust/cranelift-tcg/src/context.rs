@@ -92,6 +92,26 @@ pub struct TierTwoEntry {
 unsafe impl Send for TierTwoEntry {}
 unsafe impl Sync for TierTwoEntry {}
 
+/// Per-TB synchronous-fault unwind metadata. Produced by the translator
+/// from the SourceLoc tags Cranelift attached during lowering. Travels
+/// through the dispatcher response queue and is consumed once by the
+/// C-side unwind-index installer (which deep-copies the arrays into
+/// its own slab, see `cranelift_unwind_install` in cranelift-bridge.c).
+///
+/// `host_end` and `loc` are parallel arrays sorted by `host_end`
+/// ascending: row `i` says "everything up to byte offset `host_end[i]`
+/// of the cranelift code belongs to guest insn `loc[i]`". `insn_data`
+/// is a flat `n_insns * INSN_START_WORDS=3` table indexed by `loc[i]`,
+/// holding the values `restore_state_to_opc` consumes when rewinding
+/// guest state on an MMIO / watchpoint / SMC fault.
+#[derive(Debug)]
+pub struct UnwindBuf {
+    pub host_end: Vec<u32>,
+    pub loc: Vec<u32>,
+    pub insn_data: Vec<u64>,
+    pub n_insns: u32,
+}
+
 /// Configuration knobs (all atomically settable from the C side).
 pub struct Config {
     pub enabled: AtomicBool,

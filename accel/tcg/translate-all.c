@@ -188,7 +188,34 @@ void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
                                uintptr_t host_pc)
 {
     uint64_t data[INSN_START_WORDS];
-    int insns_left = cpu_unwind_data_from_tb(tb, host_pc, data);
+    int insns_left;
+
+    /*
+     * Tier-1 fast path: host_pc lands inside the canonical tier-1
+     * code-gen buffer at tb->tc.ptr. cpu_unwind_data_from_tb decodes
+     * the appended sleb128 search table — this is the canonical, target-
+     * agnostic unwind that QEMU has always had.
+     *
+     * Tier-2 fallback: when host_pc is outside that range we're in the
+     * cranelift JIT arena (a tier-2 helper call faulted). The cranelift
+     * unwind index resolves host_pc -> guest_insn_idx -> insn_start
+     * data via the SourceLoc map captured at codegen.
+     *
+     * Pre-cranelift, host_pc was guaranteed to be in [tc.ptr, tc.ptr +
+     * tc.size). Today a TB can dispatch via a tier-2 shim whose body
+     * lives elsewhere, so the range check is necessary.
+     */
+    uintptr_t tc_lo = (uintptr_t)tb->tc.ptr;
+    uintptr_t tc_hi = tc_lo + tb->tc.size;
+    if (host_pc >= tc_lo && host_pc < tc_hi) {
+        insns_left = cpu_unwind_data_from_tb(tb, host_pc, data);
+    } else if (cranelift_unwind_data_from_tb(tb, host_pc, data,
+                                             &insns_left)) {
+        /* Cranelift path populated `data` and `insns_left`; fall through
+         * to the shared restore-and-icount-adjust below. */
+    } else {
+        return;
+    }
 
     if (insns_left < 0) {
         return;
@@ -209,14 +236,16 @@ void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
 bool cpu_restore_state(CPUState *cpu, uintptr_t host_pc)
 {
     /*
-     * The host_pc has to be in the rx region of the code buffer.
-     * If it is not we will not be able to resolve it here.
-     * The two cases where host_pc will not be correct are:
+     * Tier-1: host_pc in the QEMU code-gen buffer; consult the canonical
+     * tcg_tb_lookup search tree. The two cases where host_pc will not be
+     * correct here are:
      *
      *  - fault during translation (instruction fetch)
      *  - fault from helper (not using GETPC() macro)
      *
-     * Either way we need return early as we can't resolve it here.
+     * Tier-2 (cranelift): host_pc lives in the JITModule arena, which is
+     * outside in_code_gen_buffer() and absent from tcg_tb_lookup. The
+     * cranelift unwind index maintains a parallel range -> TB lookup.
      */
     if (in_code_gen_buffer((const void *)(host_pc - tcg_splitwx_diff))) {
         TranslationBlock *tb = tcg_tb_lookup(host_pc);
@@ -224,6 +253,11 @@ bool cpu_restore_state(CPUState *cpu, uintptr_t host_pc)
             cpu_restore_state_from_tb(cpu, tb, host_pc);
             return true;
         }
+    }
+    TranslationBlock *tb_ce = cranelift_unwind_tb_lookup(host_pc);
+    if (tb_ce) {
+        cpu_restore_state_from_tb(cpu, tb_ce, host_pc);
+        return true;
     }
     return false;
 }
@@ -235,6 +269,11 @@ bool cpu_unwind_state_data(CPUState *cpu, uintptr_t host_pc, uint64_t *data)
         if (tb) {
             return cpu_unwind_data_from_tb(tb, host_pc, data) >= 0;
         }
+    }
+    TranslationBlock *tb_ce = cranelift_unwind_tb_lookup(host_pc);
+    if (tb_ce) {
+        int dummy;
+        return cranelift_unwind_data_from_tb(tb_ce, host_pc, data, &dummy);
     }
     return false;
 }
@@ -305,6 +344,10 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
     return tcg_gen_code(tcg_ctx, tb, pc);
 }
 
+#if XEMU_HAVE_CRANELIFT
+extern uint64_t xemu_jit_tb_gen_count;
+#endif
+
 /* Called with mmap_lock held for user mode emulation.  */
 TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 {
@@ -316,6 +359,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     int64_t ti;
     void *host_pc;
     bool recycled = false;
+
+#if XEMU_HAVE_CRANELIFT
+    qatomic_inc(&xemu_jit_tb_gen_count);
+#endif
 
     assert_memory_lock();
     qemu_thread_jit_write();
@@ -771,6 +818,11 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr)
     assert_memory_lock();
 
     tb = tcg_tb_lookup(retaddr);
+    if (!tb) {
+        /* Tier-2 fallback: retaddr may point into the cranelift JIT
+         * arena rather than the canonical code-gen buffer. */
+        tb = cranelift_unwind_tb_lookup(retaddr);
+    }
     if (tb) {
         /* We can use retranslation to find the PC.  */
         cpu_restore_state_from_tb(cpu, tb, retaddr);
@@ -802,6 +854,12 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
     uint32_t n;
 
     tb = tcg_tb_lookup(retaddr);
+    if (!tb) {
+        /* Tier-2 fallback: a helper called from cranelift-compiled code
+         * has retaddr in the JITModule arena, not the tier-1 code-gen
+         * buffer. The cranelift unwind index covers exactly that case. */
+        tb = cranelift_unwind_tb_lookup(retaddr);
+    }
     if (!tb) {
         cpu_abort(cpu, "cpu_io_recompile: could not find TB for pc=%p",
                   (void *)retaddr);

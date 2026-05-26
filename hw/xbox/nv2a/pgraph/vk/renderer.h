@@ -144,6 +144,10 @@ struct OptBisectStats {
     int finish_buf_space;
     int buf_ds_full;
     int buf_ubo_full;
+    /* Per-binding uniform-staging cache hits. Counts draws where we
+     * reused a binding's previously-staged uniform offsets instead of
+     * memcpy'ing the same bytes into the staging buffer again. */
+    int buf_ubo_cache_hit;
     int buf_fb_full;
     int buf_stg_full;
     int buf_compute_full;
@@ -376,6 +380,29 @@ typedef struct ShaderBinding {
      * shader_cache_entry_init when an LRU slot is recycled.
      */
     bool uniforms_layout_populated;
+
+    /*
+     * Per-binding uniform staging cache.
+     *
+     * cached_vsh_uniform_hash / cached_psh_uniform_hash are hashes of
+     * layout->allocation at the moment THIS binding was last staged
+     * into the uniform staging buffer. cached_uniform_buffer_offsets
+     * is the staging offsets returned by pgraph_vk_append_to_buffer
+     * for that stage. cached_uniform_staging_gen is the staging-gen
+     * counter at stage time — only valid for matches against the
+     * current r->uniform_staging_gen (bumps at frame submit).
+     *
+     * Saves the ~17% pfifo CPU spent in apply_uniform_updates +
+     * append_to_buffer when the same binding is re-bound with
+     * unchanged uniforms (e.g. A→B→A→B material interleaving).
+     * stage_cache_valid is cleared in shader_cache_entry_init and
+     * whenever a staging recycle invalidates the cached offsets.
+     */
+    bool stage_cache_valid;
+    uint32_t cached_uniform_staging_gen;
+    uint64_t cached_vsh_uniform_hash;
+    uint64_t cached_psh_uniform_hash;
+    size_t   cached_uniform_buffer_offsets[2];
     struct {
         ShaderModuleInfo *module_info;
         VshUniformLocs uniform_locs;
@@ -1165,6 +1192,24 @@ typedef struct PGRAPHVkState {
 
     StorageBuffer storage_buffers[BUFFER_COUNT];
     PrimRewriteBuf prim_rewrite_buf;
+    /* Phase 1.2: LRU cache for pgraph_prim_rewrite_indexed/_ranges
+     * output. Halo 2 redraws the same meshes per-frame; this saves
+     * the rewrite_indices() loop on repeats. Sequential rewrite
+     * skips the cache (cheaper to recompute). */
+    PrimRewriteCache index_cache;
+
+    /* Phase 1.3: update_surface_part short-circuit.
+     * [0] = color, [1] = zeta. Captures the last-touched VRAM range
+     * for the dirty walk; when pg->surface_binding_inputs_gen is
+     * unchanged AND pg_surface->buffer_dirty is clean, the walk only
+     * needs to cover this window — and if the window is clean we can
+     * skip update_surface_part entirely on the !upload path. */
+    struct {
+        uint32_t gen;
+        bool valid;
+        hwaddr last_addr;
+        size_t last_size;
+    } surface_part_cache[2];
 
     DrawQueue draw_queue;
 
@@ -1309,6 +1354,17 @@ typedef struct PGRAPHVkState {
     bool uniforms_changed;
     uint64_t last_vsh_uniform_hash;
     uint64_t last_psh_uniform_hash;
+    /*
+     * Generation counter for per-binding uniform staging cache.
+     *
+     * Bumped at frame-submit when the uniform staging buffer for a
+     * previous frame becomes reclaimable (the cached
+     * cached_uniform_buffer_offsets on every ShaderBinding may then
+     * point into a now-overwritten region). ShaderBinding's
+     * cached_uniform_staging_gen must equal this value for a cache
+     * hit. See pgraph_vk_update_descriptor_sets for the consumer.
+     */
+    uint32_t uniform_staging_gen;
     /*
      * Fast-skip state for update_shader_uniforms: if these match on a new
      * call we can prove the ShaderBinding's layout->allocation is already

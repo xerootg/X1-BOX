@@ -238,9 +238,18 @@ if(NOT _x87_main_contents MATCHES "X1BOX_CW_OVERRIDE_PATCH")
     return X87CW_PRECISION_EXTENDED | X87CW_ROUNDING_NEAREST | X87CW_MASK_ALL_EX;
 #endif
 }"
-"// X1BOX_CW_OVERRIDE_PATCH — see android/app/src/main/cpp/CMakeLists.txt
+"// X1BOX_CW_OVERRIDE_PATCH_V2 — see android/app/src/main/cpp/CMakeLists.txt
 #if !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
-static thread_local x87cw_t g_x87_cw_override = 0;
+/*
+ * Plain static storage (NOT thread_local).
+ *
+ * Xbox is single-vCPU. The cw override is set/read from the vCPU
+ * thread inside every x87 helper. With `thread_local`, each access
+ * goes through __emutls_get_address → pthread_getspecific —
+ * measured as ~13% of vCPU on Serious Sam 2 (x87-heavy) before this
+ * change. Plain static = single relaxed load/store, no TLS dance.
+ */
+static x87cw_t g_x87_cw_override = 0;
 extern \"C\" void  x1box_x87_set_cw_override(x87cw_t cw) { g_x87_cw_override = cw; }
 extern \"C\" x87cw_t x1box_x87_get_cw_override()        { return g_x87_cw_override; }
 #endif
@@ -260,6 +269,19 @@ x87cw_t read_x87_cw()
     _x87_main_patched "${_x87_main_contents}")
   file(WRITE "${_x87_main_src}" "${_x87_main_patched}")
   message(STATUS "x87: applied CW-override patch to ${_x87_main_src}")
+endif()
+
+# Idempotent in-place fix: strip `thread_local` from g_x87_cw_override
+# if a previous CMake config (V1 patch) installed it. Always runs so a
+# rebuild without re-cloning the lib still picks up the fix.
+file(READ "${_x87_main_src}" _x87_main_contents_2)
+if(_x87_main_contents_2 MATCHES "static thread_local x87cw_t g_x87_cw_override")
+  string(REPLACE
+    "static thread_local x87cw_t g_x87_cw_override"
+    "static x87cw_t g_x87_cw_override"
+    _x87_main_patched_2 "${_x87_main_contents_2}")
+  file(WRITE "${_x87_main_src}" "${_x87_main_patched_2}")
+  message(STATUS "x87: stripped thread_local from g_x87_cw_override (single-vCPU)")
 endif()
 
 set(_x87_src "${x87_SOURCE_DIR}/x87fp80trans.cpp")

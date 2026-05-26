@@ -38,6 +38,23 @@ static int g_xemu_submit_frames = 3;
 
 struct OptBisectStats g_opt_stats;
 
+/* Phase 2.2: draws_per_submit counter. Bumped at every vkCmdDraw{
+ * ,Indexed,Indirect} site; the matching submits_this_window is bumped
+ * at pgraph_vk_finish entry. Profile.c snapshot computes the ratio.
+ * Cost: one load+add+store per draw, well under the noise floor of
+ * the surrounding vkCmd*. Both fields are uint32_t in
+ * FramePhaseTimingWork; they're written exclusively from the
+ * pfifo_thre side. */
+#if NV2A_PERF_LOG
+#define NV2A_BUMP_DRAW() \
+    do { g_nv2a_stats.phase_working.draws_this_window++; } while (0)
+#define NV2A_BUMP_SUBMIT() \
+    do { g_nv2a_stats.phase_working.submits_this_window++; } while (0)
+#else
+#define NV2A_BUMP_DRAW()   do { } while (0)
+#define NV2A_BUMP_SUBMIT() do { } while (0)
+#endif
+
 #ifdef __ANDROID__
 extern bool xemu_android_is_debug_logging_enabled(void);
 #define VAF_LOG(...) __android_log_print(ANDROID_LOG_WARN, "xemu-vaf", __VA_ARGS__)
@@ -2421,6 +2438,12 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
     bool prev_in_finish = r_guard->in_finish_no_recurse;
     r_guard->in_finish_no_recurse = true;
 
+    /* Phase 2.2: count submit boundaries for draws_per_submit ratio.
+     * pgraph_vk_finish is the entry into every queue submit (one per
+     * call), so bumping here matches the granularity of the draws
+     * counter. */
+    NV2A_BUMP_SUBMIT();
+
     OPT_STAT_INC(finish_calls);
     switch (finish_reason) {
     case VK_FINISH_REASON_VERTEX_BUFFER_DIRTY: OPT_STAT_INC(finish_vtx_dirty); break;
@@ -2859,6 +2882,14 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
             r->command_buffer = r->command_buffers[next_frame * 2];
             r->aux_command_buffer = r->command_buffers[next_frame * 2 + 1];
             r->command_buffer_fence = r->frame_fences[next_frame];
+            /*
+             * Bump uniform_staging_gen: cached_uniform_buffer_offsets
+             * on every ShaderBinding now point into the PREVIOUS
+             * frame's staging buffer, which is about to be reused
+             * by the new frame. Generation mismatch on the next
+             * stage-cache check forces a re-stage.
+             */
+            r->uniform_staging_gen++;
         } /* !is_render_thread_context */
 
         /* Descriptor sets are still in use by in-flight GPU frames.
@@ -4076,7 +4107,7 @@ static bool try_enqueue_draw_indexed(PGRAPHState *pg, DrawQueue *q)
     uint32_t *draw_indices = pg->inline_elements;
     unsigned int draw_index_count = pg->inline_elements_length;
     PrimRewrite prim_rw = pgraph_prim_rewrite_indexed(
-        &r->prim_rewrite_buf, assembly,
+        &r->prim_rewrite_buf, &r->index_cache, assembly,
         pg->inline_elements, pg->inline_elements_length);
     if (prim_rw.num_indices > 0) {
         draw_indices = prim_rw.indices;
@@ -4369,6 +4400,7 @@ static void flush_draw_queue_internal(NV2AState *d)
         if (!has_uniform_changes) {
             rebind_ubo_dynamic_offsets(pg, (uint32_t)ubo_offsets[0][0],
                                        (uint32_t)ubo_offsets[0][1]);
+            NV2A_BUMP_DRAW();
             vkCmdDrawIndexed(r->command_buffer, total_indices, 1, 0, 0, 0);
         } else {
             int i = 0;
@@ -4385,6 +4417,7 @@ static void flush_draw_queue_internal(NV2AState *d)
                 }
                 uint32_t first = idx_offsets[i];
                 uint32_t count = idx_offsets[j - 1] + idx_counts[j - 1] - first;
+                NV2A_BUMP_DRAW();
                 vkCmdDrawIndexed(r->command_buffer, count, 1, first, 0, 0);
                 i = j;
             }
@@ -4412,7 +4445,7 @@ static void flush_draw_queue_internal(NV2AState *d)
         VertexBufferRemap remap = remap_unaligned_attributes(pg, max_end);
 
         PrimRewrite prim_rw = pgraph_prim_rewrite_ranges(
-            &r->prim_rewrite_buf, assembly,
+            &r->prim_rewrite_buf, &r->index_cache, assembly,
             starts, counts_arr, entry_count);
 
         if (prim_rw.num_indices > 0) {
@@ -4454,6 +4487,7 @@ static void flush_draw_queue_internal(NV2AState *d)
             vkCmdBindIndexBuffer(r->command_buffer,
                                  r->storage_buffers[BUFFER_INDEX].buffer,
                                  buffer_offset, VK_INDEX_TYPE_UINT32);
+            NV2A_BUMP_DRAW();
             vkCmdDrawIndexed(r->command_buffer, prim_rw.num_indices,
                              1, 0, 0, 0);
         } else if (!has_uniform_changes && entry_count > 1) {
@@ -4471,6 +4505,7 @@ static void flush_draw_queue_internal(NV2AState *d)
             ensure_buffer_space(pg, BUFFER_INDEX_STAGING, indirect_size);
             VkDeviceSize buffer_offset = pgraph_vk_update_index_buffer(
                 pg, cmds, indirect_size);
+            NV2A_BUMP_DRAW();
             vkCmdDrawIndirect(r->command_buffer,
                               r->storage_buffers[BUFFER_INDEX].buffer,
                               buffer_offset, entry_count,
@@ -4508,11 +4543,13 @@ static void flush_draw_queue_internal(NV2AState *d)
                                         indirect_size);
                     VkDeviceSize buf_off = pgraph_vk_update_index_buffer(
                         pg, cmds, indirect_size);
+                    NV2A_BUMP_DRAW();
                     vkCmdDrawIndirect(r->command_buffer,
                                       r->storage_buffers[BUFFER_INDEX].buffer,
                                       buf_off, group_count,
                                       sizeof(VkDrawIndirectCommand));
                 } else {
+                    NV2A_BUMP_DRAW();
                     vkCmdDraw(r->command_buffer, counts_arr[i], 1,
                               starts[i], 0);
                 }
@@ -4520,6 +4557,7 @@ static void flush_draw_queue_internal(NV2AState *d)
                 i = j;
             }
         } else {
+            NV2A_BUMP_DRAW();
             vkCmdDraw(r->command_buffer, counts_arr[0], 1, starts[0], 0);
         }
     }
@@ -4731,7 +4769,7 @@ static bool try_snapshot_draw_arrays(NV2AState *d, ReorderWindowEntry *e)
     VertexBufferRemap remap = remap_unaligned_attributes(pg, max_element);
 
     PrimRewrite prim_rw = pgraph_prim_rewrite_ranges(
-        &r->prim_rewrite_buf, assembly,
+        &r->prim_rewrite_buf, &r->index_cache, assembly,
         pg->draw_arrays_start, pg->draw_arrays_count,
         pg->draw_arrays_length);
 
@@ -4852,7 +4890,7 @@ static bool try_snapshot_inline_elements(NV2AState *d, ReorderWindowEntry *e)
     uint32_t *draw_indices = pg->inline_elements;
     unsigned int draw_index_count = pg->inline_elements_length;
     PrimRewrite prim_rw = pgraph_prim_rewrite_indexed(
-        &r->prim_rewrite_buf, assembly,
+        &r->prim_rewrite_buf, &r->index_cache, assembly,
         pg->inline_elements, pg->inline_elements_length);
     if (prim_rw.num_indices > 0) {
         draw_indices = prim_rw.indices;
@@ -5207,15 +5245,18 @@ static void emit_reorder_entry(PGRAPHState *pg, ReorderWindowEntry *e,
         vkCmdBindIndexBuffer(r->command_buffer,
                              r->storage_buffers[BUFFER_INDEX].buffer,
                              e->index_indirect_offset, VK_INDEX_TYPE_UINT32);
+        NV2A_BUMP_DRAW();
         vkCmdDrawIndexed(r->command_buffer, e->draw_count, 1, 0, 0, 0);
         break;
     case RW_DRAW_INDIRECT:
+        NV2A_BUMP_DRAW();
         vkCmdDrawIndirect(r->command_buffer,
                           r->storage_buffers[BUFFER_INDEX].buffer,
                           e->index_indirect_offset, e->draw_count,
                           sizeof(VkDrawIndirectCommand));
         break;
     case RW_DRAW_DIRECT:
+        NV2A_BUMP_DRAW();
         vkCmdDraw(r->command_buffer, e->vertex_count, 1, e->first_vertex, 0);
         break;
     }
@@ -5912,6 +5953,7 @@ void pgraph_vk_clear_surface(NV2AState *d, uint32_t parameter)
             pgraph_get_clear_color(pg, blend_constants);
             vkCmdSetScissor(r->command_buffer, 0, 1, &clear_rect.rect);
             vkCmdSetBlendConstants(r->command_buffer, blend_constants);
+            NV2A_BUMP_DRAW();
             vkCmdDraw(r->command_buffer, 3, 1, 0, 0);
         }
     }
@@ -6284,7 +6326,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
 
         NV2A_PHASE_TIMER_BEGIN(draw_prim_rw);
         PrimRewrite prim_rw = pgraph_prim_rewrite_ranges(
-            &r->prim_rewrite_buf, assembly,
+            &r->prim_rewrite_buf, &r->index_cache, assembly,
             pg->draw_arrays_start, pg->draw_arrays_count,
             pg->draw_arrays_length);
 
@@ -6319,6 +6361,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
             vkCmdBindIndexBuffer(r->command_buffer,
                                  r->storage_buffers[BUFFER_INDEX].buffer,
                                  buffer_offset, VK_INDEX_TYPE_UINT32);
+            NV2A_BUMP_DRAW();
             vkCmdDrawIndexed(r->command_buffer, prim_rw.num_indices, 1, 0, 0,
                              0);
         } else if (pg->draw_arrays_length > 1) {
@@ -6336,6 +6379,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
             ensure_buffer_space(pg, BUFFER_INDEX_STAGING, indirect_size);
             VkDeviceSize buffer_offset = pgraph_vk_update_index_buffer(
                 pg, cmds, indirect_size);
+            NV2A_BUMP_DRAW();
             vkCmdDrawIndirect(r->command_buffer,
                               r->storage_buffers[BUFFER_INDEX].buffer,
                               buffer_offset, pg->draw_arrays_length,
@@ -6346,6 +6390,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
                 uint32_t start = pg->draw_arrays_start[i],
                          count = pg->draw_arrays_count[i];
                 NV2A_VK_DPRINTF("- [%d] Start:%d Count:%d", i, start, count);
+                NV2A_BUMP_DRAW();
                 vkCmdDraw(r->command_buffer, count, 1, start, 0);
             }
         }
@@ -6369,8 +6414,8 @@ draw_arrays_done:
         uint32_t *draw_indices = pg->inline_elements;
         unsigned int draw_index_count = pg->inline_elements_length;
         PrimRewrite prim_rw = pgraph_prim_rewrite_indexed(
-            &r->prim_rewrite_buf, assembly, pg->inline_elements,
-            pg->inline_elements_length);
+            &r->prim_rewrite_buf, &r->index_cache, assembly,
+            pg->inline_elements, pg->inline_elements_length);
         if (prim_rw.num_indices > 0) {
             draw_indices = prim_rw.indices;
             draw_index_count = prim_rw.num_indices;
@@ -6426,6 +6471,7 @@ draw_arrays_done:
         vkCmdBindIndexBuffer(r->command_buffer,
                              r->storage_buffers[BUFFER_INDEX].buffer,
                              buffer_offset, VK_INDEX_TYPE_UINT32);
+        NV2A_BUMP_DRAW();
         vkCmdDrawIndexed(r->command_buffer, draw_index_count, 1, 0, 0, 0);
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
@@ -6493,9 +6539,11 @@ inline_elements_done:
             vkCmdBindIndexBuffer(r->command_buffer,
                                  r->storage_buffers[BUFFER_INDEX].buffer,
                                  idx_offset, VK_INDEX_TYPE_UINT32);
+            NV2A_BUMP_DRAW();
             vkCmdDrawIndexed(r->command_buffer, prim_rw.num_indices, 1, 0, 0,
                              0);
         } else {
+            NV2A_BUMP_DRAW();
             vkCmdDraw(r->command_buffer, pg->inline_buffer_length, 1, 0, 0);
         }
 
@@ -6573,9 +6621,11 @@ inline_buffer_done:
             vkCmdBindIndexBuffer(r->command_buffer,
                                  r->storage_buffers[BUFFER_INDEX].buffer,
                                  idx_offset, VK_INDEX_TYPE_UINT32);
+            NV2A_BUMP_DRAW();
             vkCmdDrawIndexed(r->command_buffer, prim_rw.num_indices, 1, 0, 0,
                              0);
         } else {
+            NV2A_BUMP_DRAW();
             vkCmdDraw(r->command_buffer, index_count, 1, 0, 0);
         }
 

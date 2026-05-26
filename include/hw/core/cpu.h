@@ -288,6 +288,17 @@ typedef struct CPUTLBDesc {
     /* maximum number of entries observed in the window */
     size_t window_max_entries;
     size_t n_used_entries;
+    /*
+     * Count of valid victim-TLB entries (vtable[]/vfulltlb[]). Bumped
+     * on every fill at tlb_set_page_full (where a main-TLB eviction
+     * gets copied into the victim), and decremented when a victim
+     * entry is flushed by tlb_flush_vtlb_page_mask_locked. Lets
+     * tlb_reset_dirty skip the 8-entry victim walk when it's empty —
+     * symmetric to the n_used_entries skip on the main-TLB walk
+     * (most modes have an empty victim, so this is mostly a 22-mode
+     * x 8-entry x cache-line memory-fetch saved per call).
+     */
+    size_t n_used_vtlb_entries;
     /* The next index to use in the tlb victim table.  */
     size_t vindex;
     /* The tlb victim table, in two parts.  */

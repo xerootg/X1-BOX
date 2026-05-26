@@ -62,6 +62,76 @@ static void mttcg_force_rcu(Notifier *notify, void *data)
  * current CPUState for a given thread.
  */
 
+#if defined(XBOX) && defined(__aarch64__)
+#include <android/log.h>
+/*
+ * Pre-set host FPCR to SSE-compatible defaults on vCPU thread entry.
+ *
+ * Default Android aarch64 FPCR has FZ=1 (flush denormals to zero) which
+ * diverges from SSE MXCSR default (FZ=0, preserves denormals). We
+ * clear FZ / FZ16 / DN here so that if anything tier-2 or per-op
+ * X1BOX_SSE_INLINE_* opts back IN to NEON-lowered scalar SSE, those
+ * ops at least match SSE on denormals and NaN propagation.
+ *
+ * This is NOT sufficient on its own to make NEON FMUL.S bit-identical
+ * to x86 MULSS — proven by the 2026-05-25 attempt to re-enable
+ * X1BOX_SSE_INLINE=1 with both (a) this startup FPCR write AND
+ * (b) full MXCSR -> FPCR routing on LDMXCSR. Halo 2 NPCs still slid.
+ * The residual drift is architectural, not configurable via FPCR.
+ *
+ * The startup write is still kept because:
+ *   1. It's correct (matches SSE intent) and free if SSE_INLINE=0.
+ *   2. It's load-bearing if a per-op gate opts in for bisection.
+ *   3. Without it, NEON FZ=1 would flush denormals coming OUT of
+ *      math libraries used by helpers, etc.
+ *
+ * FPCR bits (ARMv8 D17.4):
+ *   bit 24: FZ        (flush-to-zero, non-FP16)
+ *   bit 19: FZ16      (flush-to-zero, FP16)
+ *   bit 25: DN        (default NaN — propagating NaN payload is the
+ *                      SSE-matching choice, so DN=0)
+ *   bits 22-23: RM    (rounding mode — leave at default round-nearest)
+ *
+ * See project_sse_neon_physics_drift.md for the bisection record.
+ */
+static inline void xemu_vcpu_match_sse_fpcr(void)
+{
+    uint64_t fpcr_before, fpcr_after;
+    asm volatile("mrs %0, fpcr" : "=r"(fpcr_before));
+    uint64_t fpcr = fpcr_before & ~((1ULL << 24) | (1ULL << 19) | (1ULL << 25));
+    asm volatile("msr fpcr, %0" : : "r"(fpcr));
+    asm volatile("mrs %0, fpcr" : "=r"(fpcr_after));
+    /*
+     * Log so we can see WHETHER the FPCR write actually landed —
+     * historical debugging: physics drift persisted on 2026-05-25
+     * after this change, so we need to confirm whether FPCR really
+     * sticks at FZ=0 in the running vCPU thread, or whether something
+     * downstream (libc, helper, JITted op-fence) restores the bit.
+     */
+    __android_log_print(ANDROID_LOG_INFO, "x1-fpcr",
+        "vcpu_fpcr: before=0x%llx after=0x%llx FZ=%d FZ16=%d DN=%d",
+        (unsigned long long)fpcr_before,
+        (unsigned long long)fpcr_after,
+        (int)((fpcr_after >> 24) & 1),
+        (int)((fpcr_after >> 19) & 1),
+        (int)((fpcr_after >> 25) & 1));
+}
+
+/*
+ * Read FPCR from the current thread. Used by the periodic emitter in
+ * profile.c to confirm the FZ=0 setting from startup is still active
+ * after the JIT, helpers, and audio thread have run for a while.
+ */
+uint64_t xemu_vcpu_read_fpcr(void)
+{
+    uint64_t fpcr;
+    asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+    return fpcr;
+}
+#else
+uint64_t xemu_vcpu_read_fpcr(void) { return 0; }
+#endif
+
 static void *mttcg_cpu_thread_fn(void *arg)
 {
     MttcgForceRcuNotifier force_rcu;
@@ -69,6 +139,10 @@ static void *mttcg_cpu_thread_fn(void *arg)
 
     assert(tcg_enabled());
     g_assert(!icount_enabled());
+
+#if defined(XBOX) && defined(__aarch64__)
+    xemu_vcpu_match_sse_fpcr();
+#endif
 
     rcu_register_thread();
     force_rcu.notifier.notify = mttcg_force_rcu;

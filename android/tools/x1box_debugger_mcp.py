@@ -1238,6 +1238,665 @@ def measure_fps(duration: float = 5.0) -> str:
     return "\n".join(out)
 
 
+# JIT periodic stats line from hw/xbox/nv2a/pgraph/profile.c (every ~2s):
+#   xemu-jit: win=<ms> tb_gen/s=N tb_inval/s=N tb_flush/s=N
+#             jc_hit%=P jc_miss/s=N lru_hit%=P lru_call/s=N
+#             phint_hit%=P phint_call/s=N
+#             chain_runs/s=N chain_avg=A.BB irq/s=N
+# Only emitted by debug + perftest builds in the :xemu process. If you
+# don't see lines, either the build predates the instrumentation or
+# the emulator hasn't reached FLIP_STALL yet (still on the boot logo).
+_JIT_STAT_RE = re.compile(
+    r"win=(?P<win_ms>\d+)_ms\s+"
+    r"tb_gen/s=(?P<tb_gen>\d+)\s+"
+    r"tb_inval/s=(?P<tb_inval>\d+)\s+"
+    r"tb_flush/s=(?P<tb_flush>\d+)\s+"
+    r"jc_hit%=(?P<jc_hit_pct>\d+)\s+"
+    r"jc_miss/s=(?P<jc_miss>\d+)\s+"
+    r"lru_hit%=(?P<lru_hit_pct>\d+)\s+"
+    r"lru_call/s=(?P<lru_calls>\d+)\s+"
+    r"phint_hit%=(?P<phint_hit_pct>\d+)\s+"
+    r"phint_call/s=(?P<phint_calls>\d+)\s+"
+    r"chain_runs/s=(?P<chain_runs>\d+)\s+"
+    r"chain_avg=(?P<chain_avg_int>\d+)\.(?P<chain_avg_frac>\d+)\s+"
+    r"irq/s=(?P<irq>\d+)"
+    r"(?:\s+fpcr=(?P<fpcr>0x[0-9a-fA-F]+)\s+FZ=(?P<fz>\d+)\s+FZ16=(?P<fz16>\d+)\s+DN=(?P<dn>\d+))?"
+    r"(?:\s+route_shim=(?P<route_on>\d+)\s+route_hit%=(?P<route_hit_pct>\d+)\s+route_call/s=(?P<route_calls>\d+))?"
+)
+
+
+@mcp.tool()
+def jit_stats(samples: int = 5) -> str:
+    """JIT pipeline health: TB churn, jmp_cache hit rate, helper LRU + phint
+    hit rate, cranelift chain depth, IRQ exit rate.
+
+    Halo 2 callgraphs frequently surface helper_lookup_tb_ptr +
+    tb_htable_lookup as a huge chunk of vCPU, and tb_gen_code as a huge
+    chunk of cpu_exec_loop. The flat profile alone can't say WHY —
+    working-set thrash on the jmp_cache vs. constant tb_phys_invalidate
+    waves vs. helper LRU misses all show up the same way in cpu-clock
+    samples. This drains the structured `xemu-jit:` lines profile.c
+    emits every ~2s with the actual per-second rates so you can tell:
+
+      * tb_gen/s high + tb_inval/s low  → jmp_cache (or TB pool) too
+        small for working set; TBs evicted and re-translated.
+      * tb_gen/s high + tb_inval/s high → self-modifying guest or
+        page-protect churn evicting TBs; cache size won't fix it.
+      * tb_flush/s spikes                → guest tripping tb_flush
+        triggers (CR3 storms, pool exhaustion).
+      * lru_hit% low                     → 4-slot LRU not absorbing
+        the dispatch pattern; bigger LRU or different structure.
+      * phint_hit% low                   → same-page tb_htable lookups
+        are rare; the phys_pc hint isn't saving page walks here.
+      * jc_hit% low                      → tb_jmp_cache miss rate is
+        the dominant cost source.
+      * chain_avg low (<8)               → cranelift chain dispatcher
+        bails out fast; not amortising the dispatcher round-trip.
+
+    Args:
+      samples: how many recent xemu-jit samples to display (default 5
+               = last ~10 seconds; pass 30 for the last minute).
+
+    The emitter sleeps ~2 s between lines, so a sample of N covers
+    ~2N seconds.
+    """
+    if not _device():
+        return "No device connected."
+    pid = _emu_pid()
+    if not pid:
+        return f"{PKG}:xemu is not running. Launch it before sampling."
+    if samples <= 0:
+        return "samples must be > 0."
+
+    raw = _sh(f"logcat -d -s xemu-jit:I --pid={pid}")
+    lines = [ln for ln in (raw or "").splitlines() if "win=" in ln]
+    if not lines:
+        return ("No xemu-jit lines yet. Either the emulator hasn't reached "
+                "FLIP_STALL (still on the boot animation) or the running "
+                "build predates the JIT-stats instrumentation in "
+                "hw/xbox/nv2a/pgraph/profile.c — rebuild + reinstall.")
+
+    parsed = []
+    for ln in lines[-samples:]:
+        m = _JIT_STAT_RE.search(ln)
+        if not m:
+            continue
+        d = m.groupdict()
+        parsed.append({
+            "win_ms":     int(d["win_ms"]),
+            "tb_gen":     int(d["tb_gen"]),
+            "tb_inval":   int(d["tb_inval"]),
+            "tb_flush":   int(d["tb_flush"]),
+            "jc_hit_pct": int(d["jc_hit_pct"]),
+            "jc_miss":    int(d["jc_miss"]),
+            "lru_hit_pct":int(d["lru_hit_pct"]),
+            "lru_calls":  int(d["lru_calls"]),
+            "phint_hit_pct": int(d["phint_hit_pct"]),
+            "phint_calls":   int(d["phint_calls"]),
+            "chain_runs": int(d["chain_runs"]),
+            "chain_avg":  float(f"{d['chain_avg_int']}.{d['chain_avg_frac']}"),
+            "irq":        int(d["irq"]),
+            "fpcr":       d.get("fpcr"),
+            "fz":         int(d["fz"])   if d.get("fz")   else None,
+            "fz16":       int(d["fz16"]) if d.get("fz16") else None,
+            "dn":         int(d["dn"])   if d.get("dn")   else None,
+            "route_on":       int(d["route_on"])      if d.get("route_on")      else None,
+            "route_hit_pct":  int(d["route_hit_pct"]) if d.get("route_hit_pct") else None,
+            "route_calls":    int(d["route_calls"])   if d.get("route_calls")   else None,
+        })
+    if not parsed:
+        return ("Found xemu-jit lines but none matched the expected shape. "
+                "Check the format in hw/xbox/nv2a/pgraph/profile.c "
+                "vs _JIT_STAT_RE in this tool.")
+
+    out = []
+    out.append(f"Last {len(parsed)} xemu-jit samples (each window ~2s):")
+    out.append("")
+    out.append("  TB pool                  jmp_cache       helper LRU   "
+               "phint        chain         irq/s")
+    out.append("  gen/s inval/s flush/s   hit%  miss/s     hit% call/s   "
+               "hit% call/s  runs/s  avg")
+    out.append("  " + "-" * 96)
+    for r in parsed:
+        out.append(
+            f"  {r['tb_gen']:>5} {r['tb_inval']:>7} {r['tb_flush']:>7}   "
+            f"{r['jc_hit_pct']:>3}%  {r['jc_miss']:>7}    "
+            f"{r['lru_hit_pct']:>3}% {r['lru_calls']:>6}   "
+            f"{r['phint_hit_pct']:>3}% {r['phint_calls']:>6}  "
+            f"{r['chain_runs']:>6}  {r['chain_avg']:>4.1f}   "
+            f"{r['irq']:>5}"
+        )
+
+    last = parsed[-1]
+    if last["fpcr"] is not None:
+        fz_warn = " ⚠ FZ=1 — denormal flush ON" if last["fz"] else ""
+        dn_warn = " ⚠ DN=1 — default NaN ON"    if last["dn"] else ""
+        out.append("")
+        out.append(f"vCPU FPCR (last sample): {last['fpcr']} "
+                   f"FZ={last['fz']} FZ16={last['fz16']} DN={last['dn']}"
+                   f"{fz_warn}{dn_warn}")
+    if last.get("route_on") is not None:
+        out.append(
+            f"helper→shim routing: {'ON' if last['route_on'] else 'OFF'}  "
+            f"hit%={last['route_hit_pct']}  calls/s={last['route_calls']:,} "
+            f"(set X1BOX_HELPER_ROUTE_SHIM=1/0 then relaunch to A/B)"
+        )
+    out.append("")
+    out.append("Diagnosis hints:")
+    if last["tb_gen"] > 2000:
+        out.append(f"  * tb_gen/s={last['tb_gen']}: heavy TB translation. "
+                   f"Likely working-set thrash or self-mod.")
+    if last["tb_inval"] > 1000:
+        out.append(f"  * tb_inval/s={last['tb_inval']}: TBs being "
+                   f"invalidated — self-modifying code or page churn.")
+    if last["tb_flush"] > 0:
+        out.append(f"  * tb_flush/s={last['tb_flush']}: full TB cache "
+                   f"wipes — investigate pool exhaustion / CR3 storms.")
+    if last["jc_hit_pct"] < 80 and last["jc_miss"] > 50000:
+        out.append(f"  * jc_hit%={last['jc_hit_pct']}%: tb_jmp_cache miss "
+                   f"rate high — falling through to QHT often.")
+    if last["lru_hit_pct"] < 30:
+        out.append(f"  * lru_hit%={last['lru_hit_pct']}%: helper 4-slot LRU "
+                   f"not absorbing dispatch pattern.")
+    if last["phint_calls"] > 0 and last["phint_hit_pct"] < 20:
+        out.append(f"  * phint_hit%={last['phint_hit_pct']}%: same-page LRU "
+                   f"side-channel rarely fires — page walks not being "
+                   f"skipped much.")
+    if last["chain_avg"] < 8 and last["chain_runs"] > 1000:
+        out.append(f"  * chain_avg={last['chain_avg']}: cranelift chain "
+                   f"dispatcher bails out fast — dispatcher round-trip "
+                   f"not amortised.")
+    if last["irq"] > 500:
+        out.append(f"  * irq/s={last['irq']}: high IRQ exit rate — vCPU "
+                   f"frequently bailing back to the dispatcher.")
+    if len(out) == 5 + len(parsed):  # no hint lines appended
+        out.append("  (no anomalies detected at default thresholds)")
+    return "\n".join(out)
+
+
+# Pipeline stats line from hw/xbox/nv2a/pgraph/profile.c (every ~2s):
+#   xemu-pipe: win=<ms> ring avg=<bytes> max=<bytes> dma_len=<bytes>
+#              empty%=<pct> full%=<pct>
+#              pusher_calls/s=<n> words/s=<n>
+#              pfifo wait_spin/s=<n> wait_idle/s=<n> wait%=<pct>
+#              vcpu hle_yield/s=<n> hle_iters/s=<n> hle_yield_ms/s=<n>
+#              hle_yield%=<pct>
+#              uni_skip_hit%=<pct> uni_skip_total/s=<n>
+#              idx_cache_hit%=<pct> idx_cache_total/s=<n> idx_cache_evicts/s=<n>
+#              surf_skip%=<pct> surf_total/s=<n>
+#
+# Diagnoses producer-consumer in the vCPU → pgraph-ring → nv2a.pfifo_thre
+# → vulkan-render pipeline. CPU% alone (from thread_wait_profile) doesn't
+# tell you WHO IS BLOCKING WHOM — pipeline_stats does.
+#
+# The trailing uni_skip / idx_cache / surf_skip fields are optional in
+# the regex — older builds that predate Phase 1.2/1.3 wiring won't have
+# them, and we still want to parse the rest of the line cleanly.
+_PIPE_STAT_RE = re.compile(
+    r"win=(?P<win_ms>\d+)_ms\s+"
+    r"ring\s+avg=(?P<ring_avg>\d+)\s+max=(?P<ring_max>\d+)\s+"
+    r"dma_len=(?P<dma_len>\d+)\s+"
+    r"empty%=(?P<empty_pct>\d+)\s+full%=(?P<full_pct>\d+)\s+"
+    r"pusher_calls/s=(?P<pcalls>\d+)\s+words/s=(?P<words>\d+)\s+"
+    r"pfifo\s+wait_spin/s=(?P<wspin>\d+)\s+wait_idle/s=(?P<widle>\d+)\s+"
+    r"wait%=(?P<wpct_int>\d+)\.(?P<wpct_frac>\d+)\s+"
+    r"vcpu\s+hle_yield/s=(?P<hyields>\d+)\s+hle_iters/s=(?P<hiters>\d+)\s+"
+    r"hle_yield_ms/s=(?P<hyms>\d+)\s+"
+    r"hle_yield%=(?P<hypct_int>\d+)\.(?P<hypct_frac>\d+)"
+    r"(?:\s+uni_skip_hit%=(?P<uni_pct>\d+)\s+uni_skip_total/s=(?P<uni_total>\d+))?"
+    r"(?:\s+idx_cache_hit%=(?P<idx_pct>\d+)\s+idx_cache_total/s=(?P<idx_total>\d+)"
+    r"\s+idx_cache_evicts/s=(?P<idx_evicts>\d+))?"
+    r"(?:\s+surf_skip%=(?P<surf_pct>\d+)\s+surf_total/s=(?P<surf_total>\d+))?"
+)
+
+
+def _pct_str(x):
+    return f"{x:>5.1f}%"
+
+
+@mcp.tool()
+def pipeline_stats(samples: int = 5) -> str:
+    """Pipeline producer-consumer diagnosis: WHO IS BLOCKING WHOM.
+
+    `thread_wait_profile` and `profile_native` tell us CPU% per thread,
+    but a high CPU% on one thread doesn't tell you whether it's the
+    pipeline gate or is itself being held back. To diagnose Halo 2's
+    14-17 FPS plateau (well below the 30 FPS native target) we need
+    producer-consumer visibility.
+
+    This drains the `xemu-pipe:` lines that profile.c emits every ~2s
+    and renders them with a diagnostic header.
+
+    Decision keys:
+
+      * ring full%   high  → vCPU produces GPU cmds faster than pfifo
+                             drains them. PFIFO IS THE BOTTLENECK.
+                             CPU optimisations on vCPU won't help.
+      * ring empty%  high  → vCPU is slow-feeding pfifo. VCPU IS THE
+                             BOTTLENECK. Pfifo sits waiting.
+      * both low           → balanced; bottleneck is elsewhere (audio
+                             sync, wall-clock pacing, frame-throttle).
+      * wait_idle/s  high  → pfifo blocks on cond_wait often; vCPU
+                             produces in bursts or sparse work.
+      * wait_spin/s  high  → pfifo waking from short spin (good — low
+                             latency).
+      * hle_yield%   high  → vCPU spends X% of wall in KiIdleLoop
+                             nanosleep. Compare with overall Sleep%
+                             from thread_wait_profile: anything above
+                             is OTHER sleep (BQL waits, futex on
+                             pfifo/audio/etc.). High `other sleep` is
+                             a smoking gun for hidden contention.
+
+    Args:
+      samples: how many recent xemu-pipe samples to display
+               (default 5 = last ~10s; pass 30 for the last minute).
+    """
+    if not _device():
+        return "No device connected."
+    pid = _emu_pid()
+    if not pid:
+        return f"{PKG}:xemu is not running. Launch it before sampling."
+    if samples <= 0:
+        return "samples must be > 0."
+
+    raw = _sh(f"logcat -d -s xemu-pipe:I --pid={pid}")
+    lines = [ln for ln in (raw or "").splitlines() if "win=" in ln]
+    if not lines:
+        return ("No xemu-pipe lines yet. Either the emulator hasn't "
+                "reached FLIP_STALL (still on the boot animation) or the "
+                "running build predates the pipeline-stats instrumentation "
+                "in hw/xbox/nv2a/pgraph/profile.c — rebuild + reinstall.")
+
+    parsed = []
+    for ln in lines[-samples:]:
+        m = _PIPE_STAT_RE.search(ln)
+        if not m:
+            continue
+        d = m.groupdict()
+        # Trailing groups are optional (older builds may omit them).
+        def _opt_int(key):
+            v = d.get(key)
+            return int(v) if v is not None else None
+
+        parsed.append({
+            "win_ms":    int(d["win_ms"]),
+            "ring_avg":  int(d["ring_avg"]),
+            "ring_max":  int(d["ring_max"]),
+            "dma_len":   int(d["dma_len"]),
+            "empty_pct": int(d["empty_pct"]),
+            "full_pct":  int(d["full_pct"]),
+            "pcalls":    int(d["pcalls"]),
+            "words":     int(d["words"]),
+            "wspin":     int(d["wspin"]),
+            "widle":     int(d["widle"]),
+            "wpct":      float(f"{d['wpct_int']}.{d['wpct_frac']}"),
+            "hyields":   int(d["hyields"]),
+            "hiters":    int(d["hiters"]),
+            "hyms":      int(d["hyms"]),
+            "hypct":     float(f"{d['hypct_int']}.{d['hypct_frac']}"),
+            # Phase 1.1 (uniform fast-skip) + 1.2 (index LRU) + 1.3 (surface skip)
+            "uni_pct":    _opt_int("uni_pct"),
+            "uni_total":  _opt_int("uni_total"),
+            "idx_pct":    _opt_int("idx_pct"),
+            "idx_total":  _opt_int("idx_total"),
+            "idx_evicts": _opt_int("idx_evicts"),
+            "surf_pct":   _opt_int("surf_pct"),
+            "surf_total": _opt_int("surf_total"),
+        })
+    if not parsed:
+        return ("Found xemu-pipe lines but none matched the expected shape. "
+                "Check the format in hw/xbox/nv2a/pgraph/profile.c "
+                "vs _PIPE_STAT_RE in this tool.")
+
+    out = []
+    out.append(f"Last {len(parsed)} xemu-pipe samples (each window ~2s):")
+    out.append("")
+    out.append("  PGRAPH ring                pusher          pfifo wait   "
+               "vCPU KiIdleLoop")
+    out.append("  avg%  max%  empty%  full%  calls/s words/s  spin/s idle/s wait%  "
+               "yield/s iters/s yield%")
+    out.append("  " + "-" * 96)
+    for r in parsed:
+        avg_pct = (r["ring_avg"] * 100.0 / r["dma_len"]) if r["dma_len"] else 0
+        max_pct = (r["ring_max"] * 100.0 / r["dma_len"]) if r["dma_len"] else 0
+        out.append(
+            f"  {avg_pct:>4.1f} {max_pct:>5.1f}  {r['empty_pct']:>5}%  "
+            f"{r['full_pct']:>4}%  {r['pcalls']:>7} {r['words']:>7}  "
+            f"{r['wspin']:>6} {r['widle']:>6} {r['wpct']:>4.1f}%  "
+            f"{r['hyields']:>7} {r['hiters']:>7} {r['hypct']:>4.1f}%"
+        )
+
+    # Cache-effectiveness sub-table (Phase 1.1/1.2/1.3 telemetry).
+    # Only render if at least one sample carries the new fields — older
+    # APKs predate the wiring and would render an all-"n/a" table.
+    have_cache_fields = any(
+        r["uni_pct"] is not None or r["idx_pct"] is not None
+        or r["surf_pct"] is not None
+        for r in parsed
+    )
+    if have_cache_fields:
+        out.append("")
+        out.append("  Cache hit rates (uniform fast-skip / prim-rewrite LRU / "
+                   "surface-part skip)")
+        out.append("  uni_hit%  uni_total/s  idx_hit%  idx_total/s  idx_evicts/s  "
+                   "surf_skip%  surf_total/s")
+        out.append("  " + "-" * 84)
+        for r in parsed:
+            def _pct(v):
+                return f"{v:>5}%" if v is not None else "  n/a"
+
+            def _num(v):
+                return f"{v:>9}" if v is not None else "      n/a"
+
+            out.append(
+                f"  {_pct(r['uni_pct']):>7}  {_num(r['uni_total']):>10}  "
+                f"{_pct(r['idx_pct']):>7}  {_num(r['idx_total']):>10}  "
+                f"{_num(r['idx_evicts']):>11}  "
+                f"{_pct(r['surf_pct']):>9}  {_num(r['surf_total']):>11}"
+            )
+
+    last = parsed[-1]
+    out.append("")
+    out.append("Diagnosis:")
+    if last["full_pct"] >= 30:
+        out.append(f"  *** ring_full%={last['full_pct']}% — PFIFO IS THE "
+                   f"BOTTLENECK. vCPU is feeding pgraph faster than "
+                   f"nv2a.pfifo_thre can drain. Investigate pfifo "
+                   f"throughput; CPU optimisations on vCPU won't help.")
+    elif last["empty_pct"] >= 50:
+        out.append(f"  *** ring_empty%={last['empty_pct']}% — vCPU IS THE "
+                   f"PRODUCER GATE. pgraph ring is usually empty; pfifo "
+                   f"sits waiting for new commands. vCPU-side perf "
+                   f"improvements will help; pfifo isn't the bottleneck.")
+    else:
+        out.append(f"  --- ring balanced (empty {last['empty_pct']}% / "
+                   f"full {last['full_pct']}%). The bottleneck is NOT "
+                   f"in the vCPU → pfifo pipeline. Look at audio sync, "
+                   f"wall-clock pacing, frame throttle, or GPU render.")
+
+    if last["wpct"] >= 50:
+        out.append(f"  * pfifo wait%={last['wpct']:.1f}% — pfifo spends "
+                   f"over half its wall blocked on the ring being empty. "
+                   f"Confirms vCPU under-feeding.")
+
+    if last["hypct"] >= 10:
+        out.append(f"  * vCPU hle_yield%={last['hypct']:.1f}% — KiIdleLoop "
+                   f"nanosleeps eat this much wall time. If "
+                   f"thread_wait_profile Sleep% is much higher, the "
+                   f"difference is `other sleep` (BQL futex waits, "
+                   f"audio sync, etc.) — chase that next.")
+
+    if last["widle"] > 0 and last["wspin"] > 0:
+        spin_ratio = last["wspin"] * 100 // (last["wspin"] + last["widle"])
+        out.append(f"  * pfifo wake mix: {spin_ratio}% spin-wakes / "
+                   f"{100-spin_ratio}% cond_wait-wakes. High spin% is good "
+                   f"(low-latency producer signal); high cond_wait% means "
+                   f"vCPU goes silent for long stretches.")
+
+    if last["pcalls"] > 0:
+        words_per_call = last["words"] / max(1, last["pcalls"])
+        out.append(f"  * pusher: {words_per_call:.0f} words drained per "
+                   f"call, {last['words']:,} words/s total — that's the "
+                   f"actual GPU command throughput the pipeline supports.")
+
+    # Phase 1 cache diagnostics.
+    if last["idx_pct"] is not None:
+        if last["idx_total"] and last["idx_pct"] < 40:
+            out.append(f"  * idx_cache_hit%={last['idx_pct']}% — index-rewrite "
+                       f"LRU is missing most lookups; key may be wrong or "
+                       f"workload not actually repetitive on this scene.")
+        elif last["idx_total"]:
+            out.append(f"  * idx_cache_hit%={last['idx_pct']}% over "
+                       f"{last['idx_total']}/s lookups (evicts "
+                       f"{last['idx_evicts']}/s) — Phase 1.2 LRU effective.")
+    if last["surf_pct"] is not None:
+        if last["surf_total"] and last["surf_pct"] < 5:
+            out.append(f"  * surf_skip%={last['surf_pct']}% over "
+                       f"{last['surf_total']}/s update_surface_part calls — "
+                       f"short-circuit barely firing; check that "
+                       f"surface_binding_inputs_gen bump set covers all "
+                       f"buffer_dirty write sites.")
+        elif last["surf_total"]:
+            out.append(f"  * surf_skip%={last['surf_pct']}% over "
+                       f"{last['surf_total']}/s update_surface_part calls — "
+                       f"Phase 1.3 short-circuit landing.")
+
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# pgraph_method_stats — Phase 2.1 + 2.2 method-class histogram & per-draw p99
+# ---------------------------------------------------------------------------
+#
+# profile.c emits the "xemu-method" tag every ~2 seconds with the format:
+#   win=<ms> vertex/s=N(C%%) tex_state/s=N(C%%) shader_state/s=N(C%%) light/s=N(C%%)
+#            render_state/s=N(C%%) inline_draw/s=N(C%%) other/s=N(C%%)
+#          | draws_per_submit=X.YY
+#          | draw_vk_cmd_p99_us=X.XX draw_setup_p99_us=X.XX
+#            draw_vtx_attr_p99_us=X.XX draw_vtx_sync_p99_us=X.XX
+#            draw_prim_rw_p99_us=X.XX
+#            pipe_bind_tex_p99_us=X.XX pipe_bind_shd_p99_us=X.XX
+#            pipe_lookup_p99_us=X.XX
+#
+# `count/s` is methods of that class per second; `(C%)` is the percent of
+# total method-class cycles spent in that class (sums to ~100). The p99 values
+# are exponential-MA-smoothed max-per-snapshot in microseconds.
+_METHOD_CLASSES = [
+    ("vertex",       "Vertex data"),
+    ("tex_state",    "Texture state"),
+    ("shader_state", "Shader state"),
+    ("light",        "Lighting"),
+    ("render_state", "Render state"),
+    ("inline_draw",  "Inline draw"),
+    ("other",        "Other"),
+]
+_METHOD_STAT_RE = re.compile(
+    r"win=(?P<win_ms>\d+)_ms\s+"
+    r"vertex/s=(?P<v_rate>\d+)\((?P<v_pct>\d+)%\)\s+"
+    r"tex_state/s=(?P<t_rate>\d+)\((?P<t_pct>\d+)%\)\s+"
+    r"shader_state/s=(?P<s_rate>\d+)\((?P<s_pct>\d+)%\)\s+"
+    r"light/s=(?P<l_rate>\d+)\((?P<l_pct>\d+)%\)\s+"
+    r"render_state/s=(?P<r_rate>\d+)\((?P<r_pct>\d+)%\)\s+"
+    r"inline_draw/s=(?P<i_rate>\d+)\((?P<i_pct>\d+)%\)\s+"
+    r"other/s=(?P<o_rate>\d+)\((?P<o_pct>\d+)%\)\s+\|\s+"
+    r"draws_per_submit=(?P<dps_int>\d+)\.(?P<dps_frac>\d+)\s+\|\s+"
+    r"draw_vk_cmd_p99_us=(?P<p99_vk>[\d.]+)\s+"
+    r"draw_setup_p99_us=(?P<p99_setup>[\d.]+)\s+"
+    r"draw_vtx_attr_p99_us=(?P<p99_vatt>[\d.]+)\s+"
+    r"draw_vtx_sync_p99_us=(?P<p99_vsync>[\d.]+)\s+"
+    r"draw_prim_rw_p99_us=(?P<p99_prim>[\d.]+)\s+"
+    r"pipe_bind_tex_p99_us=(?P<p99_bindt>[\d.]+)\s+"
+    r"pipe_bind_shd_p99_us=(?P<p99_binds>[\d.]+)\s+"
+    r"pipe_lookup_p99_us=(?P<p99_lookup>[\d.]+)"
+)
+
+
+@mcp.tool()
+def pgraph_method_stats(samples: int = 15) -> str:
+    """Phase 2.1 + 2.2: NV2A method-class histogram and per-draw phase p99.
+
+    Phase 1's caches addressed cache-miss CPU costs in the pgraph slow
+    path. To decide whether Phase 3's producer/consumer thread split is
+    worthwhile we need to know:
+      (a) Concentration — is one method class >50% of pfifo cycles? If
+          yes, the split has high yield. Spread across 4+ classes means
+          lower yield from a single structural change.
+      (b) Encode-vs-parse ratio — `draw_vk_cmd_p99_us` relative to the
+          other per-draw phases. High vk_cmd p99 + high
+          `draws_per_submit` means a non-trivial chunk of pfifo cost is
+          pure Vulkan encode, which IS splittable. Low vk_cmd p99 means
+          parse/setup dominates and the split won't move the needle.
+
+    Drains recent `xemu-method` logcat lines and renders:
+      * Method-class histogram with count/s and cycle share per class
+      * Per-draw phase p99 (microseconds, smoothed max)
+      * draws_per_submit ratio
+
+    Args:
+      samples: how many recent xemu-method windows to display
+               (default 15 = last ~30s; pass 60 for the last ~2 min).
+    """
+    if not _device():
+        return "No device connected."
+    pid = _emu_pid()
+    if not pid:
+        return f"{PKG}:xemu is not running. Launch it before sampling."
+    if samples <= 0:
+        return "samples must be > 0."
+
+    raw = _sh(f"logcat -d -s xemu-method:I --pid={pid}")
+    lines = [ln for ln in (raw or "").splitlines() if "win=" in ln]
+    if not lines:
+        return ("No xemu-method lines yet. Either the emulator hasn't "
+                "reached FLIP_STALL (still on the boot animation) or the "
+                "running build predates the Phase 2.1/2.2 instrumentation "
+                "in hw/xbox/nv2a/pgraph/profile.c — rebuild + reinstall.")
+
+    parsed = []
+    for ln in lines[-samples:]:
+        m = _METHOD_STAT_RE.search(ln)
+        if not m:
+            continue
+        d = m.groupdict()
+        parsed.append({
+            "win_ms":    int(d["win_ms"]),
+            "rates":     {
+                "vertex":       int(d["v_rate"]),
+                "tex_state":    int(d["t_rate"]),
+                "shader_state": int(d["s_rate"]),
+                "light":        int(d["l_rate"]),
+                "render_state": int(d["r_rate"]),
+                "inline_draw":  int(d["i_rate"]),
+                "other":        int(d["o_rate"]),
+            },
+            "pcts":      {
+                "vertex":       int(d["v_pct"]),
+                "tex_state":    int(d["t_pct"]),
+                "shader_state": int(d["s_pct"]),
+                "light":        int(d["l_pct"]),
+                "render_state": int(d["r_pct"]),
+                "inline_draw":  int(d["i_pct"]),
+                "other":        int(d["o_pct"]),
+            },
+            "dps":       float(f"{d['dps_int']}.{d['dps_frac']}"),
+            "p99_vk":    float(d["p99_vk"]),
+            "p99_setup": float(d["p99_setup"]),
+            "p99_vatt":  float(d["p99_vatt"]),
+            "p99_vsync": float(d["p99_vsync"]),
+            "p99_prim":  float(d["p99_prim"]),
+            "p99_bindt": float(d["p99_bindt"]),
+            "p99_binds": float(d["p99_binds"]),
+            "p99_lookup":float(d["p99_lookup"]),
+        })
+    if not parsed:
+        return ("Found xemu-method lines but none matched the expected "
+                "shape. Check the format in hw/xbox/nv2a/pgraph/profile.c "
+                "vs _METHOD_STAT_RE in this tool.")
+
+    out = []
+    out.append(f"Last {len(parsed)} xemu-method samples (each window ~2s):")
+    out.append("")
+    out.append("  Method-class histogram (averaged across window)")
+    out.append("  " + "-" * 76)
+    # Average across samples for the headline table.
+    n = len(parsed)
+    avg_rate = {k: 0 for k, _ in _METHOD_CLASSES}
+    avg_pct  = {k: 0 for k, _ in _METHOD_CLASSES}
+    for p in parsed:
+        for k, _ in _METHOD_CLASSES:
+            avg_rate[k] += p["rates"][k]
+            avg_pct[k]  += p["pcts"][k]
+    for k, _ in _METHOD_CLASSES:
+        avg_rate[k] //= n
+        avg_pct[k]  //= n
+
+    out.append(f"  {'Class':<14}  {'count/s':>10}  {'cycle %':>8}")
+    for k, label in _METHOD_CLASSES:
+        bar = "#" * (avg_pct[k] // 2)
+        out.append(f"  {label:<14}  {avg_rate[k]:>10}  {avg_pct[k]:>6}%  {bar}")
+
+    # Per-sample p99 table (last N samples)
+    out.append("")
+    out.append("  Per-draw phase p99 (microseconds, smoothed max per "
+               "snapshot)  +  draws/submit")
+    out.append("  win  vk_cmd  setup  vtx_att vtx_sync prim_rw "
+               "bind_tex bind_shd pipe_lkp  dps")
+    out.append("  " + "-" * 84)
+    for p in parsed:
+        out.append(
+            f"  {p['win_ms']:>4} "
+            f"{p['p99_vk']:>6.2f} {p['p99_setup']:>6.2f} "
+            f"{p['p99_vatt']:>7.2f} {p['p99_vsync']:>7.2f} "
+            f"{p['p99_prim']:>7.2f} {p['p99_bindt']:>7.2f} "
+            f"{p['p99_binds']:>7.2f} {p['p99_lookup']:>8.2f} "
+            f"{p['dps']:>5.2f}"
+        )
+
+    # Diagnosis: identify the dominant class + the dominant per-draw phase.
+    last = parsed[-1]
+    out.append("")
+    out.append("Diagnosis:")
+    sorted_classes = sorted(
+        [(label, last["pcts"][k]) for k, label in _METHOD_CLASSES],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    top_label, top_pct = sorted_classes[0]
+    if top_pct >= 50:
+        out.append(f"  *** {top_label} dominates at {top_pct}% of pfifo "
+                   f"cycles — single-class concentration favours Phase 3 "
+                   f"structural split or class-targeted fast-path.")
+    elif top_pct >= 30:
+        out.append(f"  --- {top_label} leads at {top_pct}% — moderate "
+                   f"concentration; consider class-targeted optimisations "
+                   f"before a structural split.")
+    else:
+        out.append(f"  --- pfifo cycles spread evenly across classes "
+                   f"(top: {top_label} at {top_pct}%) — Phase 3 split "
+                   f"yields will be lower; chase the largest per-draw "
+                   f"phase instead.")
+
+    # Encode-vs-parse ratio
+    phases = [
+        ("draw_vk_cmd",    last["p99_vk"]),
+        ("draw_setup",     last["p99_setup"]),
+        ("draw_vtx_attr",  last["p99_vatt"]),
+        ("draw_vtx_sync",  last["p99_vsync"]),
+        ("draw_prim_rw",   last["p99_prim"]),
+        ("pipe_bind_tex",  last["p99_bindt"]),
+        ("pipe_bind_shd",  last["p99_binds"]),
+        ("pipe_lookup",    last["p99_lookup"]),
+    ]
+    total_per_draw = sum(v for _, v in phases) or 1.0
+    vk_cmd_share = last["p99_vk"] / total_per_draw
+    out.append(f"  * draw_vk_cmd_p99={last['p99_vk']:.2f} us "
+               f"({vk_cmd_share*100:.0f}% of per-draw p99 sum) — "
+               f"{'encode-heavy' if vk_cmd_share >= 0.30 else 'parse-heavy'}")
+    if vk_cmd_share >= 0.30 and last["dps"] >= 20:
+        out.append(f"    + draws_per_submit={last['dps']:.2f} (>= 20) — "
+                   f"Phase 3 encode-thread split has favourable conditions.")
+    elif vk_cmd_share < 0.20:
+        out.append(f"    + Phase 3 split won't help — encode portion is "
+                   f"<20% of per-draw cost; attack parse/setup instead.")
+    elif last["dps"] < 10:
+        out.append(f"    + draws_per_submit={last['dps']:.2f} (<10) — "
+                   f"Phase 3 split's payoff is limited by small batches.")
+
+    # Pick the largest per-draw phase that ISN'T draw_vk_cmd as a target
+    # if encode-vs-parse leans parse.
+    if vk_cmd_share < 0.30:
+        non_vk = sorted(
+            [p for p in phases if p[0] != "draw_vk_cmd"],
+            key=lambda x: x[1], reverse=True,
+        )
+        if non_vk:
+            name, val = non_vk[0]
+            out.append(f"  * largest non-encode phase: {name} "
+                       f"p99={val:.2f} us — attack here first.")
+
+    return "\n".join(out)
+
+
 # Audio-trace log line shape from hw/xbox/mcpx/apu/apu.c:
 #   prod : hakuX-apu-prod : t=<ns> q_pre=<bytes> q_post=<bytes> peak=<int> work_us=<us> div=<frame_div>
 #   cons : hakuX-apu-cons : t=<ns> req=<bytes> avail=<bytes> copied=<bytes> underrun=<0|1>

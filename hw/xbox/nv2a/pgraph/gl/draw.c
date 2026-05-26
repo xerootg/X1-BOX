@@ -462,7 +462,7 @@ void pgraph_gl_flush_draw(NV2AState *d)
         pgraph_gl_bind_shaders(pg);
 
         PrimRewrite prim_rw = pgraph_prim_rewrite_ranges(
-            &r->prim_rewrite_buf, assembly, pg->draw_arrays_start,
+            &r->prim_rewrite_buf, NULL, assembly, pg->draw_arrays_start,
             pg->draw_arrays_count, pg->draw_arrays_length);
 
         if (prim_rw.num_indices > 0) {
@@ -487,7 +487,7 @@ void pgraph_gl_flush_draw(NV2AState *d)
         uint32_t *draw_indices = pg->inline_elements;
         unsigned int draw_index_count = pg->inline_elements_length;
         PrimRewrite prim_rw = pgraph_prim_rewrite_indexed(
-            &r->prim_rewrite_buf, assembly, pg->inline_elements,
+            &r->prim_rewrite_buf, NULL, assembly, pg->inline_elements,
             pg->inline_elements_length);
         if (prim_rw.num_indices > 0) {
             draw_indices = prim_rw.indices;

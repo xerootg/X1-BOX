@@ -42,6 +42,17 @@ std::atomic<int> g_x87_lib_mask_inited{0};
 
 void init_op_mask_from_env_once()
 {
+    /*
+     * Fast path: relaxed load — if already inited, no CAS, no memory
+     * barrier. The CAS variant (used unconditionally previously) showed
+     * up as ~6% of vCPU on SS2's profile via __aarch64_cas4_acq_rel
+     * because every x87 helper hits xemu_get_x87_lib_op which calls
+     * this. With the relaxed-load guard the steady-state cost is one
+     * cache-hot load.
+     */
+    if (g_x87_lib_mask_inited.load(std::memory_order_acquire) != 0) {
+        return;
+    }
     int expected = 0;
     if (!g_x87_lib_mask_inited.compare_exchange_strong(
             expected, 1, std::memory_order_acq_rel)) {
@@ -197,9 +208,16 @@ void xemu_set_x87_lib_mask(uint32_t mask)
  * setprop is the user-facing knob; the env var still works for
  * boot-time defaults. Property wins when present (non-empty).
  */
-static thread_local uint32_t s_prop_mask_cache = 0xFFFFFFFFu;
-static thread_local uint32_t s_prop_mask_calls_left = 0;
-static thread_local bool     s_prop_mask_seen = false;
+/*
+ * Plain static (NOT thread_local). Xbox is single-vCPU and these are
+ * only read/written from the vCPU thread inside xemu_get_x87_lib_op.
+ * thread_local cost a __emutls_get_address + pthread_getspecific per
+ * access, which on SS2 (x87-heavy) showed up as ~2% of vCPU. Plain
+ * static = one direct load.
+ */
+static uint32_t s_prop_mask_cache = 0xFFFFFFFFu;
+static uint32_t s_prop_mask_calls_left = 0;
+static bool     s_prop_mask_seen = false;
 static constexpr uint32_t PROP_MASK_REFRESH_CALLS = 0x10000u;
 
 static uint32_t resolve_op_mask_android(uint32_t fallback)

@@ -31,6 +31,15 @@ extern uint32_t cranelift_bridge_g_tier2_threshold;
 extern unsigned cranelift_bridge_g_pending_head;
 extern unsigned cranelift_bridge_g_pending_tail;
 
+/*
+ * X1BOX_HELPER_ROUTE_SHIM gate. When non-zero, helper_lookup_tb_ptr
+ * consults the shim map and returns the tier-2 shim pointer if the
+ * TB has been compiled — converting tier-1 tail-call chains into
+ * tier-2 chain entries. See the comment in cranelift_bridge_lazy_init
+ * for the cost/benefit trade-off.
+ */
+extern uint32_t cranelift_bridge_g_helper_route_shim;
+
 /* Decide whether this TB has crossed the tier-2 threshold. */
 bool cranelift_bridge_tb_should_promote(const TranslationBlock *tb);
 
@@ -164,6 +173,59 @@ static inline void cranelift_bridge_try_swap(TranslationBlock *tb)
  */
 void cranelift_bridge_on_tb_flush(void);
 
+/* ------------------------------------------------------------------ */
+/* Synchronous-fault unwind index                                       */
+/* ------------------------------------------------------------------ */
+/*
+ * Cranelift-compiled TBs live in a separate code arena (JITModule) from
+ * the tier-1 code-gen buffer.  helper_ld*_mmu / helper_st*_mmu et al
+ * resolve faults via GETPC() -> cpu_restore_state_from_tb, which
+ * normally walks the sleb128 search table appended after tb->tc.ptr.
+ * That table only covers tier-1 bytes, so a fault inside Cranelift code
+ * crashes the unwind.
+ *
+ * The unwind index is a parallel lookup: per compiled TB we keep a
+ * (host_lo, host_hi, host_end[], loc[], insn_data[]) record.  The fault
+ * path consults this when host_pc falls outside [tb->tc.ptr,
+ * tb->tc.ptr + tb->tc.size).
+ *
+ * Lifecycle:
+ *   - install: cranelift_bridge_try_swap_slow, right after the shim is
+ *              emitted but BEFORE the shim-map publication. The install
+ *              deep-copies the Rust-owned arrays into a C-allocated
+ *              slab; the Rust handle is released immediately after.
+ *   - drop:    do_tb_phys_invalidate, alongside the other per-TB
+ *              cleanup. The entry is removed from the index; backing
+ *              arrays are freed.
+ *   - wipe:    cranelift_bridge_on_tb_flush, zeroing the whole index
+ *              alongside the shim map / pending ring.
+ */
+
+/* Range-key lookup: returns the originating TB for a given host_pc that
+ * falls inside the cranelift code arena, or NULL otherwise. Cheap; the
+ * common-case fast path is bsearch on a sorted vec. */
+TranslationBlock *cranelift_unwind_tb_lookup(uintptr_t host_pc);
+
+/* Resolve guest-state restoration data for a fault inside cranelift
+ * code. Returns true on success and writes INSN_START_WORDS words into
+ * `data`, plus the number of instructions remaining in the TB (for
+ * icount adjustment) into `out_insns_left`. Returns false if the TB
+ * has no unwind entry (stale, never installed, or TB-pointer
+ * recycled). */
+bool cranelift_unwind_data_from_tb(const TranslationBlock *tb,
+                                   uintptr_t host_pc,
+                                   uint64_t *data,
+                                   int *out_insns_left);
+
+/* Drop the unwind entry for `tb`. Idempotent. Called from
+ * do_tb_phys_invalidate. */
+void cranelift_unwind_drop(const TranslationBlock *tb);
+
+/* Counters surfaced via cranelift_bridge_log_stats. */
+void cranelift_unwind_get_stats(uint64_t *hits, uint64_t *misses,
+                                uint64_t *stale_tb_pc,
+                                uint32_t *entries);
+
 /*
  * Return the installed tier-2 shim address for `tb`, or NULL if this
  * TB has not been tier-2 promoted.
@@ -222,6 +284,73 @@ void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
  * tolerated; reader sees one of the in-flight values).
  */
 void cranelift_get_helper_lookup_tb_lru_stats(uint64_t *hits, uint64_t *misses);
+
+/*
+ * phys_pc-hint stats for tb_htable_lookup_common.
+ *
+ * "hits"   = tb_htable_lookup_common calls that consumed a hint from the
+ *            helper LRU (skipped get_page_addr_code).
+ * "misses" = tb_htable_lookup_common calls that fell through to
+ *            get_page_addr_code (no hint available, or different page).
+ *
+ * Combined with the LRU hit/miss counters, this lets us see how much of
+ * the page-walk path we've eliminated end-to-end.
+ */
+void cranelift_get_helper_phys_pc_hint_stats(uint64_t *hits, uint64_t *misses);
+
+/*
+ * Per-CPU TB jmp_cache hit/miss counters.
+ *
+ * tb_lookup's fast path stays in the per-CPU direct-mapped jmp_cache
+ * (TB_JMP_CACHE_SIZE entries). A miss falls through to the global QHT
+ * via tb_htable_lookup_common — that's where the page-walk + hash
+ * lookup cost lives. The miss/hit ratio tells us whether the cache is
+ * sized correctly for the current working set.
+ */
+void cranelift_get_tb_jc_stats(uint64_t *hits, uint64_t *misses);
+
+/*
+ * TB pool / churn stats.
+ *
+ * gen_count   monotonic count of tb_gen_code calls (new TBs translated)
+ * inval_count monotonic count of tb_phys_invalidate calls
+ *             (TBs evicted by self-mod, page-protect change, or TB-cache reuse)
+ * flush_count monotonic count of tb_flush events (full TB cache wipes)
+ *
+ * High gen/sec with low inval/sec = working-set thrash (cache too small).
+ * High gen/sec with high inval/sec = self-modifying or page-shuffling guest.
+ * Spiking flush_count = guest is hammering tb_flush triggers (TB pool full,
+ * etc.). Used by the MCP jit_stats tool to surface what tb_gen_code's
+ * 31% share of cpu_exec_loop is actually measuring.
+ */
+void cranelift_get_tb_pool_stats(uint64_t *gen_count, uint64_t *inval_count,
+                                  uint64_t *flush_count);
+
+/*
+ * Helper-side shim-routing stats — when X1BOX_HELPER_ROUTE_SHIM=1.
+ *
+ * hits   = helper_lookup_tb_ptr returned a tier-2 shim pointer
+ * misses = TB found in LRU/jc/qht but had no shim installed yet, so
+ *          the helper returned tier-1 tb->tc.ptr
+ *
+ * hits/(hits+misses) is the effective tier-2 takeover rate from
+ * tier-1 tail-call chains. Compare to chain_iters/sec which is the
+ * separate "tier-2 from chain_continue" coverage. With routing on,
+ * helper hits should swamp chain_iters by >10× if Halo 2's hot TBs
+ * are mostly tier-2-compiled.
+ */
+void cranelift_get_helper_dispatch_shim_stats(uint64_t *hits, uint64_t *misses);
+
+/*
+ * vCPU thread's last-observed FPCR. Sampled once every ~16M
+ * helper_lookup_tb_ptr calls (~6 s). Used to verify that the FZ=0 /
+ * DN=0 set at mttcg_cpu_thread_fn entry hasn't been reset by a
+ * downstream library / helper / JIT op. If `fpcr & (1<<24)` is set,
+ * FZ has been turned back on and SSE-inline NEON arithmetic is
+ * silently flushing denormals (the documented SSE-physics drift
+ * mode for Halo 2).
+ */
+void cranelift_get_vcpu_fpcr_observed(uint64_t *fpcr);
 
 /*
  * Target-side helper: returns the top 16 bits of the guest stack pointer
@@ -333,6 +462,34 @@ static inline bool cranelift_bridge_is_swap_enabled(void) { return false; }
 static inline void cranelift_bridge_on_tb_flush(void) {}
 static inline void cranelift_bridge_jit_cache_open(const char *p) { (void)p; }
 static inline void cranelift_bridge_jit_cache_save(void) {}
+static inline TranslationBlock *
+cranelift_unwind_tb_lookup(uintptr_t host_pc)
+{
+    (void)host_pc;
+    return NULL;
+}
+static inline bool
+cranelift_unwind_data_from_tb(const TranslationBlock *tb,
+                              uintptr_t host_pc,
+                              uint64_t *data,
+                              int *out_insns_left)
+{
+    (void)tb; (void)host_pc; (void)data; (void)out_insns_left;
+    return false;
+}
+static inline void cranelift_unwind_drop(const TranslationBlock *tb)
+{
+    (void)tb;
+}
+static inline void
+cranelift_unwind_get_stats(uint64_t *hits, uint64_t *misses,
+                           uint64_t *stale_tb_pc, uint32_t *entries)
+{
+    if (hits) *hits = 0;
+    if (misses) *misses = 0;
+    if (stale_tb_pc) *stale_tb_pc = 0;
+    if (entries) *entries = 0;
+}
 static inline void cranelift_chain_init_quantum(void) {}
 static inline void
 cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,

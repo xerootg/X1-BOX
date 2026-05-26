@@ -44,18 +44,64 @@ typedef struct PrimAssemblyState {
     bool flat_shading;
 } PrimAssemblyState;
 
+/*
+ * LRU cache for the output of pgraph_prim_rewrite_indexed /
+ * pgraph_prim_rewrite_ranges. Halo 2 redraws the same meshes per-frame
+ * so the rewrite output is highly repetitive. Sequential rewrite is
+ * skipped (the rewrite itself is cheaper than a cache probe).
+ *
+ * Hash key = fast_hash(mode_bits, num_input_indices, input_indices[0..num])
+ * for the indexed path, or (mode_bits, num_ranges, starts[..], counts[..])
+ * for the ranges path. Secondary cheap hash is the tuple
+ * (input_count, first, mid, last) used as a collision guard — both must
+ * match for a hit.
+ *
+ * Entries hold an owned (g_realloc'd) index buffer. On hit, the cached
+ * indices are copied into the per-renderer PrimRewriteBuf so callers
+ * see the same `result.indices` pointer convention.
+ */
+#define PRIM_REWRITE_CACHE_ENTRIES 32
+
+typedef struct PrimRewriteCacheEntry {
+    bool valid;
+    uint64_t key_hash;
+    uint32_t secondary_hash;
+    PrimAssemblyState mode;
+    uint32_t input_count;
+    uint32_t *indices;       /* owned; g_realloc'd */
+    unsigned indices_cap;    /* in elements */
+    unsigned num_indices;
+    uint32_t lru_seq;
+} PrimRewriteCacheEntry;
+
+typedef struct PrimRewriteCache {
+    PrimRewriteCacheEntry entries[PRIM_REWRITE_CACHE_ENTRIES];
+    uint32_t lru_seq;
+} PrimRewriteCache;
+
 void pgraph_prim_rewrite_init(PrimRewriteBuf *buf);
 void pgraph_prim_rewrite_finalize(PrimRewriteBuf *buf);
+
+void pgraph_prim_rewrite_cache_init(PrimRewriteCache *cache);
+void pgraph_prim_rewrite_cache_finalize(PrimRewriteCache *cache);
+void pgraph_prim_rewrite_cache_invalidate(PrimRewriteCache *cache);
 enum ShaderPrimitiveMode
 pgraph_prim_rewrite_get_output_mode(enum ShaderPrimitiveMode primitive_mode,
                                     enum ShaderPolygonMode polygon_mode);
 
+/*
+ * `cache` may be NULL (GL renderer doesn't wire one up). The Vulkan
+ * path passes &r->index_cache. The sequential helper skips the cache
+ * by passing NULL — the rewrite cost is below a probe cost.
+ */
 PrimRewrite pgraph_prim_rewrite_indexed(PrimRewriteBuf *buf,
+                                        PrimRewriteCache *cache,
                                         PrimAssemblyState mode,
                                         const uint32_t *input_indices,
                                         unsigned int num_input_indices);
 
 PrimRewrite pgraph_prim_rewrite_ranges(PrimRewriteBuf *buf,
+                                       PrimRewriteCache *cache,
                                        PrimAssemblyState mode,
                                        const int32_t *starts,
                                        const int32_t *counts,
@@ -66,7 +112,8 @@ static inline PrimRewrite pgraph_prim_rewrite_sequential(PrimRewriteBuf *buf,
                                                          int32_t start,
                                                          int32_t count)
 {
-    return pgraph_prim_rewrite_ranges(buf, mode, &start, &count, 1);
+    /* sequential: cache disabled — rewrite cost < probe cost. */
+    return pgraph_prim_rewrite_ranges(buf, NULL, mode, &start, &count, 1);
 }
 
 #endif

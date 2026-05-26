@@ -509,6 +509,7 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
                  stg_max >> 20);
 
     pgraph_prim_rewrite_init(&r->prim_rewrite_buf);
+    pgraph_prim_rewrite_cache_init(&r->index_cache);
 
     r->draw_queue.index_buf = g_malloc0(INDEX_QUEUE_MAX * sizeof(uint32_t));
 
@@ -573,6 +574,7 @@ void pgraph_vk_finalize_buffers(NV2AState *d)
     }
 
     pgraph_prim_rewrite_finalize(&r->prim_rewrite_buf);
+    pgraph_prim_rewrite_cache_finalize(&r->index_cache);
 
     g_free(r->draw_queue.index_buf);
     r->draw_queue.index_buf = NULL;

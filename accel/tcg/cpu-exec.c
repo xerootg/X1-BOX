@@ -482,6 +482,71 @@ static bool tb_lookup_cmp(const void *p, const void *d)
     return false;
 }
 
+#if XEMU_HAVE_CRANELIFT
+/*
+ * phys_pc hint set by helper_lookup_tb_ptr from a same-virt-page LRU slot.
+ *
+ * On LRU miss, if we still have a slot whose TB is on the same code page
+ * with matching translation state (cs_base/flags/cflags), that TB's
+ * page_addr[0] is the phys_pc for this virt_page — page-granular, the
+ * intra-page offset is just s.pc & ~TARGET_PAGE_MASK. Skipping the
+ * get_page_addr_code call avoids the probe_access_internal → tlb fast-
+ * path chain (~10ns) and, on TLB miss, the full mmu_translate + tlb_fill
+ * + physical_memory_is_clean walk (~hundreds of ns).
+ *
+ * Single-vCPU on Android → plain static, no TLS overhead.
+ * Cleared after each tb_lookup so other tb_htable_lookup callers (e.g.
+ * inv_tb_htable_lookup from tb-maint) never see a stale hint.
+ *
+ * 0 means "no hint, fall through to get_page_addr_code". A valid hint is
+ * a page-aligned phys address (low TARGET_PAGE_BITS == 0).
+ */
+static tb_page_addr_t helper_phys_pc_hint;
+static uint64_t helper_phys_pc_hint_hits;
+static uint64_t helper_phys_pc_hint_misses;
+
+void cranelift_get_helper_phys_pc_hint_stats(uint64_t *hits, uint64_t *misses)
+{
+    if (hits)   *hits = qatomic_read(&helper_phys_pc_hint_hits);
+    if (misses) *misses = qatomic_read(&helper_phys_pc_hint_misses);
+}
+
+/*
+ * tb_jmp_cache hit/miss counters and TB-pool stats.
+ *
+ * These let the MCP debugger measure whether the hot-path lookup is
+ * actually staying in the per-CPU jmp_cache vs falling through to the
+ * QHT (and the page walk that comes with it). The callgraph shows
+ * helper_lookup_tb_ptr → tb_htable_lookup as a big chunk of vCPU, but
+ * the flat profile alone doesn't tell us if that's because the cache is
+ * undersized or because something is constantly evicting entries.
+ *
+ * tb_gen_count and tb_phys_inval_count bump from translate-all.c and
+ * tb-maint.c respectively (extern declarations in the same xemu
+ * cranelift-bridge.h surface). The /sec rates derived from these tell
+ * us whether tb_gen_code's 31% share of cpu_exec_loop is steady churn
+ * (working set thrash) or burst recompiles (CR3 / self-mod waves).
+ */
+static uint64_t xemu_jit_jc_hits;
+static uint64_t xemu_jit_jc_misses;
+uint64_t xemu_jit_tb_gen_count;
+uint64_t xemu_jit_tb_phys_inval_count;
+
+void cranelift_get_tb_jc_stats(uint64_t *hits, uint64_t *misses)
+{
+    if (hits)   *hits = qatomic_read(&xemu_jit_jc_hits);
+    if (misses) *misses = qatomic_read(&xemu_jit_jc_misses);
+}
+
+void cranelift_get_tb_pool_stats(uint64_t *gen_count, uint64_t *inval_count,
+                                  uint64_t *flush_count)
+{
+    if (gen_count)   *gen_count   = qatomic_read(&xemu_jit_tb_gen_count);
+    if (inval_count) *inval_count = qatomic_read(&xemu_jit_tb_phys_inval_count);
+    if (flush_count) *flush_count = qatomic_read(&tb_ctx.tb_flush_count);
+}
+#endif
+
 static TranslationBlock *
 tb_htable_lookup_common(CPUState *cpu, TCGTBCPUState s, const struct qht *ht,
                         qht_lookup_func_t func)
@@ -492,7 +557,17 @@ tb_htable_lookup_common(CPUState *cpu, TCGTBCPUState s, const struct qht *ht,
 
     desc.s = s;
     desc.env = cpu_env(cpu);
+#if XEMU_HAVE_CRANELIFT
+    if (helper_phys_pc_hint) {
+        phys_pc = helper_phys_pc_hint | (s.pc & ~TARGET_PAGE_MASK);
+        helper_phys_pc_hint_hits++;
+    } else {
+        phys_pc = get_page_addr_code(desc.env, s.pc);
+        helper_phys_pc_hint_misses++;
+    }
+#else
     phys_pc = get_page_addr_code(desc.env, s.pc);
+#endif
     if (phys_pc == -1) {
         return NULL;
     }
@@ -553,9 +628,15 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
                tb->cs_base == s.cs_base &&
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
+#if XEMU_HAVE_CRANELIFT
+        xemu_jit_jc_hits++;
+#endif
         goto hit;
     }
 
+#if XEMU_HAVE_CRANELIFT
+    xemu_jit_jc_misses++;
+#endif
     tb = tb_htable_lookup(cpu, s);
     if (tb == NULL) {
         return NULL;
@@ -704,24 +785,28 @@ struct helper_tb_lru_slot {
     uint32_t flags;
     uint32_t cflags;
     TranslationBlock *tb;
+    /*
+     * tb_page_addr0(tb) & TARGET_PAGE_MASK, cached at insert so the
+     * phys_pc hint side-channel in tb_htable_lookup_common can fire on
+     * an LRU same-page match without a second pass over the slots.
+     */
+    tb_page_addr_t phys_pc_page;
 };
 /*
- * Plain static storage (NOT __thread).
+ * Plain static storage (NOT __thread, single-vCPU).
  *
- * Per-vCPU LRU was originally __thread. On Android Bionic, __thread
- * access compiles to __emutls_get_address (a function call resolving
- * the thread-local slot — measured 1.5% of vCPU in helper_lookup_tb_ptr
- * profiles) plus tlsdesc_resolver_dynamic (1.5%) plus pthread_getspecific
- * (1.5%) — about 5% of vCPU on TLS alone.
+ * 8-slot LRU with MRU promotion. jit_stats (2026-05-25) measured
+ * 4 slots = 29% hit / 8 slots = 45% hit on Halo 2 gameplay. Kept the
+ * 8-slot win so cold-path lookups (qht + page walks) are minimised,
+ * but the real lever is still the 3M helper calls/sec coming from
+ * tier-1 indirect branches — see project_cranelift_qemu_ld_st_blocker
+ * for the path to slashing that rate by promoting more TBs to tier-2.
  *
- * xemu is single-vCPU on Android (target/i386 has CPU 0/TCG only). The
- * LRU data is read+written ONLY from the vCPU thread (helper_lookup_tb_ptr
- * is called from generated guest code which only runs on that thread).
- * No TLS isolation needed; plain statics give us register/cache-line
- * access via the linker's GOT, no function call.
+ * Memory cost: 8 × 40B = 320B static (5 cache lines on aarch64).
  */
+#define HELPER_TB_LRU_SIZE 8
 static struct {
-    struct helper_tb_lru_slot slots[2];
+    struct helper_tb_lru_slot slots[HELPER_TB_LRU_SIZE];
     unsigned last_flush_count;
 } helper_tb_lru;
 
@@ -733,6 +818,86 @@ void cranelift_get_helper_lookup_tb_lru_stats(uint64_t *hits, uint64_t *misses)
     if (hits)   *hits = qatomic_read(&helper_lookup_tb_lru_hits);
     if (misses) *misses = qatomic_read(&helper_lookup_tb_lru_misses);
 }
+
+/*
+ * Resolve the host code pointer to dispatch into for a given TB.
+ *
+ * When X1BOX_HELPER_ROUTE_SHIM=0 (default): always returns tb->tc.ptr.
+ * Existing tier-1 tail-call chains stay in tier-1.
+ *
+ * When =1: consults cranelift_bridge_lookup_shim and prefers the
+ * tier-2 shim pointer if present. The shim is set up to receive
+ * env in X19 (tcg-prologue ABI), the same ABI the tier-1 caller's
+ * br x0 leaves us in, so cross-tier tail-call is safe.
+ *
+ * Cost on the OFF path: one qatomic_read of an L1-hot u32 + one
+ * branch — should fold into the load-pair the helper already does.
+ * Cost on the ON path: + the shim's hash probe (~10 ns avg, see
+ * cranelift_bridge_lookup_shim).
+ */
+static uint64_t helper_dispatch_shim_hits;
+static uint64_t helper_dispatch_shim_misses;
+
+static inline const void *helper_resolve_tb_dispatch(TranslationBlock *tb)
+{
+    if (likely(qatomic_read(&cranelift_bridge_g_helper_route_shim) == 0)) {
+        return tb->tc.ptr;
+    }
+    const void *shim = cranelift_bridge_lookup_shim(tb);
+    if (shim) {
+        helper_dispatch_shim_hits++;
+        return shim;
+    }
+    helper_dispatch_shim_misses++;
+    return tb->tc.ptr;
+}
+
+void cranelift_get_helper_dispatch_shim_stats(uint64_t *hits, uint64_t *misses)
+{
+    if (hits)   *hits   = qatomic_read(&helper_dispatch_shim_hits);
+    if (misses) *misses = qatomic_read(&helper_dispatch_shim_misses);
+}
+
+/*
+ * Rate-limited vCPU-thread FPCR observation.
+ *
+ * 2026-05-25 physics-drift bisection: we set FPCR.FZ=0 / DN=0 at
+ * mttcg_cpu_thread_fn entry, but the user reports SSE-inline still
+ * causes NPC sliding (SSE_INLINE drift signature). One hypothesis is
+ * that something downstream (libc, helper, JITted barrier) restores
+ * FPCR.FZ=1 after our write. This sampler reads FPCR from inside
+ * helper_lookup_tb_ptr — which is GUARANTEED to run on the vCPU
+ * thread — once every 16 million calls (~once every ~6 seconds at
+ * the observed 3M helper calls/sec). Whatever value FPCR has during
+ * the JITted arithmetic that the helper bookends is what we observe
+ * here.
+ *
+ * If we see FPCR back at the aarch64 default (FZ=1), we know
+ * something is resetting it. If we see FZ=0 here AND physics still
+ * drifts, the drift is architectural (NEON FMUL behaviour) not
+ * configurable, and SSE_INLINE has to come back off.
+ */
+#if defined(__aarch64__)
+static uint64_t vcpu_fpcr_last_observed;
+static uint64_t vcpu_fpcr_check_counter;
+
+static inline void vcpu_fpcr_sample(void)
+{
+    /* Mask 0xFFFFFF = 16M calls (~5 s at 3M/s). */
+    if (likely((++vcpu_fpcr_check_counter & 0xFFFFFFu) != 0)) return;
+    uint64_t fpcr;
+    asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+    vcpu_fpcr_last_observed = fpcr;
+}
+
+void cranelift_get_vcpu_fpcr_observed(uint64_t *fpcr)
+{
+    if (fpcr) *fpcr = qatomic_read(&vcpu_fpcr_last_observed);
+}
+#else
+static inline void vcpu_fpcr_sample(void) { }
+void cranelift_get_vcpu_fpcr_observed(uint64_t *fpcr) { if (fpcr) *fpcr = 0; }
+#endif
 #endif
 
 /**
@@ -747,6 +912,10 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 {
     CPUState *cpu = env_cpu(env);
     TranslationBlock *tb;
+
+#if XEMU_HAVE_CRANELIFT
+    vcpu_fpcr_sample();
+#endif
 
     /*
      * By definition we've just finished a TB, so I/O is OK.
@@ -773,10 +942,18 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     {
         unsigned cur_flush = qatomic_read(&tb_ctx.tb_flush_count);
         if (unlikely(cur_flush != helper_tb_lru.last_flush_count)) {
-            helper_tb_lru.slots[0].tb = NULL;
-            helper_tb_lru.slots[1].tb = NULL;
+            for (unsigned i = 0; i < HELPER_TB_LRU_SIZE; i++) {
+                helper_tb_lru.slots[i].tb = NULL;
+            }
             helper_tb_lru.last_flush_count = cur_flush;
         } else {
+            /*
+             * Slot-0 fast path: ~50% of calls hit here on Halo 2
+             * gameplay. Branch predictor needs the likely() to pipeline
+             * the hit-return ahead of the cold-path loop body, otherwise
+             * helper_lookup_tb_ptr fans out into the same-page scan
+             * cost on every call.
+             */
             struct helper_tb_lru_slot *s0 = &helper_tb_lru.slots[0];
             if (likely(s0->tb && s0->pc == s.pc &&
                        s0->cs_base == s.cs_base &&
@@ -784,37 +961,78 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
                        s0->cflags == s.cflags &&
                        !(tb_cflags(s0->tb) & CF_INVALID))) {
                 helper_lookup_tb_lru_hits++;
-                return s0->tb->tc.ptr;
+                return helper_resolve_tb_dispatch(s0->tb);
             }
-            struct helper_tb_lru_slot *s1 = &helper_tb_lru.slots[1];
-            if (s1->tb && s1->pc == s.pc &&
-                s1->cs_base == s.cs_base &&
-                s1->flags == s.flags &&
-                s1->cflags == s.cflags &&
-                !(tb_cflags(s1->tb) & CF_INVALID)) {
-                struct helper_tb_lru_slot tmp = *s1;
-                *s1 = *s0;
-                *s0 = tmp;
-                helper_lookup_tb_lru_hits++;
-                return s0->tb->tc.ptr;
+            /*
+             * Cold path: scan slots 0..N-1. Each iteration does double
+             * duty — looks for an exact match (return + promote) and
+             * also remembers the first same-page same-state slot to
+             * publish as the phys_pc hint for tb_htable_lookup_common.
+             *
+             * The hint is page-granular, so a same-page TB's
+             * phys_pc_page (cached at insert time) gives us phys_pc for
+             * s.pc without get_page_addr_code → probe_access_internal
+             * → mmu_translate / tlb_fill / physical_memory_is_clean.
+             *
+             * Folded into one pass to avoid the 2-loop scan cost that
+             * showed up in the 2026-05-25 callgraph as a ~6% inflation
+             * of helper_lookup_tb_ptr — that scan now rides along on
+             * the existing per-slot compares.
+             */
+            tb_page_addr_t hint = 0;
+            vaddr virt_page = s.pc & TARGET_PAGE_MASK;
+            for (unsigned i = 0; i < HELPER_TB_LRU_SIZE; i++) {
+                struct helper_tb_lru_slot *si = &helper_tb_lru.slots[i];
+                if (!si->tb) continue;
+                if (si->cs_base != s.cs_base ||
+                    si->flags   != s.flags   ||
+                    si->cflags  != s.cflags) continue;
+                if (tb_cflags(si->tb) & CF_INVALID) continue;
+
+                if (si->pc == s.pc) {
+                    if (i == 0) {
+                        helper_lookup_tb_lru_hits++;
+                        return helper_resolve_tb_dispatch(si->tb);
+                    }
+                    /* Promote slot i → slot 0, shift others down. */
+                    struct helper_tb_lru_slot hit = *si;
+                    for (unsigned j = i; j > 0; j--) {
+                        helper_tb_lru.slots[j] = helper_tb_lru.slots[j - 1];
+                    }
+                    helper_tb_lru.slots[0] = hit;
+                    helper_lookup_tb_lru_hits++;
+                    return helper_resolve_tb_dispatch(hit.tb);
+                }
+
+                if (!hint && (si->pc & TARGET_PAGE_MASK) == virt_page) {
+                    hint = si->phys_pc_page;
+                }
             }
+            helper_phys_pc_hint = hint;
         }
     }
 #endif
 
     tb = tb_lookup(cpu, s);
+#if XEMU_HAVE_CRANELIFT
+    helper_phys_pc_hint = 0;
+#endif
     if (tb == NULL) {
         return tcg_code_gen_epilogue;
     }
 
 #if XEMU_HAVE_CRANELIFT
     helper_lookup_tb_lru_misses++;
-    helper_tb_lru.slots[1] = helper_tb_lru.slots[0];
+    /* Shift all slots down, install new entry at slot 0. */
+    for (unsigned i = HELPER_TB_LRU_SIZE - 1; i > 0; i--) {
+        helper_tb_lru.slots[i] = helper_tb_lru.slots[i - 1];
+    }
     helper_tb_lru.slots[0].pc = s.pc;
     helper_tb_lru.slots[0].cs_base = s.cs_base;
     helper_tb_lru.slots[0].flags = s.flags;
     helper_tb_lru.slots[0].cflags = s.cflags;
     helper_tb_lru.slots[0].tb = tb;
+    helper_tb_lru.slots[0].phys_pc_page = tb_page_addr0(tb) & TARGET_PAGE_MASK;
 #endif
 
     BURST_DIAG_BUMP_TB_LOOKUP_PC(s.pc);
@@ -823,7 +1041,11 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
         log_cpu_exec(s.pc, cpu, tb);
     }
 
+#if XEMU_HAVE_CRANELIFT
+    return helper_resolve_tb_dispatch(tb);
+#else
     return tb->tc.ptr;
+#endif
 }
 
 /* Return the current PC from CPU, which may be cached in TB. */
@@ -1102,6 +1324,41 @@ uintptr_t cranelift_chain_continue(CPUArchState *env)
          */
         if (xbox_hle_check(cpu, (uint32_t)s.pc)) {
             continue;
+        }
+
+        /*
+         * Tier-2 install + hotness bookkeeping for chain-dispatched TBs.
+         *
+         * 2026-05-25 finding: tier-2-compiled TBs that only run via
+         * chain or tail-call never went through cpu_loop_exec_tb's
+         * `cranelift_bridge_try_swap` call, so their shims were never
+         * installed into g_shim_map even after the cranelift worker
+         * published them. Adding try_swap here lifts shim install rate
+         * from ~5K/sec to the full chain-iter rate.
+         *
+         * exec_count++ is mirrored from cpu_loop_exec_tb so chain-only
+         * TBs at least accumulate the same hotness counter (used by
+         * tier1_maybe_promote for the TCG-side superblock formation).
+         * try_swap reads tb->tier / cranelift_pending — cache-hot,
+         * actual work only on first install per TB.
+         *
+         * NOTE: `cranelift_bridge_maybe_compile` was also tried here
+         * (2026-05-25) so chain-only TBs would get enqueued for tier-2
+         * compile. RESULT: boot crash a couple seconds into the Halo 2
+         * Bink intro. Likely cause: enabling tier-2 codegen for a
+         * population of TBs that the original 1.28% bail-rate analysis
+         * never covered (those TBs were never compiled because they
+         * never went through the outer dispatch — so any latent
+         * cranelift codegen bug on those TBs surfaced for the first
+         * time). Don't re-enable the maybe_compile call here without
+         * first finding+fixing the specific TB(s) that crash.
+         */
+        {
+            uint32_t c = tb->exec_count;
+            if (c < (uint32_t)g_tier1_threshold * 2) {
+                tb->exec_count = c + 1;
+            }
+            cranelift_bridge_try_swap(tb);
         }
 
         const void *code = cranelift_bridge_lookup_shim(tb);

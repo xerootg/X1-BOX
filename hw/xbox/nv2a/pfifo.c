@@ -373,6 +373,54 @@ static bool pfifo_pusher_should_stall(NV2AState *d)
            qatomic_read(&d->pgraph.waiting_for_nop);
 }
 
+/*
+ * Producer-consumer telemetry for the PGRAPH DMA push-buffer.
+ *
+ * Sampled at every entry of pfifo_run_pusher. Tells us whether the
+ * vCPU is producing GPU commands faster than this thread can drain
+ * them (ring usually full → pfifo is the bottleneck) or vice-versa
+ * (ring usually empty → vCPU is the bottleneck and pfifo waits a lot).
+ *
+ * `depth_bytes` = (dma_put - dma_get) mod dma_len  — the number of
+ * bytes the producer has written that the consumer hasn't yet read.
+ * Sampling-only (no perf cost on the hot path beyond two uint32
+ * reads + a few atomic_add).
+ */
+static struct {
+    uint64_t samples;
+    uint64_t depth_sum;       /* mean = depth_sum / samples       */
+    uint32_t depth_max;
+    uint64_t empty_samples;   /* depth == 0  → vCPU under-feeding */
+    uint64_t full_samples;    /* depth ≥ 0.9·dma_len → pfifo gated*/
+    uint64_t pusher_calls;    /* number of pfifo_run_pusher entries*/
+    uint64_t words_processed; /* cumulative dwords drained        */
+    uint32_t last_dma_len;
+    /* Pfifo wait-reason breakdown */
+    uint64_t wait_spin_wakeups;  /* short spin-wait, woken by kick */
+    uint64_t wait_idle_wakeups;  /* long cond_wait, woken by kick  */
+    uint64_t wait_ns_total;      /* cumulative idle wall-time (ns) */
+} g_pfifo_ring_stats;
+
+void pfifo_get_ring_stats(uint64_t *samples, uint64_t *depth_sum,
+                          uint32_t *depth_max, uint64_t *empty,
+                          uint64_t *full, uint64_t *pusher_calls,
+                          uint64_t *words, uint32_t *dma_len,
+                          uint64_t *wait_spin, uint64_t *wait_idle,
+                          uint64_t *wait_ns)
+{
+    if (samples)      *samples      = qatomic_read(&g_pfifo_ring_stats.samples);
+    if (depth_sum)    *depth_sum    = qatomic_read(&g_pfifo_ring_stats.depth_sum);
+    if (depth_max)    *depth_max    = qatomic_read(&g_pfifo_ring_stats.depth_max);
+    if (empty)        *empty        = qatomic_read(&g_pfifo_ring_stats.empty_samples);
+    if (full)         *full         = qatomic_read(&g_pfifo_ring_stats.full_samples);
+    if (pusher_calls) *pusher_calls = qatomic_read(&g_pfifo_ring_stats.pusher_calls);
+    if (words)        *words        = qatomic_read(&g_pfifo_ring_stats.words_processed);
+    if (dma_len)      *dma_len      = qatomic_read(&g_pfifo_ring_stats.last_dma_len);
+    if (wait_spin)    *wait_spin    = qatomic_read(&g_pfifo_ring_stats.wait_spin_wakeups);
+    if (wait_idle)    *wait_idle    = qatomic_read(&g_pfifo_ring_stats.wait_idle_wakeups);
+    if (wait_ns)      *wait_ns      = qatomic_read(&g_pfifo_ring_stats.wait_ns_total);
+}
+
 static void pfifo_run_pusher(NV2AState *d)
 {
     uint32_t *push0 = &d->pfifo.regs[NV_PFIFO_CACHE1_PUSH0];
@@ -417,6 +465,34 @@ static void pfifo_run_pusher(NV2AState *d)
     uint8_t *dma = nv_dma_map(d, dma_instance, &dma_len);
 
     uint32_t dma_get_start = *dma_get;
+
+    /*
+     * Ring fill-level sample. Done ONCE per pfifo_run_pusher entry,
+     * BEFORE we drain anything, so the depth reflects how much
+     * backlog the producer (vCPU) had accumulated. (dma_put may
+     * advance further while we drain; that's fine — next sample
+     * catches it.)
+     */
+    {
+        uint32_t put_v = *dma_put;
+        uint32_t get_v = dma_get_start;
+        uint32_t depth = (put_v >= get_v)
+            ? (put_v - get_v)
+            : ((uint32_t)dma_len - (get_v - put_v));
+        qatomic_inc(&g_pfifo_ring_stats.pusher_calls);
+        qatomic_add(&g_pfifo_ring_stats.samples, 1);
+        qatomic_add(&g_pfifo_ring_stats.depth_sum, depth);
+        qatomic_set(&g_pfifo_ring_stats.last_dma_len, (uint32_t)dma_len);
+        if (depth == 0) {
+            qatomic_inc(&g_pfifo_ring_stats.empty_samples);
+        } else if ((uint64_t)depth * 10 >= (uint64_t)dma_len * 9) {
+            qatomic_inc(&g_pfifo_ring_stats.full_samples);
+        }
+        uint32_t cur_max = qatomic_read(&g_pfifo_ring_stats.depth_max);
+        if (depth > cur_max) {
+            qatomic_set(&g_pfifo_ring_stats.depth_max, depth);
+        }
+    }
 
     while (!pfifo_pusher_should_stall(d)) {
         uint32_t dma_get_v = *dma_get;
@@ -566,8 +642,9 @@ static void pfifo_run_pusher(NV2AState *d)
 
     uint32_t dma_get_end = *dma_get;
     if (dma_get_end >= dma_get_start) {
-        g_nv2a_stats.cpu_working.pusher_words +=
-            (dma_get_end - dma_get_start) / 4;
+        uint32_t words = (dma_get_end - dma_get_start) / 4;
+        g_nv2a_stats.cpu_working.pusher_words += words;
+        qatomic_add(&g_pfifo_ring_stats.words_processed, words);
     }
 
     uint32_t error = GET_MASK(*dma_state, NV_PFIFO_CACHE1_DMA_STATE_ERROR);
@@ -641,6 +718,7 @@ void *pfifo_thread(void *arg)
                 }
                 if (spun_awake) {
                     g_nv2a_stats.cpu_working.kick_count_spun++;
+                    qatomic_inc(&g_pfifo_ring_stats.wait_spin_wakeups);
                 }
 
                 qemu_mutex_lock(&d->pfifo.lock);
@@ -648,18 +726,22 @@ void *pfifo_thread(void *arg)
                 if (!spun_awake && !d->pfifo.fifo_kick) {
                     qemu_cond_signal(&d->pfifo.fifo_idle_cond);
                     qemu_cond_wait(&d->pfifo.fifo_cond, &d->pfifo.lock);
+                    qatomic_inc(&g_pfifo_ring_stats.wait_idle_wakeups);
                 }
             } else {
                 g_nv2a_stats.cpu_working.kick_count_idle++;
+                qatomic_inc(&g_pfifo_ring_stats.wait_idle_wakeups);
                 qemu_cond_signal(&d->pfifo.fifo_idle_cond);
                 qemu_cond_wait(&d->pfifo.fifo_cond, &d->pfifo.lock);
             }
 #else
             qemu_cond_signal(&d->pfifo.fifo_idle_cond);
             qemu_cond_wait(&d->pfifo.fifo_cond, &d->pfifo.lock);
+            qatomic_inc(&g_pfifo_ring_stats.wait_idle_wakeups);
 #endif
 
             int64_t idle_ns = nv2a_clock_ns() - idle_t0;
+            qatomic_add(&g_pfifo_ring_stats.wait_ns_total, (uint64_t)idle_ns);
             g_nv2a_stats.phase_working.fifo_idle_ns += idle_ns;
             if (g_nv2a_stats.phase_working.post_flip) {
                 g_nv2a_stats.phase_working.fifo_idle_frame_ns += idle_ns;

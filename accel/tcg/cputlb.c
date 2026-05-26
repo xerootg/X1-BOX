@@ -279,6 +279,7 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
 static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 {
     desc->n_used_entries = 0;
+    desc->n_used_vtlb_entries = 0;
     desc->large_page_addr = -1;
     desc->large_page_mask = -1;
     desc->vindex = 0;
@@ -489,6 +490,12 @@ static void tlb_flush_vtlb_page_mask_locked(CPUState *cpu, int mmu_idx,
     for (k = 0; k < CPU_VTLB_SIZE; k++) {
         if (tlb_flush_entry_mask_locked(&d->vtable[k], page, mask)) {
             tlb_n_used_entries_dec(cpu, mmu_idx);
+            /* Mirror dec on the victim counter so n_used_vtlb_entries
+             * tracks the actual victim slot occupancy. Symmetric to the
+             * inc at the eviction site in tlb_set_page_full. */
+            if (d->n_used_vtlb_entries > 0) {
+                d->n_used_vtlb_entries--;
+            }
         }
     }
 }
@@ -968,12 +975,15 @@ void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
             }
         }
 
-        /* Victim TLB is CPU_VTLB_SIZE=8, cheap. Walk unconditionally:
-         * large-page evictions can leave entries here even when the
-         * main TLB has been flushed and n_used_entries==0. */
-        for (i = 0; i < CPU_VTLB_SIZE; i++) {
-            tlb_reset_dirty_range_locked(&desc->vfulltlb[i], &desc->vtable[i],
-                                         start, length);
+        /* Victim TLB walk: CPU_VTLB_SIZE=8 per mode. Cheap individually,
+         * but 22 modes x 8 entries x cache-line memory-fetch adds up
+         * because most modes have an empty victim. Symmetric to the
+         * main-TLB n_used_entries skip above. */
+        if (desc->n_used_vtlb_entries > 0) {
+            for (i = 0; i < CPU_VTLB_SIZE; i++) {
+                tlb_reset_dirty_range_locked(&desc->vfulltlb[i], &desc->vtable[i],
+                                             start, length);
+            }
         }
     }
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
@@ -1176,10 +1186,19 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         unsigned vidx = desc->vindex++ % CPU_VTLB_SIZE;
         CPUTLBEntry *tv = &desc->vtable[vidx];
 
-        /* Evict the old entry into the victim tlb.  */
+        /* Evict the old entry into the victim tlb. If the victim slot
+         * we're overwriting already held a valid entry, we're replacing
+         * it (no net change in occupancy); otherwise occupancy grows
+         * by one. Either way the eviction always lands a valid entry
+         * in vtable[vidx], so saturate at CPU_VTLB_SIZE. */
+        bool prev_vacancy = tlb_entry_is_empty(tv);
         copy_tlb_helper_locked(tv, te);
         desc->vfulltlb[vidx] = desc->fulltlb[index];
         tlb_n_used_entries_dec(cpu, mmu_idx);
+        if (prev_vacancy &&
+            desc->n_used_vtlb_entries < CPU_VTLB_SIZE) {
+            desc->n_used_vtlb_entries++;
+        }
     }
 
     /* refill the tlb */
