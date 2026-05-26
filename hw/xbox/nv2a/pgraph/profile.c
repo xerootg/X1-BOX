@@ -289,6 +289,7 @@ void nv2a_profile_increment(void)
         static uint64_t last_pfifo_wait_ns;
         static uint64_t last_hle_idle, last_hle_yields, last_hle_yield_ns;
         static uint64_t last_uni_hits, last_uni_misses;
+        static uint64_t last_mfh, last_mc;
         /* Phase 1.2 (index rewrite LRU) + 1.3 (surface part skip) */
         static uint64_t last_idx_hits, last_idx_misses, last_idx_evicts;
         static uint64_t last_surf_skip, last_surf_calls;
@@ -368,6 +369,15 @@ void nv2a_profile_increment(void)
             uint64_t hle_yield_pct_x100 = pipe_window_us
                 ? (d_hyn * 10) / pipe_window_us : 0;
 
+            /* method_fast_hit accumulates per try_fast call by num_proc
+             * (count of methods consumed). method_count is per method
+             * header group. ratio = fast_hit/(fast_hit + slow_methods).
+             * If the vertex fast-path is engaging, fast_hit jumps. */
+            uint64_t mfh = g_nv2a_stats.cpu_working.method_fast_hit;
+            uint64_t mc  = g_nv2a_stats.cpu_working.method_count;
+            uint64_t d_mfh = mfh - last_mfh;
+            uint64_t d_mc  = mc  - last_mc;
+
             __android_log_print(ANDROID_LOG_INFO, "xemu-pipe",
                 "win=%lld_ms "
                 "ring avg=%llu max=%u dma_len=%u empty%%=%u full%%=%u "
@@ -377,7 +387,8 @@ void nv2a_profile_increment(void)
                 "hle_yield%%=%llu.%02llu "
                 "uni_skip_hit%%=%u uni_skip_total/s=%llu "
                 "idx_cache_hit%%=%u idx_cache_total/s=%llu idx_cache_evicts/s=%llu "
-                "surf_skip%%=%u surf_total/s=%llu",
+                "surf_skip%%=%u surf_total/s=%llu "
+                "mfh/s=%llu mc/s=%llu",
                 (long long)(pipe_window_us / 1000),
                 (unsigned long long)ring_avg,
                 pmax, pdma_len,
@@ -399,7 +410,9 @@ void nv2a_profile_increment(void)
                 (unsigned long long)(d_idx_total * 1000000 / pipe_window_us),
                 (unsigned long long)(d_iv * 1000000 / pipe_window_us),
                 surf_skip_pct,
-                (unsigned long long)(d_sc * 1000000 / pipe_window_us));
+                (unsigned long long)(d_sc * 1000000 / pipe_window_us),
+                (unsigned long long)(d_mfh * 1000000 / pipe_window_us),
+                (unsigned long long)(d_mc  * 1000000 / pipe_window_us));
 
             last_pipe_log_us       = now;
             last_pfifo_samples     = ps;
@@ -421,6 +434,8 @@ void nv2a_profile_increment(void)
             last_idx_evicts        = iv;
             last_surf_skip         = ss;
             last_surf_calls        = sc;
+            last_mfh               = mfh;
+            last_mc                = mc;
         }
 
         /*

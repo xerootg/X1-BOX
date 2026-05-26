@@ -221,6 +221,12 @@ bool cranelift_unwind_data_from_tb(const TranslationBlock *tb,
  * do_tb_phys_invalidate. */
 void cranelift_unwind_drop(const TranslationBlock *tb);
 
+/* Rate-limited diagnostic: log a host_pc that wasn't found in the unwind
+ * index along with the bracketing entries (nearest-below / above by
+ * host_lo) + the shim arena range. Used by cpu_io_recompile to capture
+ * the miss before falling back to abort/skip. */
+void cranelift_unwind_log_miss(uintptr_t host_pc);
+
 /* Counters surfaced via cranelift_bridge_log_stats. */
 void cranelift_unwind_get_stats(uint64_t *hits, uint64_t *misses,
                                 uint64_t *stale_tb_pc,

@@ -43,6 +43,7 @@ typedef struct MemoryBudget {
     size_t texture_cache_entries;
     int image_pool_max;
     int surface_image_pool_max;
+    size_t surface_image_pool_bytes_max; /* 0 = uncapped (legacy) */
 } MemoryBudget;
 
 static MemoryBudget compute_memory_budget(PGRAPHVkState *r)
@@ -94,6 +95,7 @@ static MemoryBudget compute_memory_budget(PGRAPHVkState *r)
         b.texture_cache_entries = 1024;
         b.image_pool_max = 128;
         b.surface_image_pool_max = 64;
+        b.surface_image_pool_bytes_max = 0; /* uncapped on desktop */
     } else {
         size_t budget = b.renderer_budget;
         b.vertex_inline_cap = MAX(8 * mib, budget / 5);
@@ -126,6 +128,27 @@ static MemoryBudget compute_memory_budget(PGRAPHVkState *r)
             b.image_pool_max = 64;
             b.surface_image_pool_max = 32;
         }
+
+        /*
+         * Surface image pool bytes cap.
+         *
+         * Count-based cap alone breaks down at surface_scale>1 — each pooled
+         * entry holds image + image_scratch, and at 3x scale a 640x480
+         * surface becomes 1920x1440 RGBA8 = 21.6 MB per entry. A 32-entry
+         * pool then pins ~700 MB of GPU memory and reliably OOMs Adreno
+         * KGSL mid-session (observed: 10800 KB alloc refusals at FLIP_STALL,
+         * abort via VK_CHECK on vmaCreateImage).
+         *
+         * Cap at ~15% of the renderer budget — gives the pool meaningful
+         * headroom for hot-set reuse without monopolizing GPU memory that
+         * shader/texture caches also need. Floor at 64 MB so 1x-scale users
+         * keep effectively-unlimited pool behavior on small budgets.
+         */
+        size_t pool_bytes = budget * 15 / 100;
+        if (pool_bytes < 64 * mib) {
+            pool_bytes = 64 * mib;
+        }
+        b.surface_image_pool_bytes_max = pool_bytes;
     }
 
     return b;
@@ -192,11 +215,13 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
     r->texture_cache_target = mb.texture_cache_entries;
     r->image_pool_max = mb.image_pool_max;
     r->surface_image_pool_max = mb.surface_image_pool_max;
+    r->surface_image_pool_bytes_max = mb.surface_image_pool_bytes_max;
 
     VK_LOG_ERROR("memory_budget: total_heap=%zuMB budget=%s%zuMB "
                  "vtx_inline_cap=%zuMB index_cap=%zuMB staging_cap=%zuMB "
                  "pf_vtx=%zuMB pf_idx=%zuMB pf_uni=%zuMB pf_stg=%zuMB "
-                 "shader_cache=%zu tex_cache=%zu img_pool=%d surf_pool=%d",
+                 "shader_cache=%zu tex_cache=%zu img_pool=%d "
+                 "surf_pool=%d surf_pool_bytes=%zuMB",
                  mb.total_heap >> 20,
                  mb.renderer_budget == SIZE_MAX ? "uncapped/" : "",
                  mb.renderer_budget == SIZE_MAX ? 0 : mb.renderer_budget >> 20,
@@ -210,7 +235,8 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
                  mb.shader_module_cache_entries,
                  mb.texture_cache_entries,
                  mb.image_pool_max,
-                 mb.surface_image_pool_max);
+                 mb.surface_image_pool_max,
+                 mb.surface_image_pool_bytes_max >> 20);
 
     /* Xbox had 64 MB total UMA; no game stages more than 1× VRAM in flight
      * because the guest can't address that much. On Mali UMA (Android) the

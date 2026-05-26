@@ -1302,6 +1302,16 @@ typedef struct PGRAPHVkState {
     int image_pool_count;
     QTAILQ_HEAD(, PooledSurfaceImage) surface_image_pool;
     int surface_image_pool_count;
+    /*
+     * Total bytes currently held in the pool (sum of image + image_scratch
+     * across all entries, using surface_image_config_bytes() as an estimator).
+     * Pool eviction caps by both count AND bytes — see
+     * surface_image_pool_release. Critical for surface_scale>1 where each
+     * entry can be 20+ MB (e.g. 1920x1440 RGBA8 = 10.8 MB × 2 = 21.6 MB);
+     * without the bytes cap a 32-entry pool could pin ~700 MB of GPU memory
+     * and OOM the Adreno KGSL allocator mid-session.
+     */
+    size_t surface_image_pool_bytes;
     uint32_t last_texture_state_gen;
     uint32_t texture_vram_gen;
     uint32_t last_texture_vram_gen;
@@ -1347,6 +1357,9 @@ typedef struct PGRAPHVkState {
     size_t texture_cache_target;
     int image_pool_max;
     int surface_image_pool_max;
+    /* Companion byte cap for the surface image pool. See
+     * surface_image_pool_bytes above for rationale. 0 = uncapped (legacy). */
+    size_t surface_image_pool_bytes_max;
 
     // FIXME: Merge these into a structure
     uint64_t uniform_buffer_hashes[2];

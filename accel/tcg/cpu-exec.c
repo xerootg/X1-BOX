@@ -1362,10 +1362,29 @@ uintptr_t cranelift_chain_continue(CPUArchState *env)
         }
 
         const void *code = cranelift_bridge_lookup_shim(tb);
+        bool tier2 = (code != NULL);
         if (!code) {
             code = tb->tc.ptr;
         }
-        cpu->neg.can_do_io = false;
+        /*
+         * can_do_io contract per dispatch tier:
+         *
+         *  - tier-1: gated false so per-insn io_start IR can flip it true
+         *    at MMIO-capable instructions; if the JIT-generated TB does
+         *    MMIO outside a gated window, cpu_io_recompile unwinds via
+         *    tcg_tb_lookup(retaddr) and re-translates.
+         *
+         *  - tier-2 (cranelift): MUST be true. The cranelift backend does
+         *    not emit per-insn io_start ops, and softmmu helpers called
+         *    from cranelift code reach cpu_io_recompile with a retaddr
+         *    that GETPC() in the helper can't reliably reconstruct (the
+         *    shim->BLR->cranelift->helper chain breaks
+         *    __builtin_return_address). With can_do_io=true, MMIO
+         *    completes inside the helper and we never enter
+         *    cpu_io_recompile in the first place. Tier-2 doesn't honor
+         *    icount/precise-IRQ semantics anyway, so this is correct.
+         */
+        cpu->neg.can_do_io = tier2;
         uintptr_t r = tcg_qemu_tb_exec(cpu_env(cpu), code);
         cpu->neg.can_do_io = true;
         if (r & TB_EXIT_MASK) {
@@ -1470,11 +1489,20 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
      * causes cpu_io_recompile, watchpoint unwind, and fault recovery
      * to fail with `cpu_abort("can't recompile, no TB found")` on
      * the first helper that needs precise instruction state.
+     *
+     * For tier-2 we also force can_do_io=true. See the matching
+     * comment in cranelift_chain_continue's dispatch site: cranelift
+     * doesn't emit per-insn io_start ops, and softmmu helpers reach
+     * cpu_io_recompile with a GETPC()-derived retaddr that the
+     * shim->BLR->cranelift->helper chain can't reliably reconstruct.
+     * Skipping the recompile path entirely is the right semantics for
+     * a tier that doesn't honor icount.
      */
     {
         const void *shim = cranelift_bridge_lookup_shim(itb);
         if (shim) {
             tb_ptr = shim;
+            cpu->neg.can_do_io = true;
         }
     }
 #endif

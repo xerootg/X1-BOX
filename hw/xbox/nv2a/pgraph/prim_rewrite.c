@@ -38,6 +38,19 @@ void pgraph_prim_rewrite_finalize(PrimRewriteBuf *buf)
     buf->capacity = 0;
 }
 
+/* Runtime gate for the index-rewrite cache. Default is DISABLED until we
+ * confirm it doesn't cause Adreno GPU hangs (observed 2026-05-25 title
+ * screen). Set X1BOX_ENABLE_IDX_CACHE=1 to opt in. */
+static bool prim_cache_disabled(void)
+{
+    static int s = -1;
+    if (s < 0) {
+        const char *e = getenv("X1BOX_ENABLE_IDX_CACHE");
+        s = (e && *e && *e != '0') ? 0 : 1;
+    }
+    return s != 0;
+}
+
 void pgraph_prim_rewrite_cache_init(PrimRewriteCache *cache)
 {
     memset(cache, 0, sizeof(*cache));
@@ -656,6 +669,11 @@ PrimRewrite pgraph_prim_rewrite_ranges(PrimRewriteBuf *buf,
 {
     PrimRewrite result = { 0 };
 
+    /* Env kill switch — disable the LRU cache entirely. */
+    if (prim_cache_disabled()) {
+        cache = NULL;
+    }
+
     assert(mode.polygon_mode != POLY_MODE_POINT ||
            mode.primitive_mode != PRIM_TYPE_POLYGON);
 
@@ -722,6 +740,11 @@ PrimRewrite pgraph_prim_rewrite_indexed(PrimRewriteBuf *buf,
                                         unsigned int num_input_indices)
 {
     PrimRewrite result = { 0 };
+
+    /* Env kill switch — disable the LRU cache entirely. */
+    if (prim_cache_disabled()) {
+        cache = NULL;
+    }
 
     assert(mode.polygon_mode != POLY_MODE_POINT ||
            mode.primitive_mode != PRIM_TYPE_POLYGON);

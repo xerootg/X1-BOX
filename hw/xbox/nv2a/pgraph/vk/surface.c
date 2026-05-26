@@ -1842,6 +1842,7 @@ void pgraph_vk_surface_image_pool_init(PGRAPHVkState *r)
 {
     QTAILQ_INIT(&r->surface_image_pool);
     r->surface_image_pool_count = 0;
+    r->surface_image_pool_bytes = 0;
 }
 
 static bool surface_image_pool_config_match(const SurfaceImageConfig *a,
@@ -1851,6 +1852,31 @@ static bool surface_image_pool_config_match(const SurfaceImageConfig *a,
            a->width == b->width &&
            a->height == b->height &&
            a->usage == b->usage;
+}
+
+/*
+ * Estimated GPU bytes for a pooled entry: image + image_scratch (same size).
+ * Bpp picked from format; defaults to 4 for the long tail. Conservative —
+ * actual VMA allocation may be larger due to alignment/page rounding, but
+ * the estimate is good enough to keep total pool footprint bounded.
+ */
+static size_t surface_image_config_bytes(const SurfaceImageConfig *c)
+{
+    unsigned bpp;
+    switch (c->format) {
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        bpp = 8; break;
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+    case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
+    case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+    case VK_FORMAT_D16_UNORM:
+        bpp = 2; break;
+    default:
+        bpp = 4; break;
+    }
+    return (size_t)c->width * c->height * bpp * 2u; /* image + scratch */
 }
 
 static bool surface_image_pool_acquire(PGRAPHVkState *r,
@@ -1868,6 +1894,10 @@ static bool surface_image_pool_acquire(PGRAPHVkState *r,
             *out_scratch = entry->image_scratch;
             *out_scratch_alloc = entry->allocation_scratch;
             QTAILQ_REMOVE(&r->surface_image_pool, entry, entry);
+            size_t bytes = surface_image_config_bytes(&entry->config);
+            r->surface_image_pool_bytes =
+                (r->surface_image_pool_bytes > bytes)
+                ? r->surface_image_pool_bytes - bytes : 0;
             g_free(entry);
             r->surface_image_pool_count--;
             return true;
@@ -1883,15 +1913,41 @@ static void surface_image_pool_release(PGRAPHVkState *r,
 {
     int pool_max = r->surface_image_pool_max ? r->surface_image_pool_max
                                               : SURFACE_IMAGE_POOL_MAX_SIZE;
-    if (r->surface_image_pool_count >= pool_max) {
+    size_t pool_bytes_max = r->surface_image_pool_bytes_max;
+    size_t new_bytes = surface_image_config_bytes(config);
+
+    /*
+     * Evict oldest until both caps are satisfied. The bytes cap is the
+     * load-bearing one for surface_scale>1 — without it a 32-entry pool of
+     * 1920x1440 RGBA8 surfaces holds ~700 MB and OOMs Adreno KGSL.
+     */
+    while (!QTAILQ_EMPTY(&r->surface_image_pool) &&
+           (r->surface_image_pool_count >= pool_max ||
+            (pool_bytes_max &&
+             r->surface_image_pool_bytes + new_bytes > pool_bytes_max))) {
         PooledSurfaceImage *oldest = QTAILQ_FIRST(&r->surface_image_pool);
-        assert(oldest != NULL);
         QTAILQ_REMOVE(&r->surface_image_pool, oldest, entry);
+        size_t obytes = surface_image_config_bytes(&oldest->config);
+        r->surface_image_pool_bytes =
+            (r->surface_image_pool_bytes > obytes)
+            ? r->surface_image_pool_bytes - obytes : 0;
         vmaDestroyImage(r->allocator, oldest->image, oldest->allocation);
         vmaDestroyImage(r->allocator, oldest->image_scratch,
                         oldest->allocation_scratch);
         g_free(oldest);
         r->surface_image_pool_count--;
+    }
+
+    /*
+     * If even after a full evict the new entry alone wouldn't fit under the
+     * bytes cap (single image > pool_bytes_max), don't pool it — destroy
+     * outright. Avoids pinning an oversized entry that blocks all future
+     * pooling.
+     */
+    if (pool_bytes_max && new_bytes > pool_bytes_max) {
+        vmaDestroyImage(r->allocator, image, alloc);
+        vmaDestroyImage(r->allocator, scratch, scratch_alloc);
+        return;
     }
 
     PooledSurfaceImage *pe = g_malloc(sizeof(PooledSurfaceImage));
@@ -1902,6 +1958,7 @@ static void surface_image_pool_release(PGRAPHVkState *r,
     pe->allocation_scratch = scratch_alloc;
     QTAILQ_INSERT_TAIL(&r->surface_image_pool, pe, entry);
     r->surface_image_pool_count++;
+    r->surface_image_pool_bytes += new_bytes;
 }
 
 void pgraph_vk_surface_image_pool_drain(PGRAPHVkState *r)
@@ -1915,6 +1972,7 @@ void pgraph_vk_surface_image_pool_drain(PGRAPHVkState *r)
         g_free(entry);
     }
     r->surface_image_pool_count = 0;
+    r->surface_image_pool_bytes = 0;
 }
 
 static void create_surface_image(PGRAPHState *pg, SurfaceBinding *surface)
@@ -2749,8 +2807,17 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
      * clean AND upload was not requested, return early — we skip
      * populate_surface_binding_target (memset + multiple field reads)
      * and the binding-rebind branch entirely.
+     *
+     * Runtime gate. Default DISABLED until we confirm it doesn't cause
+     * Adreno GPU hangs (observed 2026-05-25 title screen). Set
+     * X1BOX_ENABLE_SURF_SKIP=1 to opt in.
      */
-    {
+    static int s_surf_skip_enabled = -1;
+    if (s_surf_skip_enabled < 0) {
+        const char *e = getenv("X1BOX_ENABLE_SURF_SKIP");
+        s_surf_skip_enabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (s_surf_skip_enabled) {
         int idx = color ? 0 : 1;
         if (r->surface_part_cache[idx].valid &&
             r->surface_part_cache[idx].gen == pg->surface_binding_inputs_gen &&
@@ -2792,7 +2859,7 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
              * dirty bits for the window so the full bitmap walk below
              * will only re-check the (rare) outside-window pages. */
         }
-    }
+    } /* end if (!s_surf_skip_disabled) */
 
     int64_t _st0 = nv2a_clock_ns();
     SurfaceBinding target;

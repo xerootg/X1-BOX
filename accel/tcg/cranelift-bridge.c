@@ -1630,6 +1630,66 @@ TranslationBlock *cranelift_unwind_tb_lookup(uintptr_t host_pc)
     return tb;
 }
 
+/*
+ * Diagnostic: log a host_pc that wasn't found in the unwind index along
+ * with the bracketing entries (nearest-below / nearest-above by host_lo)
+ * to help characterise the miss. Rate-limited to ~one per 5 seconds.
+ *
+ * Called from cpu_io_recompile right before the cpu_abort fallback. The
+ * idea is to capture data about WHICH host_pcs we're missing — is it in
+ * a gap between entries, far outside the arena, in shim memory, etc.
+ */
+void cranelift_unwind_log_miss(uintptr_t host_pc)
+{
+    if (!g_unwind_mutex_inited) {
+        CL_LOG("unwind miss (index not init): host_pc=0x%" PRIxPTR, host_pc);
+        return;
+    }
+    static int64_t last_log_ns;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (now - last_log_ns < 5000000000LL) {
+        return;
+    }
+    last_log_ns = now;
+
+    qemu_mutex_lock(&g_unwind_mutex);
+    /* Upper bound on host_lo → idx is the first entry with host_lo > host_pc */
+    unsigned lo = 0, hi = g_unwind_len;
+    while (lo < hi) {
+        unsigned mid = (lo + hi) >> 1;
+        if (g_unwind_vec[mid].host_lo <= host_pc) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    const CraneliftUnwindEntry *below =
+        (lo > 0) ? &g_unwind_vec[lo - 1] : NULL;
+    const CraneliftUnwindEntry *above =
+        (lo < g_unwind_len) ? &g_unwind_vec[lo] : NULL;
+
+    CL_LOG("unwind miss: host_pc=0x%" PRIxPTR " entries=%u "
+           "below=%p[lo=0x%" PRIxPTR " hi=0x%" PRIxPTR
+           " tb=%p tb_pc=0x%" PRIx64 "] "
+           "above=%p[lo=0x%" PRIxPTR " hi=0x%" PRIxPTR
+           " tb=%p tb_pc=0x%" PRIx64 "] "
+           "shim_arena=%p..%p",
+           host_pc, g_unwind_len,
+           (void *)below,
+           below ? below->host_lo : 0,
+           below ? below->host_hi : 0,
+           below ? below->tb : NULL,
+           (uint64_t)(below ? below->tb_pc : 0),
+           (void *)above,
+           above ? above->host_lo : 0,
+           above ? above->host_hi : 0,
+           above ? above->tb : NULL,
+           (uint64_t)(above ? above->tb_pc : 0),
+           g_shim_arena, g_shim_arena + CRANELIFT_SHIM_ARENA);
+    qemu_mutex_unlock(&g_unwind_mutex);
+}
+
 bool cranelift_unwind_data_from_tb(const TranslationBlock *tb,
                                    uintptr_t host_pc,
                                    uint64_t *data,

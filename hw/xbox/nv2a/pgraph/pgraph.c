@@ -246,7 +246,37 @@ enum {
      * The 'reg' field is 0; slot is encoded as (xlat - XLAT_VTX_ARRAY_OFFSET_0). */
     XLAT_VTX_ARRAY_OFFSET_0,
     XLAT_VTX_ARRAY_OFFSET_LAST = XLAT_VTX_ARRAY_OFFSET_0 + 15,
+    /*
+     * Inline vertex-attribute fast paths. These methods (SET_VERTEX4F,
+     * SET_NORMAL3F, SET_TEXCOORD*_4F, SET_DIFFUSE_COLOR*, etc.) make up
+     * ~80% of pgraph_method CPU on Halo 2 gameplay per the xemu-method
+     * histogram. Lifted to the fast path they dispatch lock-free O(1).
+     *
+     * Encoding: `reg` holds (attr_index << 8) | slot. The slot may be
+     * unused for patterns that write all four inline_value lanes (e.g.
+     * 4UB / FOG_COORD / WEIGHT1F).
+     *
+     * Terminal-slot variants (SET_VERTEX3F slot 2, SET_VERTEX4F slot 3)
+     * stay on the slow path because they call
+     * pgraph_finish_inline_buffer_vertex which mutates multi-attribute
+     * state under the pgraph lock.
+     */
+    XLAT_VTX_F1,        /* inline_value[slot] = *(float*)&p */
+    XLAT_VTX_F1_W1,     /* inline_value[slot] = *(float*)&p; [3] = 1.0f */
+    XLAT_VTX_4UB,       /* 4 bytes -> inline_value[0..3] / 255.0f */
+    XLAT_VTX_FOG_BCAST, /* inline_value[0..3] = *(float*)&p (broadcast) */
+    XLAT_VTX_W1F,       /* inline_value = { p, 0, 0, 1 } */
+    XLAT_VTX_W2F,       /* inline_value[slot]=p; [2]=0; [3]=1 */
+    XLAT_VTX_TEX_2F,    /* inline_value[slot]=p; [2]=0; [3]=1 (slot 0 or 1) */
+    XLAT_VTX_TEX_2S,    /* p = int16x2; inline_value = { hi, lo, 0, 1 } */
+    XLAT_VTX_TEX_4S,    /* p = int16x2; inline_value[part*2+0]=lo,
+                         * inline_value[part*2+1]=hi (slot 0 or 1 = part) */
+    XLAT_VTX_NORMAL3S,  /* same as TEX_4S but normalised /32767 with MAX(-1,..) */
 };
+
+/* Encode (attr_index, slot) into uint16 'reg' field for inline-vtx XLATs.
+ * Lock-free fast paths interpret reg as (attr_index << 8) | slot. */
+#define VTX_RS(attr, slot) (uint16_t)(((attr) << 8) | ((slot) & 0xff))
 
 static inline uint32_t fast_xlat(unsigned int type, uint32_t p)
 {
@@ -654,6 +684,131 @@ static const MethodFastPath method_fast[0x800] = {
 
     /* SET_TRANSFORM_CONSTANT_LOAD  0x1EA4 */
     [MI(0x1EA4)] = MF_MASKED(NV_PGRAPH_CHEOPS_OFFSET, 49),
+
+    /* --- Category G: Inline vertex-attribute writes (lock-free O(1)) ---
+     *
+     * Targets the 80% of pgraph_method CPU that the xemu-method histogram
+     * showed pinned in SET_VERTEX_xF / SET_TEXCOORD_xF / SET_DIFFUSE_xF
+     * and friends. Each entry writes
+     * pg->vertex_attributes[attr].inline_value[slot] and bumps
+     * any_reg_gen + uniform_inputs_gen atomically. Terminal slots
+     * (SET_VERTEX3F slot 2, SET_VERTEX4F slot 3) are intentionally NOT
+     * listed -- they call pgraph_finish_inline_buffer_vertex which
+     * mutates multi-attribute state and must stay on the pgraph-locked
+     * slow path.
+     */
+
+    /* SET_VERTEX3F slot 0/1 (slot 2 stays slow for finish).
+     * inline_value[3] = 1.0 is set on every slot per the DEF_METHOD body. */
+    [MI(NV097_SET_VERTEX3F + 0)] = { VTX_RS(NV2A_VERTEX_ATTR_POSITION, 0), 0, XLAT_VTX_F1_W1 },
+    [MI(NV097_SET_VERTEX3F + 4)] = { VTX_RS(NV2A_VERTEX_ATTR_POSITION, 1), 0, XLAT_VTX_F1_W1 },
+
+    /* SET_VERTEX4F slot 0/1/2 (slot 3 stays slow for finish). */
+    [MI(NV097_SET_VERTEX4F + 0)]  = { VTX_RS(NV2A_VERTEX_ATTR_POSITION, 0), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_VERTEX4F + 4)]  = { VTX_RS(NV2A_VERTEX_ATTR_POSITION, 1), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_VERTEX4F + 8)]  = { VTX_RS(NV2A_VERTEX_ATTR_POSITION, 2), 0, XLAT_VTX_F1 },
+
+    /* SET_NORMAL3F (3 slots). */
+    [MI(NV097_SET_NORMAL3F + 0)]  = { VTX_RS(NV2A_VERTEX_ATTR_NORMAL, 0), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_NORMAL3F + 4)]  = { VTX_RS(NV2A_VERTEX_ATTR_NORMAL, 1), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_NORMAL3F + 8)]  = { VTX_RS(NV2A_VERTEX_ATTR_NORMAL, 2), 0, XLAT_VTX_F1 },
+
+    /* SET_NORMAL3S — 0x1540, 0x1544 (each packs 2 int16s, normalised). */
+    [MI(NV097_SET_NORMAL3S + 0)]  = { VTX_RS(NV2A_VERTEX_ATTR_NORMAL, 0), 0, XLAT_VTX_NORMAL3S },
+    [MI(NV097_SET_NORMAL3S + 4)]  = { VTX_RS(NV2A_VERTEX_ATTR_NORMAL, 1), 0, XLAT_VTX_NORMAL3S },
+
+    /* SET_DIFFUSE_COLOR4F (4 slots). */
+    [MI(NV097_SET_DIFFUSE_COLOR4F + 0)]  = { VTX_RS(NV2A_VERTEX_ATTR_DIFFUSE, 0), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_DIFFUSE_COLOR4F + 4)]  = { VTX_RS(NV2A_VERTEX_ATTR_DIFFUSE, 1), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_DIFFUSE_COLOR4F + 8)]  = { VTX_RS(NV2A_VERTEX_ATTR_DIFFUSE, 2), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_DIFFUSE_COLOR4F + 12)] = { VTX_RS(NV2A_VERTEX_ATTR_DIFFUSE, 3), 0, XLAT_VTX_F1 },
+
+    /* SET_DIFFUSE_COLOR3F (3 slots, sets inline_value[3]=1.0 per DEF_METHOD). */
+    [MI(NV097_SET_DIFFUSE_COLOR3F + 0)]  = { VTX_RS(NV2A_VERTEX_ATTR_DIFFUSE, 0), 0, XLAT_VTX_F1_W1 },
+    [MI(NV097_SET_DIFFUSE_COLOR3F + 4)]  = { VTX_RS(NV2A_VERTEX_ATTR_DIFFUSE, 1), 0, XLAT_VTX_F1_W1 },
+    [MI(NV097_SET_DIFFUSE_COLOR3F + 8)]  = { VTX_RS(NV2A_VERTEX_ATTR_DIFFUSE, 2), 0, XLAT_VTX_F1_W1 },
+
+    /* SET_DIFFUSE_COLOR4UB — single method, unpacks 4 bytes / 255.0f. */
+    [MI(NV097_SET_DIFFUSE_COLOR4UB)] = { VTX_RS(NV2A_VERTEX_ATTR_DIFFUSE, 0), 0, XLAT_VTX_4UB },
+
+    /* SET_SPECULAR_COLOR4F (4 slots). */
+    [MI(NV097_SET_SPECULAR_COLOR4F + 0)]  = { VTX_RS(NV2A_VERTEX_ATTR_SPECULAR, 0), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_SPECULAR_COLOR4F + 4)]  = { VTX_RS(NV2A_VERTEX_ATTR_SPECULAR, 1), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_SPECULAR_COLOR4F + 8)]  = { VTX_RS(NV2A_VERTEX_ATTR_SPECULAR, 2), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_SPECULAR_COLOR4F + 12)] = { VTX_RS(NV2A_VERTEX_ATTR_SPECULAR, 3), 0, XLAT_VTX_F1 },
+
+    /* SET_SPECULAR_COLOR3F (3 slots, sets [3]=1.0). */
+    [MI(NV097_SET_SPECULAR_COLOR3F + 0)]  = { VTX_RS(NV2A_VERTEX_ATTR_SPECULAR, 0), 0, XLAT_VTX_F1_W1 },
+    [MI(NV097_SET_SPECULAR_COLOR3F + 4)]  = { VTX_RS(NV2A_VERTEX_ATTR_SPECULAR, 1), 0, XLAT_VTX_F1_W1 },
+    [MI(NV097_SET_SPECULAR_COLOR3F + 8)]  = { VTX_RS(NV2A_VERTEX_ATTR_SPECULAR, 2), 0, XLAT_VTX_F1_W1 },
+
+    /* SET_SPECULAR_COLOR4UB. */
+    [MI(NV097_SET_SPECULAR_COLOR4UB)] = { VTX_RS(NV2A_VERTEX_ATTR_SPECULAR, 0), 0, XLAT_VTX_4UB },
+
+    /* SET_TEXCOORD0/1/2/3_4F (4 slots each). */
+    [MI(NV097_SET_TEXCOORD0_4F + 0)]  = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE0, 0), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD0_4F + 4)]  = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE0, 1), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD0_4F + 8)]  = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE0, 2), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD0_4F + 12)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE0, 3), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD1_4F + 0)]  = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE1, 0), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD1_4F + 4)]  = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE1, 1), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD1_4F + 8)]  = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE1, 2), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD1_4F + 12)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE1, 3), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD2_4F + 0)]  = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE2, 0), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD2_4F + 4)]  = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE2, 1), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD2_4F + 8)]  = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE2, 2), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD2_4F + 12)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE2, 3), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD3_4F + 0)]  = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE3, 0), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD3_4F + 4)]  = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE3, 1), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD3_4F + 8)]  = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE3, 2), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_TEXCOORD3_4F + 12)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE3, 3), 0, XLAT_VTX_F1 },
+
+    /* SET_TEXCOORD0/1/2/3_2F (2 slots each — pattern sets [2]=0, [3]=1). */
+    [MI(NV097_SET_TEXCOORD0_2F + 0)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE0, 0), 0, XLAT_VTX_TEX_2F },
+    [MI(NV097_SET_TEXCOORD0_2F + 4)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE0, 1), 0, XLAT_VTX_TEX_2F },
+    [MI(NV097_SET_TEXCOORD1_2F + 0)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE1, 0), 0, XLAT_VTX_TEX_2F },
+    [MI(NV097_SET_TEXCOORD1_2F + 4)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE1, 1), 0, XLAT_VTX_TEX_2F },
+    [MI(NV097_SET_TEXCOORD2_2F + 0)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE2, 0), 0, XLAT_VTX_TEX_2F },
+    [MI(NV097_SET_TEXCOORD2_2F + 4)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE2, 1), 0, XLAT_VTX_TEX_2F },
+    [MI(NV097_SET_TEXCOORD3_2F + 0)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE3, 0), 0, XLAT_VTX_TEX_2F },
+    [MI(NV097_SET_TEXCOORD3_2F + 4)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE3, 1), 0, XLAT_VTX_TEX_2F },
+
+    /* SET_TEXCOORD0/1/2/3_2S (one method per texture, packs 2 int16s). */
+    [MI(NV097_SET_TEXCOORD0_2S)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE0, 0), 0, XLAT_VTX_TEX_2S },
+    [MI(NV097_SET_TEXCOORD1_2S)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE1, 0), 0, XLAT_VTX_TEX_2S },
+    [MI(NV097_SET_TEXCOORD2_2S)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE2, 0), 0, XLAT_VTX_TEX_2S },
+    [MI(NV097_SET_TEXCOORD3_2S)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE3, 0), 0, XLAT_VTX_TEX_2S },
+
+    /* SET_TEXCOORD0/1/2/3_4S (2 slots each, each slot packs 2 int16s). */
+    [MI(NV097_SET_TEXCOORD0_4S + 0)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE0, 0), 0, XLAT_VTX_TEX_4S },
+    [MI(NV097_SET_TEXCOORD0_4S + 4)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE0, 1), 0, XLAT_VTX_TEX_4S },
+    [MI(NV097_SET_TEXCOORD1_4S + 0)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE1, 0), 0, XLAT_VTX_TEX_4S },
+    [MI(NV097_SET_TEXCOORD1_4S + 4)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE1, 1), 0, XLAT_VTX_TEX_4S },
+    [MI(NV097_SET_TEXCOORD2_4S + 0)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE2, 0), 0, XLAT_VTX_TEX_4S },
+    [MI(NV097_SET_TEXCOORD2_4S + 4)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE2, 1), 0, XLAT_VTX_TEX_4S },
+    [MI(NV097_SET_TEXCOORD3_4S + 0)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE3, 0), 0, XLAT_VTX_TEX_4S },
+    [MI(NV097_SET_TEXCOORD3_4S + 4)] = { VTX_RS(NV2A_VERTEX_ATTR_TEXTURE3, 1), 0, XLAT_VTX_TEX_4S },
+
+    /* SET_FOG_COORD — broadcast to all 4 lanes. */
+    [MI(NV097_SET_FOG_COORD)] = { VTX_RS(NV2A_VERTEX_ATTR_FOG, 0), 0, XLAT_VTX_FOG_BCAST },
+
+    /* SET_WEIGHT1F — { p, 0, 0, 1 }. */
+    [MI(NV097_SET_WEIGHT1F)] = { VTX_RS(NV2A_VERTEX_ATTR_WEIGHT, 0), 0, XLAT_VTX_W1F },
+
+    /* SET_WEIGHT2F (2 slots) — [slot]=p, [2]=0, [3]=1. */
+    [MI(NV097_SET_WEIGHT2F + 0)] = { VTX_RS(NV2A_VERTEX_ATTR_WEIGHT, 0), 0, XLAT_VTX_W2F },
+    [MI(NV097_SET_WEIGHT2F + 4)] = { VTX_RS(NV2A_VERTEX_ATTR_WEIGHT, 1), 0, XLAT_VTX_W2F },
+
+    /* SET_WEIGHT3F (3 slots) — [slot]=p, [3]=1 (same pattern as F1_W1). */
+    [MI(NV097_SET_WEIGHT3F + 0)] = { VTX_RS(NV2A_VERTEX_ATTR_WEIGHT, 0), 0, XLAT_VTX_F1_W1 },
+    [MI(NV097_SET_WEIGHT3F + 4)] = { VTX_RS(NV2A_VERTEX_ATTR_WEIGHT, 1), 0, XLAT_VTX_F1_W1 },
+    [MI(NV097_SET_WEIGHT3F + 8)] = { VTX_RS(NV2A_VERTEX_ATTR_WEIGHT, 2), 0, XLAT_VTX_F1_W1 },
+
+    /* SET_WEIGHT4F (4 slots) — pure F1 (no auto-set on [3]). */
+    [MI(NV097_SET_WEIGHT4F + 0)]  = { VTX_RS(NV2A_VERTEX_ATTR_WEIGHT, 0), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_WEIGHT4F + 4)]  = { VTX_RS(NV2A_VERTEX_ATTR_WEIGHT, 1), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_WEIGHT4F + 8)]  = { VTX_RS(NV2A_VERTEX_ATTR_WEIGHT, 2), 0, XLAT_VTX_F1 },
+    [MI(NV097_SET_WEIGHT4F + 12)] = { VTX_RS(NV2A_VERTEX_ATTR_WEIGHT, 3), 0, XLAT_VTX_F1 },
 };
 
 #undef MF_DIRECT
@@ -662,6 +817,121 @@ static const MethodFastPath method_fast[0x800] = {
 #undef MF_TEX
 #undef MF_VTX_OFF
 #undef MI
+
+/*
+ * Apply an inline vertex-attribute write at the fast path. Returns true
+ * if we owned the entire update; false if a back-fill is required and
+ * the caller must fall through to the slow (locked) path.
+ *
+ * Shared by fast_entry_apply / fast_entry_apply_atomic since the only
+ * thing the lock-free variant adds is atomic gen-counter bumps; the
+ * inline_value writes are private to the pfifo thread either way
+ * (renderer only reads attribute->inline_buffer, not inline_value).
+ */
+static inline bool fast_apply_vtx_inline(PGRAPHState *pg,
+                                         const MethodFastPath *f,
+                                         uint32_t p, bool atomic)
+{
+    /* Kill switch: X1BOX_DISABLE_VTX_FAST_PATH=1 forces all inline-vtx
+     * methods back through the pgraph_method slow path. Default ON. */
+    static int s_disabled = -1;
+    if (s_disabled < 0) {
+        const char *e = getenv("X1BOX_DISABLE_VTX_FAST_PATH");
+        s_disabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (s_disabled) {
+        return false;
+    }
+
+    unsigned int attr = (f->reg >> 8) & 0x0f;
+    unsigned int slot = f->reg & 0x03;
+    VertexAttribute *a = &pg->vertex_attributes[attr];
+
+    /* Lock-free check: if any attribute would need a back-fill into
+     * inline_buffer (pgraph_allocate_inline_buffer_vertices semantics),
+     * bail to the slow path. The common steady-state case has
+     * inline_buffer_populated == true OR inline_buffer_length == 0 for
+     * the attribute we're writing — both safe to fast-write. */
+    bool populated = atomic ? qatomic_read(&a->inline_buffer_populated)
+                            : a->inline_buffer_populated;
+    unsigned int length = atomic ? qatomic_read(&pg->inline_buffer_length)
+                                 : pg->inline_buffer_length;
+    if (!populated && length > 0) {
+        return false;  /* defer to slow path for back-fill */
+    }
+
+    float pf = *(float *)&p;
+    switch (f->xlat) {
+    case XLAT_VTX_F1:
+        a->inline_value[slot] = pf;
+        break;
+    case XLAT_VTX_F1_W1:
+        a->inline_value[slot] = pf;
+        a->inline_value[3] = 1.0f;
+        break;
+    case XLAT_VTX_4UB:
+        a->inline_value[0] = (p & 0xFF) / 255.0f;
+        a->inline_value[1] = ((p >>  8) & 0xFF) / 255.0f;
+        a->inline_value[2] = ((p >> 16) & 0xFF) / 255.0f;
+        a->inline_value[3] = ((p >> 24) & 0xFF) / 255.0f;
+        break;
+    case XLAT_VTX_FOG_BCAST:
+        a->inline_value[0] = pf;
+        a->inline_value[1] = pf;
+        a->inline_value[2] = pf;
+        a->inline_value[3] = pf;
+        break;
+    case XLAT_VTX_W1F:
+        a->inline_value[0] = pf;
+        a->inline_value[1] = 0.0f;
+        a->inline_value[2] = 0.0f;
+        a->inline_value[3] = 1.0f;
+        break;
+    case XLAT_VTX_W2F:
+        a->inline_value[slot] = pf;
+        a->inline_value[2] = 0.0f;
+        a->inline_value[3] = 1.0f;
+        break;
+    case XLAT_VTX_TEX_2F:
+        a->inline_value[slot] = pf;
+        a->inline_value[2] = 0.0f;
+        a->inline_value[3] = 1.0f;
+        break;
+    case XLAT_VTX_TEX_2S:
+        a->inline_value[0] = (float)(int16_t)(p & 0xFFFF);
+        a->inline_value[1] = (float)(int16_t)(p >> 16);
+        a->inline_value[2] = 0.0f;
+        a->inline_value[3] = 1.0f;
+        break;
+    case XLAT_VTX_TEX_4S: {
+        unsigned int part = slot & 1;
+        a->inline_value[part * 2 + 0] = (float)(int16_t)(p & 0xFFFF);
+        a->inline_value[part * 2 + 1] = (float)(int16_t)(p >> 16);
+        break;
+    }
+    case XLAT_VTX_NORMAL3S: {
+        unsigned int part = slot & 1;
+        int16_t v0 = (int16_t)(p & 0xFFFF);
+        int16_t v1 = (int16_t)(p >> 16);
+        a->inline_value[part * 2 + 0] =
+            (v0 < -32767) ? -1.0f : ((float)v0 / 32767.0f);
+        a->inline_value[part * 2 + 1] =
+            (v1 < -32767) ? -1.0f : ((float)v1 / 32767.0f);
+        break;
+    }
+    default:
+        return false;
+    }
+
+    if (atomic) {
+        __atomic_fetch_add(&pg->any_reg_gen, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&pg->uniform_inputs_gen, 1, __ATOMIC_RELAXED);
+    } else {
+        pg->any_reg_gen++;
+        pg->uniform_inputs_gen++;
+    }
+    return true;
+}
 
 static inline bool fast_entry_apply(PGRAPHState *pg,
                                     const MethodFastPath *f, uint32_t p)
@@ -680,6 +950,9 @@ static inline bool fast_entry_apply(PGRAPHState *pg,
         pg->vertex_attributes[slot].offset = p & 0x7fffffff;
         pg->vertex_attr_gen++;
         return true;
+    }
+    if (f->xlat >= XLAT_VTX_F1 && f->xlat <= XLAT_VTX_NORMAL3S) {
+        return fast_apply_vtx_inline(pg, f, p, false);
     }
     if (f->xlat) {
         p = fast_xlat(f->xlat, p);
@@ -712,6 +985,9 @@ static inline bool fast_entry_apply_atomic(PGRAPHState *pg,
         pg->vertex_attributes[slot].offset = p & 0x7fffffff;
         pg->vertex_attr_gen++;
         return true;
+    }
+    if (f->xlat >= XLAT_VTX_F1 && f->xlat <= XLAT_VTX_NORMAL3S) {
+        return fast_apply_vtx_inline(pg, f, p, true);
     }
     if (f->xlat) {
         p = fast_xlat(f->xlat, p);
