@@ -31,6 +31,16 @@ crossbeam-channel = "0.5"
 parking_lot = "0.12"
 once_cell = "1"
 
+[patch.crates-io]
+# Vendored fork of cranelift-jit 0.130.2 that swaps the per-finalize
+# Vec<(start, end, FuncId)> + O(N log N) sort for a BTreeMap. Each
+# tier-2 compile previously re-sorted every previously-compiled TB,
+# costing O(N^2 log N) cumulative and showing up as a 3.5% wall-clock
+# sink plus the 1%-low FPS slump in active scenes. BTreeMap gives
+# O(log N) insert and O(log N) lookup with no per-finalize sort.
+# Source: rust/cranelift-jit-patched/src/backend.rs.
+cranelift-jit = { path = "../cranelift-jit-patched" }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

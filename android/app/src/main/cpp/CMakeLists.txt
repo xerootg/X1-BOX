@@ -673,6 +673,12 @@ set(CRANELIFT_TCG_AR "${NDK_TOOLCHAIN}/llvm-ar")
 file(GLOB_RECURSE CRANELIFT_TCG_SOURCES CONFIGURE_DEPENDS
   "${CRANELIFT_TCG_DIR}/Cargo.toml"
   "${CRANELIFT_TCG_DIR}/src/*.rs"
+  # Vendored fork of cranelift-jit (BTreeMap patch). cargo will rebuild
+  # automatically when the source mtimes change, but CMake's custom_command
+  # also needs to know about these files so the static lib is rebuilt
+  # when the patched crate changes.
+  "${CRANELIFT_TCG_DIR}/../cranelift-jit-patched/Cargo.toml"
+  "${CRANELIFT_TCG_DIR}/../cranelift-jit-patched/src/*.rs"
 )
 
 add_custom_command(
