@@ -818,6 +818,39 @@ impl<'a, 'b> Lowering<'a, 'b> {
     }
 
     fn lower_block(&mut self, ops: &[DecodedOp]) -> Result<(), TransError> {
+        /*
+         * TB prologue: force cpu->neg.can_do_io = true so softmmu helpers
+         * called from this tier-2 code (helper_ldul_mmu / helper_stul_mmu
+         * / etc.) bypass io_prepare's cpu_io_recompile gate.
+         *
+         * Why this is needed:
+         *   - Tier-1 emits per-insn `set_can_do_io` IR ops (see
+         *     accel/tcg/translator.c set_can_do_io); we don't, so without
+         *     this store can_do_io stays at whatever the dispatcher left
+         *     (false in tier-1 paths, true in tier-2-dispatched paths).
+         *   - The C-side dispatcher (cpu_tb_exec / cranelift_chain_continue)
+         *     already sets can_do_io=true before entering tier-2 code, but
+         *     RACE: a chain iteration that dispatches a tier-1 TB sets it
+         *     false, and on return our tier-2 caller resumes with false.
+         *     Emitting the store in the TB prologue makes the guarantee
+         *     local to this TB and immune to dispatcher state.
+         *   - Tier-2 doesn't honor icount / precise-IRQ semantics
+         *     anyway, so unconditional true is correct.
+         *
+         * Offset: env-relative -12 (= offsetof(CPUState, neg.can_do_io) -
+         * sizeof(CPUState)). Confirmed by disasm of accel/tcg/translator.c
+         * set_can_do_io's `sturb wN, [env, #-0xc]` emission. TODO: promote
+         * to EnvDesc.can_do_io_offset and populate from the C side so this
+         * tracks struct-layout changes.
+         */
+        let one = self.builder.ins().iconst(types::I8, 1);
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            one,
+            self.env_val,
+            -12i32,
+        );
+
         for (i, op) in ops.iter().enumerate() {
             if self.block_terminated {
                 // Spawn a fresh block to land in. We do NOT seal it here

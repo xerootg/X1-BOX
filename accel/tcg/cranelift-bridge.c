@@ -1639,6 +1639,7 @@ TranslationBlock *cranelift_unwind_tb_lookup(uintptr_t host_pc)
  * idea is to capture data about WHICH host_pcs we're missing — is it in
  * a gap between entries, far outside the arena, in shim memory, etc.
  */
+__attribute__((noipa))
 void cranelift_unwind_log_miss(uintptr_t host_pc)
 {
     if (!g_unwind_mutex_inited) {

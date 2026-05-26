@@ -846,6 +846,32 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr)
  * must be at the end of the TB.
  *
  * Called by softmmu_template.h, with iothread mutex not held.
+ *
+ * !tb fallback: cpu_abort. Earlier attempts to gracefully recover
+ * (set can_do_io=true and return) were defeated by an aggressive
+ * clang tail-merge optimization that elided the function epilogue
+ * regardless of source structure — tried 8 distinct variants
+ * (qatomic_set + asm barrier, __attribute__((noipa)) on log_miss,
+ * static noinline helper isolation, __attribute__((optnone)),
+ * if/else, volatile funcptr-hidden noreturn, inverted structure
+ * with __builtin_unreachable, ...). Every variant produced a
+ * function body ending in `bl <something>` with no `ret`/epilogue
+ * — control then fell through into tcg_flush_jmp_cache's first
+ * instruction (`ldr x9, [x0, #0x258]`) with garbage x0 → SIGSEGV
+ * at fault=0x258.
+ *
+ * Reaching this fallback is itself the upstream bug to fix:
+ *   - Tier-2 (cranelift) TBs set can_do_io=true at dispatch (see
+ *     cpu_tb_exec and cranelift_chain_continue in cpu-exec.c), so
+ *     io_prepare's `!cpu->neg.can_do_io` gate is FALSE and they
+ *     don't route here at all.
+ *   - Tier-1 TBs have helper-call retaddrs in the tier-1 code-gen
+ *     buffer; tcg_tb_lookup must find them.
+ * If we land here the cranelift backend likely emitted a non-bl
+ * branch (br/jr) to a helper, breaking GETPC()'s
+ * __builtin_return_address recovery → host_pc=0. Needs investigation
+ * in rust/cranelift-tcg/src/translator.rs's helper-call emission,
+ * not a band-aid in this function.
  */
 void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
 {
@@ -861,19 +887,6 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
         tb = cranelift_unwind_tb_lookup(retaddr);
     }
     if (!tb) {
-        /*
-         * Tier-2 (cranelift) shims now set can_do_io=true at dispatch
-         * (see cpu_tb_exec / cranelift_chain_continue in cpu-exec.c), so
-         * cpu_io_recompile is only reachable from tier-1 paths where
-         * retaddr must be a valid host PC inside the tcg code buffer.
-         * Hitting this fallback means tier-1 emitted a helper call
-         * without a recoverable retaddr -- a real bug, abort loudly.
-         *
-         * Earlier attempt: log + set can_do_io=1 + return. clang
-         * miscompiled the return path (treated log_miss as noreturn,
-         * elided the can_do_io store + epilogue), causing the function
-         * to fall through into tcg_flush_jmp_cache and SIGSEGV.
-         */
         cranelift_unwind_log_miss(retaddr);
         cpu_abort(cpu, "cpu_io_recompile: could not find TB for pc=%p",
                   (void *)retaddr);
