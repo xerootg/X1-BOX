@@ -13,6 +13,7 @@
 #include "exec/translation-block.h"
 #include "exec/mmap-lock.h"
 #include "accel/tcg/tb-cpu-state.h"
+#include "qemu/log.h"
 
 extern int64_t max_delay;
 extern int64_t max_advance;
@@ -70,8 +71,38 @@ void tlb_destroy(CPUState *cpu);
 bool tcg_exec_realizefn(CPUState *cpu, Error **errp);
 void tcg_exec_unrealizefn(CPUState *cpu);
 
-/* current cflags for hashing/comparison */
-uint32_t curr_cflags(CPUState *cpu);
+/*
+ * current cflags for hashing/comparison.
+ *
+ * 2026-05-25 inlined (Phase 3 of vCPU dispatch plan): in normal gameplay
+ * none of the conditional ORs fire — singlestep/one_insn_per_tb/
+ * CPU_LOG_TB_NOCHAIN are all 0 — so the function reduces to a single
+ * load of cpu->tcg_cflags + return. Pre-inline this showed up as 0.45%
+ * wall on the CPU 0/TCG thread purely as call-ABI overhead, plus a
+ * branch every call instead of folding into the caller's existing
+ * register pressure.
+ */
+static inline uint32_t curr_cflags(CPUState *cpu)
+{
+    uint32_t cflags = cpu->tcg_cflags;
+
+    /*
+     * Record gdb single-step.  We should be exiting the TB by raising
+     * EXCP_DEBUG, but to simplify other tests, disable chaining too.
+     *
+     * For singlestep and -d nochain, suppress goto_tb so that
+     * we can log -d cpu,exec after every TB.
+     */
+    if (unlikely(cpu->singlestep_enabled)) {
+        cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_SINGLE_STEP | 1;
+    } else if (unlikely(qatomic_read(&one_insn_per_tb))) {
+        cflags |= CF_NO_GOTO_TB | 1;
+    } else if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN))) {
+        cflags |= CF_NO_GOTO_TB;
+    }
+
+    return cflags;
+}
 
 void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr);
 

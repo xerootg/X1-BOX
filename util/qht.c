@@ -74,21 +74,12 @@
 //#define QHT_DEBUG
 
 /*
- * We want to avoid false sharing of cache lines. Most systems have 64-byte
- * cache lines so we go with it for simplicity.
- *
- * Note that systems with smaller cache lines will be fine (the struct is
- * almost 64-bytes); systems with larger cache lines might suffer from
- * some false sharing.
+ * qht_bucket / qht_map / QHT_BUCKET_ALIGN / QHT_BUCKET_ENTRIES /
+ * qht_tsan_lock / qht_map_to_bucket all live in qht-internal.h now so
+ * type-specialised inline lookups (e.g. cpu-exec.c's tb_htable_lookup)
+ * can replicate the bucket walk with the comparator inlined.
  */
-#define QHT_BUCKET_ALIGN 64
-
-/* define these to keep sizeof(qht_bucket) within QHT_BUCKET_ALIGN */
-#if HOST_LONG_BITS == 32
-#define QHT_BUCKET_ENTRIES 6
-#else /* 64-bit */
-#define QHT_BUCKET_ENTRIES 4
-#endif
+#include "qemu/qht-internal.h"
 
 enum qht_iter_type {
     QHT_ITER_VOID,    /* do nothing; use retvoid */
@@ -130,66 +121,7 @@ static inline void qht_unlock(struct qht *ht)
     qemu_mutex_unlock(&ht->lock);
 }
 
-/*
- * Note: reading partially-updated pointers in @pointers could lead to
- * segfaults. We thus access them with qatomic_read/set; this guarantees
- * that the compiler makes all those accesses atomic. We also need the
- * volatile-like behavior in qatomic_read, since otherwise the compiler
- * might refetch the pointer.
- * qatomic_read's are of course not necessary when the bucket lock is held.
- *
- * If both ht->lock and b->lock are grabbed, ht->lock should always
- * be grabbed first.
- */
-struct qht_bucket {
-    QemuSpin lock;
-    QemuSeqLock sequence;
-    uint32_t hashes[QHT_BUCKET_ENTRIES];
-    void *pointers[QHT_BUCKET_ENTRIES];
-    struct qht_bucket *next;
-} QEMU_ALIGNED(QHT_BUCKET_ALIGN);
-
 QEMU_BUILD_BUG_ON(sizeof(struct qht_bucket) > QHT_BUCKET_ALIGN);
-
-/*
- * Under TSAN, we use striped locks instead of one lock per bucket chain.
- * This avoids crashing under TSAN, since TSAN aborts the program if more than
- * 64 locks are held (this is a hardcoded limit in TSAN).
- * When resizing a QHT we grab all the buckets' locks, which can easily
- * go over TSAN's limit. By using striped locks, we avoid this problem.
- *
- * Note: this number must be a power of two for easy index computation.
- */
-#define QHT_TSAN_BUCKET_LOCKS_BITS 4
-#define QHT_TSAN_BUCKET_LOCKS (1 << QHT_TSAN_BUCKET_LOCKS_BITS)
-
-struct qht_tsan_lock {
-    QemuSpin lock;
-} QEMU_ALIGNED(QHT_BUCKET_ALIGN);
-
-/**
- * struct qht_map - structure to track an array of buckets
- * @rcu: used by RCU. Keep it as the top field in the struct to help valgrind
- *       find the whole struct.
- * @buckets: array of head buckets. It is constant once the map is created.
- * @n_buckets: number of head buckets. It is constant once the map is created.
- * @n_added_buckets: number of added (i.e. "non-head") buckets
- * @n_added_buckets_threshold: threshold to trigger an upward resize once the
- *                             number of added buckets surpasses it.
- * @tsan_bucket_locks: Array of striped locks to be used only under TSAN.
- *
- * Buckets are tracked in what we call a "map", i.e. this structure.
- */
-struct qht_map {
-    struct rcu_head rcu;
-    struct qht_bucket *buckets;
-    size_t n_buckets;
-    size_t n_added_buckets;
-    size_t n_added_buckets_threshold;
-#ifdef CONFIG_TSAN
-    struct qht_tsan_lock tsan_bucket_locks[QHT_TSAN_BUCKET_LOCKS];
-#endif
-};
 
 /* trigger a resize when n_added_buckets > n_buckets / div */
 #define QHT_NR_ADDED_BUCKETS_THRESHOLD_DIV 8
@@ -302,11 +234,7 @@ static inline void qht_head_init(struct qht_map *map, struct qht_bucket *b)
     seqlock_init(&b->sequence);
 }
 
-static inline
-struct qht_bucket *qht_map_to_bucket(const struct qht_map *map, uint32_t hash)
-{
-    return &map->buckets[hash & (map->n_buckets - 1)];
-}
+/* qht_map_to_bucket moved to qemu/qht-internal.h. */
 
 /* acquire all bucket locks from a map */
 static void qht_map_lock_buckets(struct qht_map *map)

@@ -224,8 +224,17 @@ void cranelift_unwind_drop(const TranslationBlock *tb);
 /* Rate-limited diagnostic: log a host_pc that wasn't found in the unwind
  * index along with the bracketing entries (nearest-below / above by
  * host_lo) + the shim arena range. Used by cpu_io_recompile to capture
- * the miss before falling back to abort/skip. */
-void cranelift_unwind_log_miss(uintptr_t host_pc);
+ * the miss before falling back to abort/skip.
+ *
+ * noipa is load-bearing: without it clang treats this call as noreturn
+ * (likely via cross-TU inference on its qemu_mutex_lock/CL_LOG body),
+ * elides the can_do_io store + epilogue at the caller, and the caller
+ * falls through into the next function's prologue with garbage state
+ * → SIGSEGV. Caused two reported crashes (Halo 2 FLIP_STALL, 2026-05-25)
+ * before being diagnosed. noipa = "no inter-procedural analysis": treat
+ * the call as a fully opaque external sequence point. */
+void cranelift_unwind_log_miss(uintptr_t host_pc)
+    __attribute__((noipa));
 
 /* Counters surfaced via cranelift_bridge_log_stats. */
 void cranelift_unwind_get_stats(uint64_t *hits, uint64_t *misses,
@@ -290,6 +299,14 @@ void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
  * tolerated; reader sees one of the in-flight values).
  */
 void cranelift_get_helper_lookup_tb_lru_stats(uint64_t *hits, uint64_t *misses);
+
+/*
+ * Per-slot hit histogram for the 8-slot helper LRU. out[0] is the
+ * slot-0 fast-path hit count; out[1..7] are the SIMD-found promotions
+ * from cold-scan. Sum over all 8 ≡ helper_lookup_tb_lru_hits.
+ */
+#define HELPER_TB_LRU_HIST_SIZE 8
+void cranelift_get_helper_lookup_slot_hist(uint64_t out[HELPER_TB_LRU_HIST_SIZE]);
 
 /*
  * phys_pc-hint stats for tb_htable_lookup_common.

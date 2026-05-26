@@ -48,6 +48,10 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "tb-cache-hints.h"
+#include "qemu/qht-internal.h"
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include "cranelift-bridge.h"
 #ifdef XBOX
 #include "hw/xbox/xbox-hle.h"
@@ -445,7 +449,7 @@ struct tb_desc {
     tb_page_addr_t page_addr0;
 };
 
-static bool tb_lookup_cmp(const void *p, const void *d)
+static inline bool tb_lookup_cmp(const void *p, const void *d)
 {
     const TranslationBlock *tb = p;
     const struct tb_desc *desc = d;
@@ -577,9 +581,88 @@ tb_htable_lookup_common(CPUState *cpu, TCGTBCPUState s, const struct qht *ht,
     return qht_lookup_custom(ht, &desc, h, func);
 }
 
+/*
+ * tb_lookup_tb_qht: TB-specialised qht bucket walk with tb_lookup_cmp
+ * inlined.
+ *
+ * Phase 4 of vCPU dispatch plan (2026-05-25). Upstream `qht_lookup_custom`
+ * walks the bucket chain calling a function-pointer comparator per
+ * matching-hash probe. The indirect call (1) can't be inlined, (2)
+ * defeats the compiler's ability to hoist desc-loop-invariant loads,
+ * and (3) adds a few cycles of jump-target latency per probe. Inlining
+ * the comparator removes all three.
+ *
+ * Layout (struct qht_bucket / qht_map / qht_map_to_bucket /
+ * QHT_BUCKET_ENTRIES) is shared with util/qht.c via qemu/qht-internal.h.
+ * Semantics mirror qht_lookup_custom: optimistic seqlock acquire +
+ * single walk; if the seqlock retry signals concurrent writer activity,
+ * fall back to the upstream noinline retry path. The fallback redoes
+ * the bucket lookup — cheap, and only fires on the rare contended case.
+ */
+static inline TranslationBlock *
+tb_lookup_tb_qht(const struct qht *ht, struct tb_desc *desc, uint32_t hash)
+{
+    const struct qht_map *map = qatomic_rcu_read(&ht->map);
+    const struct qht_bucket *head = qht_map_to_bucket(map, hash);
+    unsigned int version;
+    TranslationBlock *ret = NULL;
+
+    version = seqlock_read_begin(&head->sequence);
+    {
+        const struct qht_bucket *b = head;
+        do {
+            for (int i = 0; i < QHT_BUCKET_ENTRIES; i++) {
+                if (qatomic_read(&b->hashes[i]) == hash) {
+                    TranslationBlock *p = qatomic_rcu_read(&b->pointers[i]);
+                    if (likely(p) && likely(tb_lookup_cmp(p, desc))) {
+                        ret = p;
+                        goto found;
+                    }
+                }
+            }
+            b = qatomic_rcu_read(&b->next);
+        } while (b);
+    }
+found:
+    if (likely(!seqlock_read_retry(&head->sequence, version))) {
+        return ret;
+    }
+    /*
+     * Stale read — fall through to the upstream qht_lookup_custom which
+     * keeps the noinline retry loop. The comparator goes via function
+     * pointer here, but this path is rare (concurrent writer during our
+     * read).
+     */
+    return (TranslationBlock *)qht_lookup_custom(ht, desc, hash,
+                                                  tb_lookup_cmp);
+}
+
 static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
 {
-    return tb_htable_lookup_common(cpu, s, &tb_ctx.htable, tb_lookup_cmp);
+    tb_page_addr_t phys_pc;
+    struct tb_desc desc;
+    uint32_t h;
+
+    desc.s = s;
+    desc.env = cpu_env(cpu);
+#if XEMU_HAVE_CRANELIFT
+    if (helper_phys_pc_hint) {
+        phys_pc = helper_phys_pc_hint | (s.pc & ~TARGET_PAGE_MASK);
+        helper_phys_pc_hint_hits++;
+    } else {
+        phys_pc = get_page_addr_code(desc.env, s.pc);
+        helper_phys_pc_hint_misses++;
+    }
+#else
+    phys_pc = get_page_addr_code(desc.env, s.pc);
+#endif
+    if (phys_pc == -1) {
+        return NULL;
+    }
+    desc.page_addr0 = phys_pc;
+    h = tb_hash_func(phys_pc, (s.cflags & CF_PCREL ? 0 : s.pc),
+                     s.flags, s.cs_base, s.cflags);
+    return tb_lookup_tb_qht(&tb_ctx.htable, &desc, h);
 }
 
 static bool inv_tb_lookup_cmp(const void *p, const void *d)
@@ -779,19 +862,6 @@ static inline bool check_for_breakpoints(CPUState *cpu, vaddr pc,
  * CF_INVALID check we still run on cache hits catches per-TB async
  * invalidation that tb_flush_count alone wouldn't see.
  */
-struct helper_tb_lru_slot {
-    vaddr pc;
-    uint64_t cs_base;
-    uint32_t flags;
-    uint32_t cflags;
-    TranslationBlock *tb;
-    /*
-     * tb_page_addr0(tb) & TARGET_PAGE_MASK, cached at insert so the
-     * phys_pc hint side-channel in tb_htable_lookup_common can fire on
-     * an LRU same-page match without a second pass over the slots.
-     */
-    tb_page_addr_t phys_pc_page;
-};
 /*
  * Plain static storage (NOT __thread, single-vCPU).
  *
@@ -802,22 +872,112 @@ struct helper_tb_lru_slot {
  * tier-1 indirect branches — see project_cranelift_qemu_ld_st_blocker
  * for the path to slashing that rate by promoting more TBs to tier-2.
  *
- * Memory cost: 8 × 40B = 320B static (5 cache lines on aarch64).
+ * 2026-05-25 redesign (Phase 1+2 of vCPU dispatch plan): converted
+ * Array-of-Structs → Structure-of-Arrays so the 8 pcs fit one 64-byte
+ * cache line and can be compared 8-way against s.pc via NEON
+ * (vceqq_u64 × 4). The cold scan dropped from a per-slot field-walk
+ * (~80 ns/call) to a vector pc-broadcast-and-compare followed by a
+ * single-slot confirmation (~20 ns/call). MRU eviction unchanged
+ * (promote-on-hit, shift-down on miss-install) — only the layout +
+ * the scan implementation changed.
+ *
+ * Memory cost: 8 × (8+8+4+4+8+8) = 320B + alignment padding.
+ * tb_page_addr_t is uint64_t on x86_64 softmmu.
  */
 #define HELPER_TB_LRU_SIZE 8
 static struct {
-    struct helper_tb_lru_slot slots[HELPER_TB_LRU_SIZE];
+    /* Hot scan fields, SoA, cache-line-aligned so the SIMD pc-load
+     * touches exactly one cache line. */
+    uint64_t pcs[HELPER_TB_LRU_SIZE]       __attribute__((aligned(64)));
+    uint64_t cs_bases[HELPER_TB_LRU_SIZE]  __attribute__((aligned(64)));
+    uint32_t flags[HELPER_TB_LRU_SIZE]     __attribute__((aligned(32)));
+    uint32_t cflags[HELPER_TB_LRU_SIZE]    __attribute__((aligned(32)));
+    /* Cold fields, only touched after a pc-match confirmation. */
+    TranslationBlock *tbs[HELPER_TB_LRU_SIZE];
+    tb_page_addr_t   phys_pc_pages[HELPER_TB_LRU_SIZE];
     unsigned last_flush_count;
 } helper_tb_lru;
 
 static uint64_t helper_lookup_tb_lru_hits;
 static uint64_t helper_lookup_tb_lru_misses;
+/*
+ * Per-slot hit histogram for the rewritten cold-scan. slot 0 is the
+ * fast-path mass; slots 1+ are the SIMD-found promotions. Useful for
+ * tuning HELPER_TB_LRU_SIZE if/when we revisit.
+ */
+static uint64_t helper_lookup_slot_hits[HELPER_TB_LRU_SIZE];
 
 void cranelift_get_helper_lookup_tb_lru_stats(uint64_t *hits, uint64_t *misses)
 {
     if (hits)   *hits = qatomic_read(&helper_lookup_tb_lru_hits);
     if (misses) *misses = qatomic_read(&helper_lookup_tb_lru_misses);
 }
+
+void cranelift_get_helper_lookup_slot_hist(uint64_t out[HELPER_TB_LRU_SIZE])
+{
+    for (unsigned i = 0; i < HELPER_TB_LRU_SIZE; i++) {
+        out[i] = qatomic_read(&helper_lookup_slot_hits[i]);
+    }
+}
+
+/*
+ * Swap two LRU slots across all parallel arrays. Used by promote-on-hit
+ * (i > 0) to land the just-hit TB at slot 0. Replaces the original
+ * shift-everything-down-and-place-at-0 with a single-slot swap — keeps
+ * slot-0 fast-path semantics intact while eliminating the ~5-slot shift
+ * cost (the bulk of `__memmove_aarch64_simd` 0.69% wall on the helper
+ * thread). MRU semantics weaken slightly (slot order after a slot-3 hit
+ * becomes 3,1,2,0,4,5,6,7 vs 3,0,1,2,4,5,6,7 under shift), but the
+ * critical property — just-hit TB is at slot 0 — is preserved.
+ */
+static inline void helper_tb_lru_swap(unsigned i)
+{
+    uint64_t tmp64;
+    uint32_t tmp32;
+    TranslationBlock *tmp_tb;
+    tb_page_addr_t tmp_pa;
+
+    tmp64 = helper_tb_lru.pcs[i];
+    helper_tb_lru.pcs[i] = helper_tb_lru.pcs[0];
+    helper_tb_lru.pcs[0] = tmp64;
+
+    tmp64 = helper_tb_lru.cs_bases[i];
+    helper_tb_lru.cs_bases[i] = helper_tb_lru.cs_bases[0];
+    helper_tb_lru.cs_bases[0] = tmp64;
+
+    tmp32 = helper_tb_lru.flags[i];
+    helper_tb_lru.flags[i] = helper_tb_lru.flags[0];
+    helper_tb_lru.flags[0] = tmp32;
+
+    tmp32 = helper_tb_lru.cflags[i];
+    helper_tb_lru.cflags[i] = helper_tb_lru.cflags[0];
+    helper_tb_lru.cflags[0] = tmp32;
+
+    tmp_tb = helper_tb_lru.tbs[i];
+    helper_tb_lru.tbs[i] = helper_tb_lru.tbs[0];
+    helper_tb_lru.tbs[0] = tmp_tb;
+
+    tmp_pa = helper_tb_lru.phys_pc_pages[i];
+    helper_tb_lru.phys_pc_pages[i] = helper_tb_lru.phys_pc_pages[0];
+    helper_tb_lru.phys_pc_pages[0] = tmp_pa;
+}
+
+/*
+ * Miss-install: shift slots 0..6 → 1..7 (oldest at 7 falls off) then
+ * write new at slot 0. Hand-unrolled so the compiler emits a sequence
+ * of ldp/stp pairs rather than calling out to `__memmove_aarch64_simd`,
+ * eliminating the function-call + length-check overhead that showed up
+ * as 0.69% wall on the helper thread.
+ */
+#define HELPER_TB_LRU_SHIFT_DOWN(arr) do {  \
+    (arr)[7] = (arr)[6];                    \
+    (arr)[6] = (arr)[5];                    \
+    (arr)[5] = (arr)[4];                    \
+    (arr)[4] = (arr)[3];                    \
+    (arr)[3] = (arr)[2];                    \
+    (arr)[2] = (arr)[1];                    \
+    (arr)[1] = (arr)[0];                    \
+} while (0)
 
 /*
  * Resolve the host code pointer to dispatch into for a given TB.
@@ -943,69 +1103,115 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
         unsigned cur_flush = qatomic_read(&tb_ctx.tb_flush_count);
         if (unlikely(cur_flush != helper_tb_lru.last_flush_count)) {
             for (unsigned i = 0; i < HELPER_TB_LRU_SIZE; i++) {
-                helper_tb_lru.slots[i].tb = NULL;
+                helper_tb_lru.tbs[i] = NULL;
             }
             helper_tb_lru.last_flush_count = cur_flush;
         } else {
             /*
              * Slot-0 fast path: ~50% of calls hit here on Halo 2
-             * gameplay. Branch predictor needs the likely() to pipeline
-             * the hit-return ahead of the cold-path loop body, otherwise
-             * helper_lookup_tb_ptr fans out into the same-page scan
-             * cost on every call.
+             * gameplay. SoA layout puts the slot-0 fields at the start
+             * of each parallel array; all 4 array-starts live on
+             * cache-line-aligned addresses kept hot in L1.
              */
-            struct helper_tb_lru_slot *s0 = &helper_tb_lru.slots[0];
-            if (likely(s0->tb && s0->pc == s.pc &&
-                       s0->cs_base == s.cs_base &&
-                       s0->flags == s.flags &&
-                       s0->cflags == s.cflags &&
-                       !(tb_cflags(s0->tb) & CF_INVALID))) {
+            TranslationBlock *tb0 = helper_tb_lru.tbs[0];
+            if (likely(tb0 &&
+                       helper_tb_lru.pcs[0]      == (uint64_t)s.pc &&
+                       helper_tb_lru.cs_bases[0] == s.cs_base &&
+                       helper_tb_lru.flags[0]    == s.flags &&
+                       helper_tb_lru.cflags[0]   == s.cflags &&
+                       !(tb_cflags(tb0) & CF_INVALID))) {
                 helper_lookup_tb_lru_hits++;
-                return helper_resolve_tb_dispatch(s0->tb);
+                helper_lookup_slot_hits[0]++;
+                return helper_resolve_tb_dispatch(tb0);
             }
             /*
-             * Cold path: scan slots 0..N-1. Each iteration does double
-             * duty — looks for an exact match (return + promote) and
-             * also remembers the first same-page same-state slot to
-             * publish as the phys_pc hint for tb_htable_lookup_common.
+             * Cold path: SIMD pc-broadcast against all 8 slots, then
+             * confirm cs_base/flags/cflags/CF_INVALID on any pc-matching
+             * slot. Same-page hint collection happens in a tiny
+             * post-pass walked only when no exact pc match was found.
              *
-             * The hint is page-granular, so a same-page TB's
-             * phys_pc_page (cached at insert time) gives us phys_pc for
-             * s.pc without get_page_addr_code → probe_access_internal
-             * → mmu_translate / tlb_fill / physical_memory_is_clean.
-             *
-             * Folded into one pass to avoid the 2-loop scan cost that
-             * showed up in the 2026-05-25 callgraph as a ~6% inflation
-             * of helper_lookup_tb_ptr — that scan now rides along on
-             * the existing per-slot compares.
+             * On aarch64, 4× vceqq_u64 (one cache-line load + 4 vector
+             * compares) builds an 8-lane match mask in ~8 instructions.
+             * The portable fallback uses a scalar loop that the compiler
+             * can still auto-vectorize on the SoA layout.
+             */
+            uint32_t mask;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+            {
+                uint64x2_t tpc = vdupq_n_u64((uint64_t)s.pc);
+                uint64x2_t e0 = vceqq_u64(
+                    vld1q_u64(&helper_tb_lru.pcs[0]), tpc);
+                uint64x2_t e1 = vceqq_u64(
+                    vld1q_u64(&helper_tb_lru.pcs[2]), tpc);
+                uint64x2_t e2 = vceqq_u64(
+                    vld1q_u64(&helper_tb_lru.pcs[4]), tpc);
+                uint64x2_t e3 = vceqq_u64(
+                    vld1q_u64(&helper_tb_lru.pcs[6]), tpc);
+                /*
+                 * vceqq_u64 returns 0 or ~0u64 per lane. Extract each
+                 * lane as a scalar (single fmov), mask to the low bit
+                 * (0 or 1), and OR into the 8-bit slot-match mask at
+                 * the correct position.
+                 */
+                uint64_t l0 = vgetq_lane_u64(e0, 0);
+                uint64_t l1 = vgetq_lane_u64(e0, 1);
+                uint64_t l2 = vgetq_lane_u64(e1, 0);
+                uint64_t l3 = vgetq_lane_u64(e1, 1);
+                uint64_t l4 = vgetq_lane_u64(e2, 0);
+                uint64_t l5 = vgetq_lane_u64(e2, 1);
+                uint64_t l6 = vgetq_lane_u64(e3, 0);
+                uint64_t l7 = vgetq_lane_u64(e3, 1);
+                mask = (uint32_t)(
+                    ((l0 & 1u) << 0) |
+                    ((l1 & 1u) << 1) |
+                    ((l2 & 1u) << 2) |
+                    ((l3 & 1u) << 3) |
+                    ((l4 & 1u) << 4) |
+                    ((l5 & 1u) << 5) |
+                    ((l6 & 1u) << 6) |
+                    ((l7 & 1u) << 7));
+            }
+#else
+            mask = 0;
+            for (unsigned i = 0; i < HELPER_TB_LRU_SIZE; i++) {
+                if (helper_tb_lru.pcs[i] == (uint64_t)s.pc) {
+                    mask |= 1u << i;
+                }
+            }
+#endif
+            /*
+             * Fused walk: single pass over all 8 slots. The SIMD-built
+             * `mask` tells us which slots had a pc-match worth confirming
+             * (state + CF_INVALID). Other slots are eligible only as
+             * same-page hint candidates. This is the same total work as
+             * the original AoS scan — one walk, both exact-match and
+             * hint collection — without paying the 2x miss-path penalty
+             * of the original Phase 1+2 implementation that did the
+             * bitset-iter loop and then a separate full hint walk.
              */
             tb_page_addr_t hint = 0;
             vaddr virt_page = s.pc & TARGET_PAGE_MASK;
             for (unsigned i = 0; i < HELPER_TB_LRU_SIZE; i++) {
-                struct helper_tb_lru_slot *si = &helper_tb_lru.slots[i];
-                if (!si->tb) continue;
-                if (si->cs_base != s.cs_base ||
-                    si->flags   != s.flags   ||
-                    si->cflags  != s.cflags) continue;
-                if (tb_cflags(si->tb) & CF_INVALID) continue;
+                TranslationBlock *cand = helper_tb_lru.tbs[i];
+                if (!cand) continue;
+                if (helper_tb_lru.cs_bases[i] != s.cs_base) continue;
+                if (helper_tb_lru.flags[i]    != s.flags)    continue;
+                if (helper_tb_lru.cflags[i]   != s.cflags)   continue;
+                if (tb_cflags(cand) & CF_INVALID) continue;
 
-                if (si->pc == s.pc) {
-                    if (i == 0) {
-                        helper_lookup_tb_lru_hits++;
-                        return helper_resolve_tb_dispatch(si->tb);
-                    }
-                    /* Promote slot i → slot 0, shift others down. */
-                    struct helper_tb_lru_slot hit = *si;
-                    for (unsigned j = i; j > 0; j--) {
-                        helper_tb_lru.slots[j] = helper_tb_lru.slots[j - 1];
-                    }
-                    helper_tb_lru.slots[0] = hit;
+                if (mask & (1u << i)) {
+                    /* Exact pc match confirmed. */
                     helper_lookup_tb_lru_hits++;
-                    return helper_resolve_tb_dispatch(hit.tb);
+                    helper_lookup_slot_hits[i]++;
+                    if (i != 0) {
+                        helper_tb_lru_swap(i);
+                    }
+                    return helper_resolve_tb_dispatch(cand);
                 }
 
-                if (!hint && (si->pc & TARGET_PAGE_MASK) == virt_page) {
-                    hint = si->phys_pc_page;
+                if (!hint &&
+                    (helper_tb_lru.pcs[i] & TARGET_PAGE_MASK) == virt_page) {
+                    hint = helper_tb_lru.phys_pc_pages[i];
                 }
             }
             helper_phys_pc_hint = hint;
@@ -1023,16 +1229,24 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 
 #if XEMU_HAVE_CRANELIFT
     helper_lookup_tb_lru_misses++;
-    /* Shift all slots down, install new entry at slot 0. */
-    for (unsigned i = HELPER_TB_LRU_SIZE - 1; i > 0; i--) {
-        helper_tb_lru.slots[i] = helper_tb_lru.slots[i - 1];
-    }
-    helper_tb_lru.slots[0].pc = s.pc;
-    helper_tb_lru.slots[0].cs_base = s.cs_base;
-    helper_tb_lru.slots[0].flags = s.flags;
-    helper_tb_lru.slots[0].cflags = s.cflags;
-    helper_tb_lru.slots[0].tb = tb;
-    helper_tb_lru.slots[0].phys_pc_page = tb_page_addr0(tb) & TARGET_PAGE_MASK;
+    /*
+     * Miss-install: shift slots 0..6 down by one in every parallel
+     * array, then write s + tb at slot 0. Hand-unrolled shift compiles
+     * to back-to-back ldp/stp pairs without an out-of-line memmove
+     * (the previous AoS shift was hitting `__memmove_aarch64_simd`).
+     */
+    HELPER_TB_LRU_SHIFT_DOWN(helper_tb_lru.pcs);
+    HELPER_TB_LRU_SHIFT_DOWN(helper_tb_lru.cs_bases);
+    HELPER_TB_LRU_SHIFT_DOWN(helper_tb_lru.flags);
+    HELPER_TB_LRU_SHIFT_DOWN(helper_tb_lru.cflags);
+    HELPER_TB_LRU_SHIFT_DOWN(helper_tb_lru.tbs);
+    HELPER_TB_LRU_SHIFT_DOWN(helper_tb_lru.phys_pc_pages);
+    helper_tb_lru.pcs[0]           = (uint64_t)s.pc;
+    helper_tb_lru.cs_bases[0]      = s.cs_base;
+    helper_tb_lru.flags[0]         = s.flags;
+    helper_tb_lru.cflags[0]        = s.cflags;
+    helper_tb_lru.tbs[0]           = tb;
+    helper_tb_lru.phys_pc_pages[0] = tb_page_addr0(tb) & TARGET_PAGE_MASK;
 #endif
 
     BURST_DIAG_BUMP_TB_LOOKUP_PC(s.pc);
