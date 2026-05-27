@@ -1395,8 +1395,20 @@ static uint64_t cranelift_chain_runs;
 static uint64_t cranelift_chain_iters_total;
 static uint64_t cranelift_chain_spins;     /* exits via revisit detection */
 static uint64_t cranelift_chain_irq_exits; /* exits via interrupt_request */
+/* Phase 3 (tier-2 TB chaining): per-chain install accounting.
+ * `installs` = first-iter slot install succeeded.
+ * `install_declines` = first-iter slot install skipped (target tier-1
+ *                      or HLE-intercepted PC; safe to chain without
+ *                      installing). */
+uint64_t cranelift_chain_installs;
+uint64_t cranelift_chain_install_declines;
 
 uintptr_t cranelift_chain_continue(CPUArchState *env)
+{
+    return cranelift_chain_continue_v2(env, NULL);
+}
+
+uintptr_t cranelift_chain_continue_v2(CPUArchState *env, void **from_slot)
 {
     if (cranelift_in_chain) {
         return 0;
@@ -1404,6 +1416,11 @@ uintptr_t cranelift_chain_continue(CPUArchState *env)
     CPUState *cpu = env_cpu(env);
     cranelift_in_chain = true;
     uintptr_t ret = 0;
+    /* Phase 3 install hook: only attempt to install the FIRST eligible
+     * chain target into *from_slot, then suppress further attempts for
+     * this invocation (later iters dispatch unrelated TBs that wouldn't
+     * be the from-TB's direct successor). */
+    bool install_pending = (from_slot != NULL);
 
     /* Per-chain quantum: base + jitter. Jitter breaks livelock alignment
      * across consecutive chains; without it, a chain that always exits
@@ -1542,6 +1559,30 @@ uintptr_t cranelift_chain_continue(CPUArchState *env)
         }
 
         /*
+         * Phase 3 (tier-2 TB chaining) install hook. Fires only on
+         * the FIRST iter of a chain_continue_v2 invocation that was
+         * passed a non-NULL from_slot — i.e., we're being called as
+         * the slow-path fallback from a tier-2 TB's GotoTb whose
+         * chain slot was empty. We install the immediate next TB's
+         * SystemV entry into the from-TB's slot ONLY if:
+         *   - target is itself tier-2 (lookup_ce_code returns non-NULL)
+         *   - target PC is NOT HLE-intercepted (would skip in-chain HLE
+         *     otherwise; see the comment block below this one)
+         * After the first attempt (whether install or decline) we
+         * clear install_pending so later iters don't keep checking.
+         */
+        if (install_pending) {
+            install_pending = false;
+            const void *ce = cranelift_bridge_lookup_ce_code(tb);
+            if (ce && !xbox_hle_is_handled((uint32_t)s.pc)) {
+                qatomic_set((void **)from_slot, (void *)(uintptr_t)ce);
+                cranelift_chain_installs++;
+            } else {
+                cranelift_chain_install_declines++;
+            }
+        }
+
+        /*
          * Xbox kernel HLE inside the chain.
          *
          * Without this, only kernel calls reached via the main dispatcher
@@ -1677,6 +1718,7 @@ void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
     if (irq_exits)   *irq_exits = cranelift_chain_irq_exits;
     if (chain_max)   *chain_max = cranelift_chain_max_base;
     if (jitter)      *jitter = cranelift_chain_jitter_mask;
+    (void)cranelift_chain_installs; (void)cranelift_chain_install_declines;
     if (thread_count) {
 #ifdef XBOX
         uint32_t n = 0;

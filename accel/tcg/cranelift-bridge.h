@@ -262,6 +262,16 @@ void cranelift_unwind_get_stats(uint64_t *hits, uint64_t *misses,
 const void *cranelift_bridge_lookup_shim(const TranslationBlock *tb);
 
 /*
+ * Phase 3 (tier-2 TB chaining): companion to lookup_shim that returns
+ * the SystemV entry into the cranelift-emitted code body (skipping the
+ * TCG-prologue ABI shim). Used by `cranelift_chain_continue_v2` to
+ * install direct tail-call targets into a from-TB's chain slot; both
+ * source and target are SystemV when chaining tier-2→tier-2, so the
+ * shim's ABI conversion is unnecessary.
+ */
+const void *cranelift_bridge_lookup_ce_code(const TranslationBlock *tb);
+
+/*
  * Published by the aarch64 TCG backend (tcg_target_qemu_prologue) once
  * the prologue/epilogue blob has been emitted.  Zero until the prologue
  * has been initialised; cranelift_bridge_try_swap() refuses to install
@@ -277,6 +287,25 @@ extern uintptr_t cranelift_g_tb_ret_addr;
  * resolution at JIT time.
  */
 uintptr_t cranelift_chain_continue(CPUArchState *env);
+
+/*
+ * Phase 3 (tier-2 TB chaining) variant of `cranelift_chain_continue`.
+ *
+ * Same dispatch loop as chain_continue, but takes an extra `from_slot`
+ * pointer to the calling tier-2 TB's chain slot. On the FIRST tier-2→
+ * tier-2 hop that's safe to chain (target compiled tier-2, target PC
+ * not HLE-intercepted, target not blacklisted), atomically writes the
+ * target's SystemV entry into *from_slot. Subsequent dispatches via
+ * that from-TB's GotoTb skip chain_continue_v2 entirely and direct-
+ * tail-call the cached target.
+ *
+ * `from_slot == NULL` is permitted (callers from GotoPtr, or when the
+ * tier-2 chaining feature is disabled); behaves identically to
+ * chain_continue with no install side-effect.
+ *
+ * Defined alongside cranelift_chain_continue in accel/tcg/cpu-exec.c.
+ */
+uintptr_t cranelift_chain_continue_v2(CPUArchState *env, void **from_slot);
 
 /*
  * Per-chain quantum + per-guest-thread fingerprint tracker.
@@ -467,6 +496,12 @@ static inline void cranelift_bridge_try_swap(TranslationBlock *tb)
 }
 static inline const void *
 cranelift_bridge_lookup_shim(const TranslationBlock *tb)
+{
+    (void)tb;
+    return NULL;
+}
+static inline const void *
+cranelift_bridge_lookup_ce_code(const TranslationBlock *tb)
 {
     (void)tb;
     return NULL;

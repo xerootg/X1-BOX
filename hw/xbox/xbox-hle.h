@@ -46,6 +46,17 @@ bool xbox_hle_is_enabled(void);
 bool xbox_hle_check(CPUState *cs, uint32_t pc);
 
 /*
+ * Side-effect-free predicate: returns true if `pc` could be intercepted
+ * by an HLE handler given the currently enabled ranges/gates. Mirrors
+ * the fast-path range filter inside xbox_hle_check (kernel image, XBE
+ * VSH probe, dsound, intro, crt-math) plus the QPC inline fast-path,
+ * but does not run any handler. Used by tier-2 TB chaining to decline
+ * installing a direct chain target whose dispatch would otherwise
+ * bypass HLE.
+ */
+bool xbox_hle_is_handled(uint32_t pc);
+
+/*
  * Lazy resolver. Reads the Xbox kernel PE export table at 0x80010000
  * once per session and installs hooks for all known ordinals. The
  * dispatcher fast-path nudges this on each cpu_exec_loop entry until

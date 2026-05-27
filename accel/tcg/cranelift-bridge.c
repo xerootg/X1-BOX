@@ -1373,6 +1373,14 @@ typedef struct CraneliftShimEntry {
      */
     vaddr                   pc;
     void                   *shim;
+    /*
+     * Phase 3 (tier-2 TB chaining): the SystemV entry to the
+     * cranelift-emitted code body, recorded alongside the shim at
+     * install time. The shim wraps this with the TCG-prologue ABI;
+     * for direct tail-call between tier-2 TBs (both SystemV) we want
+     * the body, NOT the shim. NULL = no tier-2 entry installed yet.
+     */
+    void                   *ce_code;
 } CraneliftShimEntry;
 static CraneliftShimEntry g_shim_map[CRANELIFT_SHIM_MAP_CAP];
 static unsigned           g_shim_map_count;
@@ -2158,8 +2166,9 @@ void cranelift_bridge_try_swap_slow(TranslationBlock *tb)
                  * as a publication boundary so lockless readers see
                  * a fully-formed slot).
                  */
-                g_shim_map[slot].shim = shim;
-                g_shim_map[slot].pc   = tb->pc;
+                g_shim_map[slot].shim    = shim;
+                g_shim_map[slot].ce_code = new_code;
+                g_shim_map[slot].pc      = tb->pc;
                 qatomic_set(&g_shim_map[slot].tb, tb);
                 if (cur == NULL) {
                     qatomic_set(&g_shim_map_count, g_shim_map_count + 1);
@@ -2416,6 +2425,36 @@ const void *cranelift_bridge_lookup_shim(const TranslationBlock *tb)
             return NULL;
         }
         /* Collision with different tb pointer; keep probing. */
+    }
+    return NULL;
+}
+
+/*
+ * Phase 3 (tier-2 TB chaining): same lookup shape as
+ * cranelift_bridge_lookup_shim, but returns the SystemV entry
+ * (ce_code) instead of the shim. Used by chain_continue_v2 to install
+ * a direct tail-call target into a from-TB's slot — direct calls
+ * skip the shim's ABI thunk since both source and target are SystemV.
+ */
+const void *cranelift_bridge_lookup_ce_code(const TranslationBlock *tb)
+{
+    if (qatomic_read(&g_shim_map_count) == 0) {
+        return NULL;
+    }
+    unsigned idx = cranelift_shim_hash(tb);
+    for (unsigned i = 0; i < CRANELIFT_SHIM_MAP_CAP; i++) {
+        unsigned slot = (idx + i) & CRANELIFT_SHIM_MAP_MASK;
+        const TranslationBlock *slot_tb =
+            qatomic_read(&g_shim_map[slot].tb);
+        if (slot_tb == NULL) {
+            return NULL;
+        }
+        if (slot_tb == tb) {
+            if (g_shim_map[slot].pc == tb->pc) {
+                return g_shim_map[slot].ce_code;
+            }
+            return NULL;
+        }
     }
     return NULL;
 }

@@ -3490,6 +3490,35 @@ bool xbox_hle_check(CPUState *cs, uint32_t pc)
     return handled;
 }
 
+bool xbox_hle_is_handled(uint32_t pc)
+{
+    if (!g_hle_enabled) {
+        return false;
+    }
+    /* Mirrors the early-return fast paths in xbox_hle_check above. The
+     * #defines for these ranges are all in lexical scope by this point
+     * (they were declared above for use by xbox_hle_check). */
+    if (pc == XBOX_HLE_KE_QPC_VA) {
+        return true;
+    }
+    if (pc >= XKRNL_HOOK_RANGE_LO && pc < XKRNL_HOOK_RANGE_HI) {
+        return true;
+    }
+    if (pc >= HALO2_VSH_PROBE_LO && pc < HALO2_VSH_PROBE_HI) {
+        return true;
+    }
+    if (g_gate_dsound && pc >= HALO2_DSOUND_PC_LO && pc < HALO2_DSOUND_PC_HI) {
+        return true;
+    }
+    if (pc >= HALO2_INTRO_DISPATCHER_LO && pc < HALO2_INTRO_DISPATCHER_HI) {
+        return true;
+    }
+    if (g_gate_halo2_pow && pc >= HALO2_CRT_MATH_LO && pc < HALO2_CRT_MATH_HI) {
+        return true;
+    }
+    return false;
+}
+
 void xbox_hle_log_stats(void)
 {
     if (!g_hle_enabled) return;
