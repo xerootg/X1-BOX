@@ -137,6 +137,9 @@ impl Translator {
          * recompiling once the root cause is found. */
         let direct_bl_ext = std::env::var("X1BOX_DIRECT_BL_EXT")
             .unwrap_or_default();
+        // PERF A/B 2026-05-27: phase 3 alone (back off phase 2 ext since
+        // combining all three direct-bl mods together wasn't bisected
+        // and triggered a wedge symptom on the first attempt).
         let direct_bl_cc = matches!(direct_bl_ext.as_str(), "1" | "cc");
         let direct_bl_flcr = matches!(direct_bl_ext.as_str(), "1" | "flcr");
 
@@ -145,10 +148,19 @@ impl Translator {
          * request_offset to be populated; if either is missing (e.g.
          * old C side, env=NULL test path) the gate stays effectively
          * off so the JIT keeps emitting the legacy GotoTb shape. */
+        /* Phase 3 (tier-2 TB chaining) default. Flipped to ON by default
+         * 2026-05-27 after Zenfone Halo 2 measurement showed +32% user-
+         * FPS vs OFF at the audio-heavy scene (12.77 vs 9.65) and the
+         * earlier bisect work cleared the chain-install + IRQ-check
+         * shape on title scenes. Env var keeps the opt-OUT semantics
+         * for future regression bisect:
+         *   X1BOX_TIER2_CHAIN=0  — disable (legacy chain_continue path)
+         *   X1BOX_TIER2_CHAIN=1  — explicitly enable (same as default)
+         *   unset                — enabled */
         let tier2_chain_gate = std::env::var("X1BOX_TIER2_CHAIN")
             .ok()
             .as_deref()
-            == Some("1");
+            != Some("0");
         let tier2_chain_enabled = tier2_chain_gate
             && env.chain_continue_v2_fn != 0
             && env.cpu_interrupt_request_offset != 0;
