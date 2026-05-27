@@ -39,6 +39,7 @@ use crate::translator::{Lowering, TransError};
  */
 const OPC_LD_VEC: u16 = 127;
 const OPC_ST_VEC: u16 = 128;
+const OPC_OR_VEC: u16 = 144;
 
 /// Lower an FP opcode by its raw integer code (past QemuSt2 / 82).
 ///
@@ -330,8 +331,31 @@ pub(crate) fn lower_vec(l: &mut Lowering<'_, '_>, raw: u16, op: &DecodedOp) -> R
     match raw {
         OPC_LD_VEC => lower_ld_vec(l, op),
         OPC_ST_VEC => lower_st_vec(l, op),
+        OPC_OR_VEC => lower_or_vec(l, op),
         _ => Err(TransError::UnsupportedOp(raw)),
     }
+}
+
+/*
+ * or_vec — bitwise OR of two vector temps.
+ *
+ * Lane width (vece) is irrelevant for bitwise ops, so we don't need
+ * the vece slot that cranelift-bridge.c:854-857 currently drops on the
+ * floor. read_iarg routes both operands through the scalar↔vector
+ * coerce so they arrive as I64X2 regardless of how TCG materialised
+ * them; `bor` on I64X2 lowers to AArch64 `ORR Vd.16B, Vn.16B, Vm.16B`
+ * which gives the right answer for any element size.
+ *
+ * Halo 2 hit this exactly once per ~1900 compiles in the 2026-05-27
+ * Zenfone histogram (opc144=1). Tiny lever, but a clean closing motion
+ * on the Phase 1 bail-reduction pass — no plumbing, single op.
+ */
+fn lower_or_vec(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), TransError> {
+    let a = l.read_iarg(op, 0, op.ty)?;
+    let b = l.read_iarg(op, 1, op.ty)?;
+    let r = l.builder.ins().bor(a, b);
+    l.write_temp(op.oarg(0), r);
+    Ok(())
 }
 
 /*
@@ -438,7 +462,20 @@ fn lower_st_vec(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), TransErr
     let off = op.carg(0) as i64;
     let addr = l.builder.ins().iadd_imm(base, off);
     if width_bytes == 16 {
-        if l.builder.func.dfg.value_type(val) != types::I64X2 {
+        let vty = l.builder.func.dfg.value_type(val);
+        if vty != types::I64X2 {
+            /* Diagnostic: capture the actual Cranelift value type so
+             * we know which coercion is missing.  One-shot via static
+             * AtomicBool — same pattern as the dispatcher's first-
+             * verifier-failure logger. */
+            static FIRST: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(true);
+            if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                crate::dispatcher::log_to_android(&format!(
+                    "st_vec V128 bail (first): val_ty={} op.ty={:?}",
+                    vty, op.ty
+                ));
+            }
             return Err(TransError::UnsupportedOp(OPC_ST_VEC_BAIL_V128_VAL_TY));
         }
         l.builder.ins().store(MemFlags::new(), val, addr, 0);
@@ -449,6 +486,14 @@ fn lower_st_vec(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), TransErr
         } else if val_ty == types::I64 {
             val
         } else {
+            static FIRST: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(true);
+            if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                crate::dispatcher::log_to_android(&format!(
+                    "st_vec V64 bail (first): val_ty={} op.ty={:?}",
+                    val_ty, op.ty
+                ));
+            }
             return Err(TransError::UnsupportedOp(OPC_ST_VEC_BAIL_V64_VAL_TY));
         };
         l.builder.ins().store(MemFlags::new(), lo, addr, 0);

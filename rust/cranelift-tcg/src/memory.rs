@@ -264,10 +264,32 @@ fn lower_load_with_helper(
     let memop_raw = op.carg(0) as u32;
     let memop = decode_memop(memop_raw);
 
-    let helper_ptr = l
-        .helpers
-        .ld_helper(memop.memop)
-        .ok_or(TransError::UnsupportedOp(crate::opc::Opc::QemuLd as u16))?;
+    let helper_ptr = match l.helpers.ld_helper(memop.memop) {
+        Some(p) => p,
+        None => {
+            /* Diagnostic: identify which MemOp shape is missing from
+             * the helper table. One-shot per distinct memop value (low
+             * 5 bits) to cap log volume.  Helps spot uncovered slots
+             * like MO_128 (SSE-aligned guest loads) without flooding
+             * logcat on every bail. */
+            static SEEN: [std::sync::atomic::AtomicBool; 32] = {
+                #[allow(clippy::declare_interior_mutable_const)]
+                const F: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                [F; 32]
+            };
+            let slot = (memop.memop & 0x1f) as usize;
+            if !SEEN[slot].swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::dispatcher::log_to_android(&format!(
+                    "qemu_ld bail: memop_raw=0x{:x} memop=0x{:x} size={:?} \
+                     bswap={} signed={} mmu_idx={}",
+                    memop_raw, memop.memop, memop.size,
+                    memop.bswap, memop.signed, memop.mmu_idx
+                ));
+            }
+            return Err(TransError::UnsupportedOp(crate::opc::Opc::QemuLd as u16));
+        }
+    };
 
     let fast = emit_tlb_fastpath(l, guest_addr, memop.mmu_idx, memop.size, false)?;
 
@@ -391,10 +413,30 @@ fn lower_store_with_helper(
     let memop_raw = op.carg(0) as u32;
     let memop = decode_memop(memop_raw);
 
-    let helper_ptr = l
-        .helpers
-        .st_helper(memop.memop)
-        .ok_or(TransError::UnsupportedOp(crate::opc::Opc::QemuSt as u16))?;
+    let helper_ptr = match l.helpers.st_helper(memop.memop) {
+        Some(p) => p,
+        None => {
+            /* Same shape as the load side. Store helper table is
+             * indexed by memop & 0x07 so the seen-set only needs 8
+             * entries, but use 16 for cheap symmetry. */
+            static SEEN: [std::sync::atomic::AtomicBool; 16] = {
+                #[allow(clippy::declare_interior_mutable_const)]
+                const F: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                [F; 16]
+            };
+            let slot = (memop.memop & 0x0f) as usize;
+            if !SEEN[slot].swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::dispatcher::log_to_android(&format!(
+                    "qemu_st bail: memop_raw=0x{:x} memop=0x{:x} size={:?} \
+                     bswap={} mmu_idx={}",
+                    memop_raw, memop.memop, memop.size,
+                    memop.bswap, memop.mmu_idx
+                ));
+            }
+            return Err(TransError::UnsupportedOp(crate::opc::Opc::QemuSt as u16));
+        }
+    };
 
     let fast = emit_tlb_fastpath(l, guest_addr, memop.mmu_idx, memop.size, true)?;
 
