@@ -42,7 +42,7 @@ const FIXED_REG_OFFSET: u32 = 0xFFFFFFFF;
 use cranelift_codegen::Context as CgContext;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::context::{JitContext, TierTwoEntry, UnwindBuf};
 use crate::env::EnvDesc;
@@ -77,6 +77,15 @@ pub struct Translator {
     func_index: u32,
     env: EnvDesc,
     pub host_ptr_ty: Type,
+    /// Phase 2 direct-relocated-call cache. Each known C helper that
+    /// tier-2 emits a call to is pre-declared in the JIT module at
+    /// Translator::new and its FuncId stashed here, so per-TB compiles
+    /// can lower the call as a single relocated `bl #imm` rather than
+    /// the legacy 4-insn `movz/movk/movk/blr` indirect sequence. The
+    /// raw helper pointer is registered as a symbol on the JITBuilder
+    /// so cranelift-jit-patched can resolve the relocation at finalize
+    /// time. See Lowering::declare_helper for the call-site emit shape.
+    helper_funcs: HashMap<&'static str, FuncId>,
 }
 
 impl Translator {
@@ -102,17 +111,59 @@ impl Translator {
 
         let host_ptr_ty = if env.host_ptr_size == 8 { types::I64 } else { types::I32 };
 
-        let jit_builder = JITBuilder::with_isa(
+        let mut jit_builder = JITBuilder::with_isa(
             isa,
             cranelift_module::default_libcall_names(),
         );
-        let module = JITModule::new(jit_builder);
+
+        /* Phase 2: register cranelift_chain_continue with the JIT
+         * builder so cranelift_module's relocation pass can resolve a
+         * direct `bl #imm` against it. Pre-bind the name to the
+         * address we already have on EnvDesc; cranelift-jit-patched
+         * stashes it in its internal symbol table (backend.rs:115-122).
+         * Every tier-2 TB exits via this call once (GotoTb/GotoPtr) so
+         * this is the highest-frequency direct-bl target in the JIT. */
+        if env.chain_continue_fn != 0 {
+            jit_builder.symbols(std::iter::once((
+                "cranelift_chain_continue",
+                env.chain_continue_fn as *const u8,
+            )));
+        }
+
+        let mut module = JITModule::new(jit_builder);
+
+        /* Pre-declare the helpers we just registered as Linkage::Import
+         * so the FuncId is stable across compiles. declare_function
+         * with the same name+sig returns the same id; we cache it. */
+        let mut helper_funcs: HashMap<&'static str, FuncId> = HashMap::new();
+        if env.chain_continue_fn != 0 {
+            let mut sig = Signature::new(CallConv::SystemV);
+            sig.params.push(AbiParam::new(host_ptr_ty));
+            sig.returns.push(AbiParam::new(types::I64));
+            match module.declare_function(
+                "cranelift_chain_continue",
+                Linkage::Import,
+                &sig,
+            ) {
+                Ok(id) => {
+                    helper_funcs.insert("cranelift_chain_continue", id);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "cranelift-tcg: failed to declare \
+                         cranelift_chain_continue: {e:?} (falling back \
+                         to call_indirect)"
+                    );
+                }
+            }
+        }
 
         Ok(Translator {
             module,
             func_index: 0,
             env: env.clone(),
             host_ptr_ty,
+            helper_funcs,
         })
     }
 
@@ -234,6 +285,8 @@ impl Translator {
                 &mut builder,
                 &self.env,
                 host_ptr_ty,
+                &mut self.module,
+                &self.helper_funcs,
                 &ctx.helpers,
             );
             lower.lower_block(&snap.ops)?;
@@ -384,6 +437,14 @@ pub(crate) struct Lowering<'a, 'b> {
     pub(crate) env: &'a EnvDesc,
     pub(crate) env_val: Value,
     pub(crate) host_ptr_ty: Type,
+    /// Module reference for declare_func_in_func calls (Phase 2 direct
+    /// relocated helper calls). Borrowed mutably for the duration of
+    /// this compile so individual call-site lowerings can pull FuncRefs
+    /// into the current function being built.
+    pub(crate) module: &'a mut JITModule,
+    /// Cache of pre-declared helper FuncIds (built in Translator::new).
+    /// Lookup by stable C symbol name.
+    pub(crate) helper_funcs: &'a HashMap<&'static str, FuncId>,
     /// Snapshot of QEMU's softmmu slow-path helper table.
     pub(crate) helpers: &'a crate::context::HelperTable,
     /// TCG temp ID -> (Cranelift Variable, type it was declared with).
@@ -420,6 +481,8 @@ impl<'a, 'b> Lowering<'a, 'b> {
         builder: &'a mut FunctionBuilder<'b>,
         env: &'a EnvDesc,
         host_ptr_ty: Type,
+        module: &'a mut JITModule,
+        helper_funcs: &'a HashMap<&'static str, FuncId>,
         helpers: &'a crate::context::HelperTable,
     ) -> Self {
         let entry_block = builder.create_block();
@@ -432,6 +495,8 @@ impl<'a, 'b> Lowering<'a, 'b> {
             env,
             env_val,
             host_ptr_ty,
+            module,
+            helper_funcs,
             helpers,
             temps: HashMap::new(),
             next_var: 0,
@@ -442,6 +507,19 @@ impl<'a, 'b> Lowering<'a, 'b> {
             current_guest_idx: 0,
             insn_start_words: Vec::new(),
         }
+    }
+
+    /// Pull a pre-declared helper into the current function being built
+    /// and return a FuncRef suitable for ins().call(). Returns None if
+    /// the helper wasn't registered at Translator::new — caller is
+    /// expected to fall back to iconst+call_indirect via the raw
+    /// pointer it already has.
+    pub(crate) fn declare_helper(
+        &mut self,
+        name: &'static str,
+    ) -> Option<cranelift_codegen::ir::FuncRef> {
+        let id = *self.helper_funcs.get(name)?;
+        Some(self.module.declare_func_in_func(id, self.builder.func))
     }
 
     /// Look up (or declare) the Variable for a TCG temp id.
@@ -1057,24 +1135,40 @@ impl<'a, 'b> Lowering<'a, 'b> {
                  * subsequent tier-2 TBs within that chain hit the guard
                  * and return 0 immediately — pure CALL overhead BUT
                  * removing the call entirely breaks chain bootstrapping
-                 * (verified 2026-05-25: chain_runs=0 with no call). */
+                 * (verified 2026-05-25: chain_runs=0 with no call).
+                 *
+                 * Phase 2: try a direct relocated `bl` first via the
+                 * pre-declared helper FuncId (saves the 3-insn movz/movk
+                 * address materialisation + the indirect blr). Fall
+                 * back to iconst+call_indirect if the helper wasn't
+                 * registered at Translator::new. */
                 let chain_fn = self.env.chain_continue_fn;
                 if chain_fn != 0 {
-                    let mut sig =
-                        Signature::new(CallConv::SystemV);
-                    sig.params.push(AbiParam::new(self.host_ptr_ty));
-                    sig.returns.push(AbiParam::new(types::I64));
-                    let sig_ref = self.builder.import_signature(sig);
-                    let addr = self
-                        .builder
-                        .ins()
-                        .iconst(self.host_ptr_ty, chain_fn as i64);
-                    let inst = self.builder.ins().call_indirect(
-                        sig_ref,
-                        addr,
-                        &[self.env_val],
-                    );
-                    let ret = self.builder.inst_results(inst)[0];
+                    let ret = if let Some(func_ref) =
+                        self.declare_helper("cranelift_chain_continue")
+                    {
+                        let inst = self.builder.ins().call(
+                            func_ref,
+                            &[self.env_val],
+                        );
+                        self.builder.inst_results(inst)[0]
+                    } else {
+                        let mut sig =
+                            Signature::new(CallConv::SystemV);
+                        sig.params.push(AbiParam::new(self.host_ptr_ty));
+                        sig.returns.push(AbiParam::new(types::I64));
+                        let sig_ref = self.builder.import_signature(sig);
+                        let addr = self
+                            .builder
+                            .ins()
+                            .iconst(self.host_ptr_ty, chain_fn as i64);
+                        let inst = self.builder.ins().call_indirect(
+                            sig_ref,
+                            addr,
+                            &[self.env_val],
+                        );
+                        self.builder.inst_results(inst)[0]
+                    };
                     self.builder.ins().return_(&[ret]);
                 } else {
                     let v = self.builder.ins().iconst(types::I64, 0);
@@ -1104,24 +1198,35 @@ impl<'a, 'b> Lowering<'a, 'b> {
                  * unused; Cranelift's DCE drops the dead load. The
                  * helper_lookup_tb_ptr call that produced it still
                  * executes for its side effects.
-                 */
+                 *
+                 * Phase 2: same direct-bl path as GotoTb above. */
                 let chain_fn = self.env.chain_continue_fn;
                 if chain_fn != 0 {
-                    let mut sig =
-                        Signature::new(CallConv::SystemV);
-                    sig.params.push(AbiParam::new(self.host_ptr_ty));
-                    sig.returns.push(AbiParam::new(types::I64));
-                    let sig_ref = self.builder.import_signature(sig);
-                    let addr = self
-                        .builder
-                        .ins()
-                        .iconst(self.host_ptr_ty, chain_fn as i64);
-                    let inst = self.builder.ins().call_indirect(
-                        sig_ref,
-                        addr,
-                        &[self.env_val],
-                    );
-                    let ret = self.builder.inst_results(inst)[0];
+                    let ret = if let Some(func_ref) =
+                        self.declare_helper("cranelift_chain_continue")
+                    {
+                        let inst = self.builder.ins().call(
+                            func_ref,
+                            &[self.env_val],
+                        );
+                        self.builder.inst_results(inst)[0]
+                    } else {
+                        let mut sig =
+                            Signature::new(CallConv::SystemV);
+                        sig.params.push(AbiParam::new(self.host_ptr_ty));
+                        sig.returns.push(AbiParam::new(types::I64));
+                        let sig_ref = self.builder.import_signature(sig);
+                        let addr = self
+                            .builder
+                            .ins()
+                            .iconst(self.host_ptr_ty, chain_fn as i64);
+                        let inst = self.builder.ins().call_indirect(
+                            sig_ref,
+                            addr,
+                            &[self.env_val],
+                        );
+                        self.builder.inst_results(inst)[0]
+                    };
                     self.builder.ins().return_(&[ret]);
                 } else {
                     let v = self.builder.ins().iconst(types::I64, 0);
