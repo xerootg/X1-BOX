@@ -40,13 +40,19 @@ android {
     externalNativeBuild {
       cmake {
         /*
-         * Crank optimization across xemu_core for all variants:
-         *   -O3                more aggressive inlining + loop vectorization
-         *                      vs the NDK default of -O2
-         *   -funroll-loops     unrolls fixed-trip loops; pays off in the
-         *                      hot dsp/voice mix and pgraph batch paths
+         * Per-variant optimization split:
+         *   DEBUG / perftest   -O2           less aggressive inlining + loop
+         *                                    transforms; symbols + call sites
+         *                                    stay close to source for
+         *                                    profiling / simpleperf / lldb.
+         *                                    perftest inherits DEBUG flags via
+         *                                    matchingFallbacks so its codegen
+         *                                    stays identical to debug — the
+         *                                    whole point of that variant.
+         *   RELWITHDEBINFO     -O3 + unroll  shipping codegen with debug-info.
+         *   RELEASE            -O3 + unroll  shipping codegen + LTO opt-in.
          *
-         * Deliberately NOT enabled here:
+         * Deliberately NOT enabled anywhere:
          *   -ffast-math / -fno-signed-zeros / -freciprocal-math: would break
          *     the bit-exact NaN/denorm/rounding semantics that the x87 lib
          *     and softfloat code rely on (same reason x87/CMakeLists guard
@@ -57,18 +63,14 @@ android {
          *   LTO: release variant opts in via -DXEMU_ENABLE_LTO=ON (consumed
          *     by the option() + check_ipo_supported() probe in cpp/CMakeLists.txt,
          *     applied per-target on libxemu.so and its first-party static deps).
-         *     Adding it to perftest would change inlining and muddy the
-         *     debug/perftest codegen-parity comment below.
-         *
-         * Perftest matches Debug native flags via matchingFallbacks so the
-         * libxemu.so codegen is identical across debug/perftest — preserved
-         * here by editing both DEBUG and RELEASE flag sets symmetrically.
+         *     Adding it to debug or perftest would change inlining and muddy
+         *     the debug/perftest codegen-parity contract.
          */
         arguments += listOf(
           "-DXEMU_ANDROID_BUILD_ID=3",
           "-DXEMU_ENABLE_XISO_CONVERTER=ON",
-          "-DCMAKE_C_FLAGS_DEBUG=-O3 -funroll-loops -g0",
-          "-DCMAKE_CXX_FLAGS_DEBUG=-O3 -funroll-loops -g0",
+          "-DCMAKE_C_FLAGS_DEBUG=-O2 -g0",
+          "-DCMAKE_CXX_FLAGS_DEBUG=-O2 -g0",
           "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O3 -funroll-loops -g0 -fvisibility=hidden",
           "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O3 -funroll-loops -g0 -fvisibility=hidden",
           "-DCMAKE_C_FLAGS_RELEASE=-O3 -funroll-loops -g0 -fvisibility=hidden",
