@@ -36,7 +36,7 @@ extern void cranelift_chain_get_stats(uint64_t *runs, uint64_t *iters,
                                        unsigned *chain_max, uint32_t *jitter);
 extern void cranelift_get_helper_lookup_tb_lru_stats(uint64_t *hits,
                                                       uint64_t *misses);
-extern void cranelift_get_helper_lookup_slot_hist(uint64_t out[8]);
+extern void cranelift_get_helper_lookup_slot_hist(uint64_t out[4]);
 extern void cranelift_get_helper_phys_pc_hint_stats(uint64_t *hits,
                                                      uint64_t *misses);
 extern void cranelift_get_tb_jc_stats(uint64_t *hits, uint64_t *misses);
@@ -214,18 +214,20 @@ void nv2a_profile_increment(void)
             unsigned route_on = qatomic_read(&cranelift_bridge_g_helper_route_shim);
 
             /*
-             * Per-slot LRU hit histogram (Phase 1+2 SoA+NEON rewrite).
-             * Emitted as `lru_slot=A/B/C/D/E/F/G/H` where A is slot 0
-             * fast-path hits (should dominate), and B..H are SIMD-found
-             * cold-scan promotions. A healthy distribution falls off
-             * monotonically; any non-monotonic spike indicates the LRU
-             * sizing is wrong for the current workload.
+             * Per-way LRU hit histogram (4-way × 16-set set-associative,
+             * 2026-05-26 reshape). Emitted as `lru_way=W0/W1/W2/W3`
+             * where W0 is the way-0 fast-path-of-selected-set hit count
+             * (should dominate by promote-on-hit) and W1..W3 are the
+             * SIMD-found promotions within the selected set. A clean
+             * cliff W2 → W3 means 4-way is sufficient; W3 ≈ W2 means
+             * the working set in some sets exceeds 4 ways and we'd
+             * benefit from more associativity (or a wider set hash).
              */
-            uint64_t slot_hist[8] = {0};
+            uint64_t slot_hist[4] = {0};
             cranelift_get_helper_lookup_slot_hist(slot_hist);
-            static uint64_t last_slot_hist[8];
-            uint64_t d_slot[8];
-            for (unsigned _i = 0; _i < 8; _i++) {
+            static uint64_t last_slot_hist[4];
+            uint64_t d_slot[4];
+            for (unsigned _i = 0; _i < 4; _i++) {
                 d_slot[_i] = slot_hist[_i] - last_slot_hist[_i];
                 last_slot_hist[_i] = slot_hist[_i];
             }
@@ -235,7 +237,7 @@ void nv2a_profile_increment(void)
                 "tb_gen/s=%llu tb_inval/s=%llu tb_flush/s=%llu "
                 "jc_hit%%=%u jc_miss/s=%llu "
                 "lru_hit%%=%u lru_call/s=%llu "
-                "lru_slot=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+                "lru_way=%llu/%llu/%llu/%llu "
                 "phint_hit%%=%u phint_call/s=%llu "
                 "chain_runs/s=%llu chain_avg=%llu.%02llu "
                 "irq/s=%llu "
@@ -251,8 +253,6 @@ void nv2a_profile_increment(void)
                 (unsigned long long)(lru_total * 1000000 / window_us),
                 (unsigned long long)d_slot[0], (unsigned long long)d_slot[1],
                 (unsigned long long)d_slot[2], (unsigned long long)d_slot[3],
-                (unsigned long long)d_slot[4], (unsigned long long)d_slot[5],
-                (unsigned long long)d_slot[6], (unsigned long long)d_slot[7],
                 phint_hit_pct,
                 (unsigned long long)(phint_total * 1000000 / window_us),
                 (unsigned long long)(d_cr * 1000000 / window_us),
