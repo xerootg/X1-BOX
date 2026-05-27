@@ -3470,7 +3470,7 @@ void xbox_hle_log_stats(void)
             g_idle_loop_idle, g_idle_loop_dpc_pending,
             g_idle_loop_next_thread_pending, g_idle_loop_halts,
             g_idle_loop_yields);
-    HLE_LOG("keqpc_fast_hits=%" PRIu64 " (inline cntvct path)",
+    HLE_LOG("keqpc_fast_hits=%" PRIu64 " (QEMU_CLOCK_VIRTUAL path)",
             g_keqpc_fast_hits);
     HLE_LOG("halo2_pow hits=%" PRIu64 " declines=%" PRIu64 " swap=%d gate=%d",
             g_halo2_pow_hits, g_halo2_pow_declines,
