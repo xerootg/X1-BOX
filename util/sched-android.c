@@ -474,11 +474,46 @@ static void apply_profile_defaults(SchedProfile p, struct sched_config *c)
     };
 }
 
+/* Per-package default profile.
+ *
+ * The release variant (applicationId com.izzy2lost.x1box.release) needs the
+ * sched profile turned on at install time — there's no user-facing UI for
+ * X1BOX_SCHED_PROFILE in the shipping APK, and `am start` doesn't propagate
+ * env vars. Without this auto-enable, Pixel 10a sched_pixel parks the X4
+ * (cpu7) at 700 MHz and Halo 2 runs ~17 FPS instead of ~30 (matching debug).
+ *
+ * Debug (com.izzy2lost.x1box, no suffix) and perftest
+ * (com.izzy2lost.x1box.perftest) intentionally keep the upstream default of
+ * OFF so the user can A/B them against any sched_config.txt or env-var
+ * overlay without silent per-variant behavior change. Anything the user sets
+ * via X1BOX_SCHED_PROFILE / sched_config.txt still wins via the explicit
+ * lookup_str() call below — this only applies when nothing else asked. */
+static SchedProfile default_profile_for_package(void)
+{
+#ifdef __ANDROID__
+    const char *pkg = android_package_name();
+    if (pkg) {
+        size_t len = strlen(pkg);
+        static const char kSuffix[] = ".release";
+        size_t suf_len = sizeof(kSuffix) - 1;
+        if (len >= suf_len && strcmp(pkg + len - suf_len, kSuffix) == 0) {
+            return X1BOX_SCHED_MAX;
+        }
+    }
+#endif
+    return X1BOX_SCHED_OFF;
+}
+
 static void init_once_locked(void)
 {
     memset(&g_cfg, 0, sizeof(g_cfg));
     load_config_file();
-    g_cfg.profile = parse_profile(lookup_str("X1BOX_SCHED_PROFILE"));
+    const char *prof_str = lookup_str("X1BOX_SCHED_PROFILE");
+    if (prof_str && *prof_str) {
+        g_cfg.profile = parse_profile(prof_str);
+    } else {
+        g_cfg.profile = default_profile_for_package();
+    }
     g_cfg.debug   = env_bool("X1BOX_SCHED_DEBUG", false);
     g_cfg.boost_enabled = true;
 
