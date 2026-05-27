@@ -29,6 +29,17 @@ pub struct EnvDesc {
     /// chain dispatch is disabled and we fall back to return-to-
     /// dispatcher.
     pub chain_continue_fn: u64,
+    /// Phase 3 (tier-2 TB chaining): address of
+    /// `cranelift_chain_continue_v2` — slow path of GotoTb chain-slot
+    /// miss; installs the target's SystemV entry into *from_slot
+    /// before continuing the dispatch loop. 0 = chaining disabled,
+    /// GotoTb stays on the legacy `chain_continue_fn` path.
+    pub chain_continue_v2_fn: u64,
+    /// Phase 3: signed byte offset from env to `cpu->interrupt_request`.
+    /// Negative on every aarch64 build (CPUState precedes CPUArchState
+    /// via CPUNegativeOffsetState). 0 = unknown; emitter must omit the
+    /// IRQ check and fall back to legacy chain_continue.
+    pub cpu_interrupt_request_offset: i32,
     /// Address of `helper_lookup_tb_ptr`. The x86 frontend always emits
     /// this helper call immediately before `goto_ptr` (see
     /// tcg_gen_lookup_and_goto_ptr), but in tier-2 our goto_ptr
@@ -135,6 +146,8 @@ impl EnvDesc {
             host_ptr_size: 8,
             globals: Vec::new(),
             chain_continue_fn: 0,
+            chain_continue_v2_fn: 0,
+            cpu_interrupt_request_offset: 0,
             lookup_tb_ptr_fn: 0,
             flcr_fn: 0,
             cc_compute_all_fn: 0,
@@ -160,6 +173,8 @@ impl EnvDesc {
         guest_ptr_size: u32,
         host_ptr_size: u32,
         chain_continue_fn: u64,
+        chain_continue_v2_fn: u64,
+        cpu_interrupt_request_offset: i32,
         lookup_tb_ptr_fn: u64,
         flcr_fn: u64,
         cc_compute_all_fn: u64,
@@ -195,6 +210,8 @@ impl EnvDesc {
             host_ptr_size,
             globals: out,
             chain_continue_fn,
+            chain_continue_v2_fn,
+            cpu_interrupt_request_offset,
             lookup_tb_ptr_fn,
             flcr_fn,
             cc_compute_all_fn,

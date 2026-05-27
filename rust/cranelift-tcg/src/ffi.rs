@@ -33,6 +33,15 @@ pub struct CraneliftTcgEnvDesc {
     pub guest_ptr_size: u32,
     pub host_ptr_size: u32,
     pub chain_continue_fn: usize,
+    /// Phase 3: cranelift_chain_continue_v2 — slow path of GotoTb
+    /// chain-slot miss, installs into *from_slot before continuing.
+    /// 0 = chaining not available; GotoTb stays on legacy path.
+    pub chain_continue_v2_fn: usize,
+    /// Phase 3: signed byte offset from env to cpu->interrupt_request.
+    /// Negative on every aarch64 build (CPUState precedes CPUArchState
+    /// via CPUNegativeOffsetState).
+    pub cpu_interrupt_request_offset: i32,
+    pub phase3_pad0: u32,
     pub lookup_tb_ptr_fn: usize,
     pub flcr_fn: usize,
     pub cc_compute_all_fn: usize,
@@ -226,6 +235,8 @@ pub unsafe extern "C" fn cranelift_tcg_init(
                 e.guest_ptr_size,
                 e.host_ptr_size,
                 e.chain_continue_fn as u64,
+                e.chain_continue_v2_fn as u64,
+                e.cpu_interrupt_request_offset,
                 e.lookup_tb_ptr_fn as u64,
                 e.flcr_fn as u64,
                 e.cc_compute_all_fn as u64,

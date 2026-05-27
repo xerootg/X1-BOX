@@ -556,6 +556,20 @@ static void cranelift_bridge_lazy_init(void)
         .guest_ptr_size    = guest_ptr_size,
         .host_ptr_size     = sizeof(void *),
         .chain_continue_fn = (uintptr_t)&cranelift_chain_continue,
+        .chain_continue_v2_fn = (uintptr_t)&cranelift_chain_continue_v2,
+        /*
+         * Signed delta from env (= CPUArchState*) to
+         * cpu->interrupt_request. CPUState lives at env minus
+         * sizeof(CPUNegativeOffsetState); interrupt_request sits at
+         * offsetof(CPUState, interrupt_request) inside CPUState. Cast
+         * to int32_t for the descriptor (the magnitude is small —
+         * single-digit KiB at most). Used by the JIT-emitted GotoTb
+         * fast path to poll for IRQs between chained TBs.
+         */
+        .cpu_interrupt_request_offset =
+            (int32_t)(offsetof(CPUState, interrupt_request) -
+                       (long)sizeof(CPUNegativeOffsetState)),
+        .phase3_pad0       = 0,
         .lookup_tb_ptr_fn  = (uintptr_t)&helper_lookup_tb_ptr,
         .flcr_fn           = (uintptr_t)&cranelift_helper_flcr,
         /*
@@ -2167,7 +2181,11 @@ void cranelift_bridge_try_swap_slow(TranslationBlock *tb)
                  * a fully-formed slot).
                  */
                 g_shim_map[slot].shim    = shim;
-                g_shim_map[slot].ce_code = new_code;
+                /* new_code is `const void *` from the Rust side; cast
+                 * away const for storage. The cranelift JIT arena is
+                 * RWX-mapped and the pointer remains valid for the
+                 * life of the JITModule. */
+                g_shim_map[slot].ce_code = (void *)new_code;
                 g_shim_map[slot].pc      = tb->pc;
                 qatomic_set(&g_shim_map[slot].tb, tb);
                 if (cur == NULL) {
@@ -2521,13 +2539,20 @@ void cranelift_bridge_log_stats(void)
     cranelift_chain_get_stats(&runs, &iters, &spins, &irq_exits,
                               &thread_count, &chain_max, &jitter);
     uint64_t avg_iters_x100 = runs ? (iters * 100 / runs) : 0;
+    /* Phase 3 install/decline counters declared in cpu-exec.c. */
+    extern uint64_t cranelift_chain_installs;
+    extern uint64_t cranelift_chain_install_declines;
+    uint64_t installs   = qatomic_read(&cranelift_chain_installs);
+    uint64_t declines   = qatomic_read(&cranelift_chain_install_declines);
     CL_LOG("chain stats: runs=%" PRIu64 " iters=%" PRIu64
            " avg=%" PRIu64 ".%02" PRIu64
            " spins=%" PRIu64 " irq_exits=%" PRIu64
-           " base=%u jitter=0x%x threads=%u",
+           " base=%u jitter=0x%x threads=%u"
+           " installs=%" PRIu64 " declines=%" PRIu64,
            runs, iters,
            avg_iters_x100 / 100, avg_iters_x100 % 100,
-           spins, irq_exits, chain_max, jitter, thread_count);
+           spins, irq_exits, chain_max, jitter, thread_count,
+           installs, declines);
 
     uint64_t lru_hits = 0, lru_misses = 0;
     cranelift_get_helper_lookup_tb_lru_stats(&lru_hits, &lru_misses);

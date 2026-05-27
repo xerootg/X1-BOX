@@ -86,6 +86,13 @@ pub struct Translator {
     /// so cranelift-jit-patched can resolve the relocation at finalize
     /// time. See Lowering::declare_helper for the call-site emit shape.
     helper_funcs: HashMap<&'static str, FuncId>,
+    /// Phase 3 (tier-2 TB chaining) gate. Snapshotted at Translator
+    /// construction time from `X1BOX_TIER2_CHAIN=1` env var. When true,
+    /// the GotoTb lowering emits an atomic-load + IRQ-check + direct-
+    /// tail-call fast path, falling back to `chain_continue_v2` for
+    /// the install + slow path. When false, GotoTb keeps its Phase 2
+    /// shape (direct-bl to `chain_continue`).
+    tier2_chain_enabled: bool,
 }
 
 impl Translator {
@@ -133,6 +140,19 @@ impl Translator {
         let direct_bl_cc = matches!(direct_bl_ext.as_str(), "1" | "cc");
         let direct_bl_flcr = matches!(direct_bl_ext.as_str(), "1" | "flcr");
 
+        /* Phase 3 (tier-2 TB chaining). Opt-in via X1BOX_TIER2_CHAIN=1.
+         * Requires both the v2 helper address and the cpu_interrupt_
+         * request_offset to be populated; if either is missing (e.g.
+         * old C side, env=NULL test path) the gate stays effectively
+         * off so the JIT keeps emitting the legacy GotoTb shape. */
+        let tier2_chain_gate = std::env::var("X1BOX_TIER2_CHAIN")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let tier2_chain_enabled = tier2_chain_gate
+            && env.chain_continue_v2_fn != 0
+            && env.cpu_interrupt_request_offset != 0;
+
         /* Phase 2: register cranelift_chain_continue with the JIT
          * builder so cranelift_module's relocation pass can resolve a
          * direct `bl #imm` against it. Pre-bind the name to the
@@ -145,6 +165,12 @@ impl Translator {
             symbol_pairs.push((
                 "cranelift_chain_continue",
                 env.chain_continue_fn as *const u8,
+            ));
+        }
+        if tier2_chain_enabled && env.chain_continue_v2_fn != 0 {
+            symbol_pairs.push((
+                "cranelift_chain_continue_v2",
+                env.chain_continue_v2_fn as *const u8,
             ));
         }
         if direct_bl_cc && env.cc_compute_all_fn != 0 {
@@ -197,6 +223,21 @@ impl Translator {
                 sig,
             );
         }
+        if tier2_chain_enabled && env.chain_continue_v2_fn != 0 {
+            /* cranelift_chain_continue_v2(env, from_slot) -> i64.
+             * Both args are host pointers (env = CPUArchState*,
+             * from_slot = void **). */
+            let mut sig = Signature::new(CallConv::SystemV);
+            sig.params.push(AbiParam::new(host_ptr_ty));
+            sig.params.push(AbiParam::new(host_ptr_ty));
+            sig.returns.push(AbiParam::new(types::I64));
+            declare_helper(
+                &mut module,
+                &mut helper_funcs,
+                "cranelift_chain_continue_v2",
+                sig,
+            );
+        }
         if direct_bl_cc && env.cc_compute_all_fn != 0 {
             /* helper_cc_compute_all(dst, src1, src2, op) -> result.
              * All args/return are target_ulong (= i64 on x86_64-guest /
@@ -234,6 +275,7 @@ impl Translator {
             env: env.clone(),
             host_ptr_ty,
             helper_funcs,
+            tier2_chain_enabled,
         })
     }
 
@@ -347,6 +389,12 @@ impl Translator {
         );
         self.func_index = self.func_index.wrapping_add(1);
 
+        /* Phase 3: allocate the chain-slot pair NOW (before lowering)
+         * so the GotoTb emission can bake the slot's stable address as
+         * a constant. The Box stays alive for the life of the
+         * JitContext via the tier2_chain_slots Vec. */
+        let chain_slots = ctx.alloc_chain_slot_pair();
+
         let mut fb_ctx = FunctionBuilderContext::new();
         let insn_start_words: Vec<[u64; 3]>;
         {
@@ -358,6 +406,8 @@ impl Translator {
                 &mut self.module,
                 &self.helper_funcs,
                 &ctx.helpers,
+                chain_slots,
+                self.tier2_chain_enabled,
             );
             lower.lower_block(&snap.ops)?;
             /*
@@ -486,12 +536,6 @@ impl Translator {
             ));
         }
 
-        /* Phase 3: allocate a chain-slot pair for this TB. The Box
-         * stays alive in ctx.tier2_chain_slots so the raw pointer we
-         * stash here (and bake into emitted GotoTb code) remains valid
-         * for the life of the JIT module. */
-        let chain_slots = ctx.alloc_chain_slot_pair();
-
         let entry = TierTwoEntry {
             code: code_ptr,
             size: code_size,
@@ -522,6 +566,15 @@ pub(crate) struct Lowering<'a, 'b> {
     /// Cache of pre-declared helper FuncIds (built in Translator::new).
     /// Lookup by stable C symbol name.
     pub(crate) helper_funcs: &'a HashMap<&'static str, FuncId>,
+    /// Phase 3 (tier-2 TB chaining): pointer to this TB's pre-
+    /// allocated chain-slot pair. GotoTb emission bakes
+    /// `chain_slots + n * 8` as an iconst when emitting the fast-path
+    /// load. `null` if Phase 3 is disabled or allocation failed; in
+    /// that case GotoTb keeps its Phase 2 (chain_continue) shape.
+    pub(crate) chain_slots: *const [std::sync::atomic::AtomicUsize; 2],
+    /// Snapshot of Translator::tier2_chain_enabled. False ⇒ emit the
+    /// legacy GotoTb (chain_continue direct-bl).
+    pub(crate) tier2_chain_enabled: bool,
     /// Snapshot of QEMU's softmmu slow-path helper table.
     pub(crate) helpers: &'a crate::context::HelperTable,
     /// TCG temp ID -> (Cranelift Variable, type it was declared with).
@@ -561,6 +614,8 @@ impl<'a, 'b> Lowering<'a, 'b> {
         module: &'a mut JITModule,
         helper_funcs: &'a HashMap<&'static str, FuncId>,
         helpers: &'a crate::context::HelperTable,
+        chain_slots: *const [std::sync::atomic::AtomicUsize; 2],
+        tier2_chain_enabled: bool,
     ) -> Self {
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
@@ -574,6 +629,8 @@ impl<'a, 'b> Lowering<'a, 'b> {
             host_ptr_ty,
             module,
             helper_funcs,
+            chain_slots,
+            tier2_chain_enabled,
             helpers,
             temps: HashMap::new(),
             next_var: 0,
@@ -597,6 +654,100 @@ impl<'a, 'b> Lowering<'a, 'b> {
     ) -> Option<cranelift_codegen::ir::FuncRef> {
         let id = *self.helper_funcs.get(name)?;
         Some(self.module.declare_func_in_func(id, self.builder.func))
+    }
+
+    /// Phase 3 GotoTb emission. Caller has verified
+    /// `tier2_chain_enabled` and that `chain_slots` is non-null and
+    /// the `cranelift_chain_continue_v2` symbol is registered. Emits:
+    ///
+    ///   target = atomic_load(slot_addr)
+    ///   if target == 0: goto slow
+    ///   if cpu->interrupt_request != 0: goto slow
+    ///   return target(env)                  // direct tail-call
+    /// slow:
+    ///   return cranelift_chain_continue_v2(env, slot_addr)  // install + dispatch
+    ///
+    /// The plain `load` is sufficient on aarch64: 8-byte aligned loads
+    /// are single-copy atomic at the hardware level and we only care
+    /// about "is the value non-zero" (no acquire ordering needed for
+    /// the install→read race since the C side uses qatomic_set as a
+    /// release store, and a stale 0 just sends us through the slow
+    /// path one extra time).
+    pub(crate) fn emit_tier2_chain_goto_tb(&mut self, slot_addr_usize: usize) {
+        let env = self.env_val;
+        let host_ptr_ty = self.host_ptr_ty;
+        let irq_off = self.env.cpu_interrupt_request_offset;
+
+        let slot_addr_const = self
+            .builder
+            .ins()
+            .iconst(host_ptr_ty, slot_addr_usize as i64);
+        let target = self.builder.ins().load(
+            host_ptr_ty,
+            MemFlags::trusted(),
+            slot_addr_const,
+            0,
+        );
+
+        let fast_block = self.builder.create_block();
+        let direct_block = self.builder.create_block();
+        let slow_block = self.builder.create_block();
+
+        // target != 0 -> fast, else slow
+        self.builder.ins().brif(
+            target,
+            fast_block,
+            &[] as &[BlockArg],
+            slow_block,
+            &[] as &[BlockArg],
+        );
+
+        // Fast block: check cpu->interrupt_request
+        self.builder.switch_to_block(fast_block);
+        self.builder.seal_block(fast_block);
+        let irq = self.builder.ins().load(
+            types::I32,
+            MemFlags::trusted(),
+            env,
+            irq_off,
+        );
+        // irq != 0 -> slow, else direct
+        self.builder.ins().brif(
+            irq,
+            slow_block,
+            &[] as &[BlockArg],
+            direct_block,
+            &[] as &[BlockArg],
+        );
+
+        // Direct block: tail-call cached target with env
+        self.builder.switch_to_block(direct_block);
+        self.builder.seal_block(direct_block);
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(host_ptr_ty));
+        sig.returns.push(AbiParam::new(types::I64));
+        let sig_ref = self.builder.import_signature(sig);
+        let inst = self
+            .builder
+            .ins()
+            .call_indirect(sig_ref, target, &[env]);
+        let ret_direct = self.builder.inst_results(inst)[0];
+        self.builder.ins().return_(&[ret_direct]);
+
+        // Slow block: chain_continue_v2(env, slot_addr) — installs and
+        // continues dispatch. Resolves via declare_helper (caller
+        // already verified it's registered).
+        self.builder.switch_to_block(slow_block);
+        self.builder.seal_block(slow_block);
+        let v2_ref = self
+            .declare_helper("cranelift_chain_continue_v2")
+            .expect("chain_continue_v2 should be registered when tier2_chain_enabled");
+        let inst = self
+            .builder
+            .ins()
+            .call(v2_ref, &[env, slot_addr_const]);
+        let ret_slow = self.builder.inst_results(inst)[0];
+        self.builder.ins().return_(&[ret_slow]);
     }
 
     /// Look up (or declare) the Variable for a TCG temp id.
@@ -1218,17 +1369,37 @@ impl<'a, 'b> Lowering<'a, 'b> {
                  * pre-declared helper FuncId (saves the 3-insn movz/movk
                  * address materialisation + the indirect blr). Fall
                  * back to iconst+call_indirect if the helper wasn't
-                 * registered at Translator::new. */
+                 * registered at Translator::new.
+                 *
+                 * Phase 3 (gated X1BOX_TIER2_CHAIN=1): emit the
+                 * tier-2 → tier-2 chain fast path. Load the per-TB
+                 * chain slot for this GotoTb index; if non-zero AND
+                 * cpu->interrupt_request is clear, tail-call the
+                 * cached target directly without re-entering the
+                 * dispatcher. Slow path (slot empty OR IRQ pending)
+                 * routes through chain_continue_v2, which installs
+                 * the next eligible target into the slot. */
                 let chain_fn = self.env.chain_continue_fn;
                 if chain_fn != 0 {
-                    let ret = if let Some(func_ref) =
+                    if self.tier2_chain_enabled
+                        && !self.chain_slots.is_null()
+                        && self.helper_funcs.contains_key(
+                            "cranelift_chain_continue_v2",
+                        )
+                    {
+                        let n = (op.carg(0) as usize) & 1;
+                        let slot_addr_usize =
+                            (self.chain_slots as usize) + n * 8;
+                        self.emit_tier2_chain_goto_tb(slot_addr_usize);
+                    } else if let Some(func_ref) =
                         self.declare_helper("cranelift_chain_continue")
                     {
                         let inst = self.builder.ins().call(
                             func_ref,
                             &[self.env_val],
                         );
-                        self.builder.inst_results(inst)[0]
+                        let ret = self.builder.inst_results(inst)[0];
+                        self.builder.ins().return_(&[ret]);
                     } else {
                         let mut sig =
                             Signature::new(CallConv::SystemV);
@@ -1244,9 +1415,9 @@ impl<'a, 'b> Lowering<'a, 'b> {
                             addr,
                             &[self.env_val],
                         );
-                        self.builder.inst_results(inst)[0]
-                    };
-                    self.builder.ins().return_(&[ret]);
+                        let ret = self.builder.inst_results(inst)[0];
+                        self.builder.ins().return_(&[ret]);
+                    }
                 } else {
                     let v = self.builder.ins().iconst(types::I64, 0);
                     self.builder.ins().return_(&[v]);

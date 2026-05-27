@@ -114,6 +114,26 @@ typedef struct CraneliftTcgEnvDesc {
      * Pass 0 to disable chain dispatch (lowering falls back to a plain
      * return-to-dispatcher). */
     uintptr_t chain_continue_fn;
+    /*
+     * Phase 3 (tier-2 TB chaining): address of cranelift_chain_continue_v2,
+     * the slow-path fallback for GotoTb chain-slot misses. Takes (env,
+     * from_slot) and installs the next eligible target into *from_slot
+     * before continuing the dispatch loop. 0 = chaining not available
+     * for this build (GotoTb stays on the legacy chain_continue path).
+     */
+    uintptr_t chain_continue_v2_fn;
+    /*
+     * Phase 3: signed byte offset from env to cpu->interrupt_request.
+     * env points at CPUArchState; CPUState (which holds
+     * interrupt_request) precedes it in memory via
+     * CPUNegativeOffsetState, so this value is NEGATIVE. The JIT-
+     * emitted GotoTb fast path uses it to inline an IRQ check before
+     * direct-tail-calling the cached chain target — without the check,
+     * a fully-chained tier-2 hot loop would never poll for pending
+     * IRQs and starve the audio thread.
+     */
+    int32_t cpu_interrupt_request_offset;
+    uint32_t phase3_pad0;
     /* Address of `helper_lookup_tb_ptr` (accel/tcg/cpu-exec.c). The
      * frontend always emits this helper immediately before `goto_ptr`
      * (see tcg_gen_lookup_and_goto_ptr). Tier-2 lowering of goto_ptr
