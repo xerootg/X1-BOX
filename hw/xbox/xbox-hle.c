@@ -1394,60 +1394,23 @@ static bool hle_ke_query_performance_frequency(X86CPU *cpu)
  *
  * Returns 64-bit value via EDX:EAX (stdcall LARGE_INTEGER return).
  */
-#if defined(__aarch64__)
-static inline uint64_t arm_cntvct_el0(void)
-{
-    uint64_t v;
-    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
-    return v;
-}
-
-static inline uint64_t arm_cntfrq_el0(void)
-{
-    uint64_t v;
-    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
-    return v;
-}
-
-/* 32.32 fixed-point multiplier such that
- *   xbox_ticks = (cntvct * g_xbox_qpc_mul) >> 32
- * gives `cntvct * (3.375 MHz / cntfrq_el0)`. Initialised lazily on
- * first call. cntfrq is a constant from boot — Snapdragon = 19.2 MHz,
- * Tensor = 24 MHz — so one read & cache is enough. */
-static uint64_t g_xbox_qpc_mul;
-static bool     g_xbox_qpc_init;
-
-static void xbox_qpc_calibrate(void)
-{
-    uint64_t cntfrq = arm_cntfrq_el0();
-    if (cntfrq == 0) {
-        cntfrq = 19200000ULL;  /* sensible Snapdragon default */
-    }
-    /* (3375000 << 32) / cntfrq fits in 64 bits while preserving
-     * precision: 3375000 * 2^32 ≈ 1.45e16, well below 2^64. */
-    g_xbox_qpc_mul = (3375000ULL << 32) / cntfrq;
-    g_xbox_qpc_init = true;
-}
-
 static inline uint64_t xbox_qpc_ticks_fast(void)
 {
-    if (__builtin_expect(!g_xbox_qpc_init, 0)) {
-        xbox_qpc_calibrate();
-    }
-    uint64_t v = arm_cntvct_el0();
-    /* 64x64 → 128 high-half multiply. clang emits `umulh + lsr 0`
-     * which collapses to one umulh on aarch64. */
-    return (uint64_t)(((unsigned __int128)v * g_xbox_qpc_mul) >> 32);
-}
-#else
-static inline uint64_t xbox_qpc_ticks_fast(void)
-{
-    /* Non-aarch64 fallback (used only by host x86 builds for unit
-     * tests — Android target is always aarch64 in production). */
+    /* Must use QEMU_CLOCK_VIRTUAL — the SAME source as the PIT IRQ that
+     * drives KeTickCount. Halo 2's bink decoder (FUN_003e4560) cross-
+     * checks QPC against GetTickCount; if they tick at different rates
+     * the drift accumulator at 0x00570a14 grows unbounded and BinkWait
+     * gets stuck (see hw/i386/x86-cpu.c cpu_get_tsc for the full
+     * diagnosis). Earlier cntvct_el0 fast path traded correctness for
+     * a ~5% perf win on the 5M-calls/sec hotspot; the trade was wrong
+     * because cntvct keeps advancing during vm_stop/vm_start while the
+     * PIT pauses with QEMU_CLOCK_VIRTUAL. The qemu_clock_get_ns call
+     * costs ~50 cycles, which is the price of consistent timekeeping.
+     *
+     * Scaling: ns * (3,375,000 / 1,000,000,000) = ns * 27 / 8000. */
     int64_t virtual_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     return ((uint64_t)virtual_ns * 27ull) / 8000ull;
 }
-#endif
 
 /* PC of KeQueryPerformanceCounter in the Halo 2 retail kernel. Exposed
  * so the xbox_hle_check fast-path can const-compare against it without

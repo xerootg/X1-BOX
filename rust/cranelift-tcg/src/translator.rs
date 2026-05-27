@@ -1585,6 +1585,31 @@ impl<'a, 'b> Lowering<'a, 'b> {
         let val = self.read_iarg(op, 0, op.ty)?;
         let base = self.read_iarg(op, 1, TcgType::I64)?;
         let off = op.carg(0) as i64;
+
+        /*
+         * Filter set_can_do_io stores emitted by accel/tcg/translator.c.
+         * QEMU emits `set_can_do_io(false)` at TB start and
+         * `set_can_do_io(true)` before the last insn, as 1-byte stores to
+         * env-relative offset -12 (= offsetof(CPUState, neg.can_do_io) -
+         * sizeof(CPUState)). For tier-1 this manages icount/precise-IRQ
+         * semantics.
+         *
+         * Tier-2 (cranelift) doesn't honor those semantics. Worse, the
+         * `false` store between TB start and the last insn would race
+         * the per-TB shim's `can_do_io = 1` setup — any softmmu helper
+         * called mid-TB would see can_do_io=0 and call cpu_io_recompile
+         * with retaddr=0 (memory.rs hardcodes that) → tcg_tb_lookup(0)
+         * fails → cpu_abort. The shim's MOVZ+STURB w17, [x19, #-12]
+         * guarantees can_do_io=1 across the entire tier-2 TB; we just
+         * need to drop these IR-level stores so they don't clobber it.
+         *
+         * Detection: 1-byte store, base is env, offset is -12.
+         */
+        if matches!(opc, Opc::St8) && base == self.env_val && off == -12 {
+            let _ = val; /* side-effect-free read of the constant arg */
+            return Ok(());
+        }
+
         let addr = self.builder.ins().iadd_imm(base, off);
         let store_ty: Type = match opc {
             Opc::St8 => types::I8,

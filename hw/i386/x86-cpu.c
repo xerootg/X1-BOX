@@ -36,46 +36,33 @@ uint64_t cpu_get_tsc(CPUX86State *env)
 {
 #ifdef XBOX
     /*
-     * Xbox CPU runs at 733.333 MHz. Profiled Halo 2 first level:
-     * vDSO __kernel_clock_gettime was 4.87% of total CPU on the vCPU
-     * thread, and KeQueryPerformanceCounter HLE hits=0 — so Halo 2
-     * polls RDTSC directly (compiled into game code, never going
-     * through a kernel hook). Each RDTSC was costing us a
-     * qemu_clock_get_ns → cpus_get_virtual_clock → clock_gettime
-     * syscall path; that's ~50 cycles for a one-instruction RDTSC.
+     * Xbox CPU runs at 733.333 MHz. RDTSC must tick from the SAME
+     * clock source as the PIT IRQ that drives KeTickCount (the kernel
+     * global behind XAPILIB::GetTickCount): both come from
+     * QEMU_CLOCK_VIRTUAL. Halo 2's Bink decoder (FUN_003e4560) reads
+     * RDTSC for elapsed ms AND GetTickCount as a sanity check; if the
+     * two clocks drift apart, the bink's drift accumulator at
+     * DAT_00570a14 grows unbounded until iVar2+drift wraps so far
+     * negative that the (iVar2 - DAT_00484ad8) > 0xc0000000 backward-
+     * jump guard fires, FUN_003e4560 returns its cached ms forever,
+     * BinkWait's timer condition never resolves, and halo_bink_pump_
+     * tick @ 0x00155fc8 spins for 60+ seconds on every Bink frame.
+     * Sampled wedge state: drift=-1.85M ms, host advanced 10s with
+     * the cached ms field literally not moving.
      *
-     * On aarch64 hosts we sidestep the entire timer stack by reading
-     * ARM's cntvct_el0 directly (1 mrs instruction, ~1 cycle) and
-     * scaling to 733 MHz with a cached 96.32 fixed-point multiplier
-     * computed once from cntfrq_el0. That's a single mrs + umulh per
-     * RDTSC. Halo 2's game timing only cares about monotonic
-     * elapsed-cycle counts, not host-vs-guest pause semantics.
-     *
-     * Non-aarch64 builds (host testing) keep the slow path.
+     * Prior aarch64 fast path (commit before 2026-05-26) read
+     * cntvct_el0 directly — host monotonic, doesn't pause when the
+     * VM does. That made RDTSC drift forward of KeTickCount on every
+     * vm_stop/vm_start (gdb break, audio thread serialization, frame
+     * throttle, anything that briefly disables ticks via
+     * cpu_disable_ticks). The drift assumption "virtual and host
+     * clocks track within ns" doesn't hold over a 20-minute attract-
+     * loop run. Going back through qemu_clock_get_ns costs ~5% vCPU
+     * on the RDTSC hotspot, but the wedge is unrecoverable until the
+     * bink itself ages out a movie. Correctness over throughput.
      */
-#if defined(__aarch64__)
-    {
-        static uint64_t s_mul;
-        static bool s_init;
-        if (__builtin_expect(!s_init, 0)) {
-            uint64_t cntfrq;
-            __asm__("mrs %0, cntfrq_el0" : "=r"(cntfrq));
-            if (cntfrq == 0) {
-                cntfrq = 19200000ULL;
-            }
-            /* mul = (733333333 << 32) / cntfrq. Fits in 64 bits:
-             * 733333333 * 2^32 ≈ 3.15e18 < 2^64. */
-            s_mul = (733333333ULL << 32) / cntfrq;
-            s_init = true;
-        }
-        uint64_t v;
-        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
-        return (uint64_t)(((unsigned __int128)v * s_mul) >> 32);
-    }
-#else
     return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), 733333333,
                     NANOSECONDS_PER_SECOND);
-#endif
 #else
     return cpus_get_elapsed_ticks();
 #endif

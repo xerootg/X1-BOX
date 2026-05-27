@@ -1298,6 +1298,28 @@ static inline uint32_t encode_ldr_literal_x(int rt, int32_t pc_offset_bytes)
 #define INSN_BLR_X16      0xD63F0200u
 #define INSN_BR_X16       0xD61F0200u
 #define INSN_NOP          0xD503201Fu
+#define INSN_MOVZ_W17_1   0x52800031u  /* MOVZ w17, #1 */
+/*
+ * STURB w17, [x19, #-12]  (cpu->neg.can_do_io = 1)
+ *
+ * Encoding: 00111000 000 imm9 00 Rn Rt
+ *   opcode  0x38000000
+ *   imm9    -12 → 0x1f4 (sign-extended 9-bit), shifted left 12
+ *   Rn      19 (env), shifted left 5
+ *   Rt      17
+ * = 0x38000000 | 0x1f4000 | 0x260 | 0x11 = 0x381f4271.
+ *
+ * Sets the tier-2 io-permission gate so softmmu helpers called from
+ * cranelift code bypass io_prepare's cpu_io_recompile path. Without
+ * this, helpers reach cpu_io_recompile with retaddr=0 (cranelift's
+ * memory.rs hardcodes retaddr=0) → tcg_tb_lookup(0) fails → abort.
+ *
+ * Setting it here in the shim (instead of via cranelift IR) guarantees
+ * the store runs BEFORE any cranelift code — the IR-level approach
+ * landed after gen_tb_start's exit-request check, which can b.lt over
+ * subsequent IR and skip the store entirely.
+ */
+#define INSN_STURB_W17_X19_NEG12  0x381F4271u
 
 /*
  * Emit a single per-TB shim.  Returns a pointer (in the arena) suitable
@@ -1328,33 +1350,43 @@ static void *cranelift_emit_shim(uintptr_t cranelift_fn,
      *
      *   off  asm                          purpose
      *   ---  ---------------------------  ---------------------------
-     *    0   LDR  x16, [pc + #24]         load cranelift_fn literal
-     *    4   MOV  x0,  x19                env -> SystemV arg0
-     *    8   BLR  x16                     call into Cranelift code
-     *   12   LDR  x16, [pc + #20]         load tb_ret_addr literal
-     *   16   BR   x16                     jump to TCG epilogue
-     *   20   NOP                          padding before literals
-     *   24   .quad cranelift_fn           (8 bytes)
-     *   32   .quad tb_ret_addr            (8 bytes)
-     *   40   NOP NOP                      (8 bytes tail padding)
+     *    0   MOV   w17, #1                can_do_io=true source
+     *    4   STURB w17, [x19, #-12]       cpu->neg.can_do_io = 1
+     *    8   LDR   x16, [pc + #24]        load cranelift_fn literal
+     *   12   MOV   x0,  x19               env -> SystemV arg0
+     *   16   BLR   x16                    call into Cranelift code
+     *   20   LDR   x16, [pc + #20]        load tb_ret_addr literal
+     *   24   BR    x16                    jump to TCG epilogue
+     *   28   NOP                          padding before literals
+     *   32   .quad cranelift_fn           (8 bytes)
+     *   40   .quad tb_ret_addr            (8 bytes)
      *
-     * BLR's return PC (pc=8 + 4 = 12) lands on the second LDR, which
-     * loads tb_ret_addr into x16 ready for the BR. We deliberately
-     * keep the same 48-byte stride to preserve arena bookkeeping.
+     * BLR's return PC (pc=16 + 4 = 20) lands on the second LDR, which
+     * loads tb_ret_addr into x16 ready for the BR. 48-byte stride
+     * preserved.
+     *
+     * The MOV+STURB at offset 0-4 sets cpu->neg.can_do_io = 1 before
+     * BLR into cranelift code so softmmu helpers from that code skip
+     * io_prepare's cpu_io_recompile gate (cranelift hardcodes
+     * helper retaddr=0 in memory.rs, which would otherwise abort).
+     * Doing this in the shim instead of via cranelift IR ensures it
+     * runs UNCONDITIONALLY — the IR-level placement landed after
+     * gen_tb_start's exit-request brcondi, which can branch over the
+     * IR store on exit-requested TBs.
      */
-    insn[0] = encode_ldr_literal_x(16, 24);
-    insn[1] = INSN_MOV_X0_X19;
-    insn[2] = INSN_BLR_X16;
-    insn[3] = encode_ldr_literal_x(16, 20);
-    insn[4] = INSN_BR_X16;
-    insn[5] = INSN_NOP;
+    insn[0]  = INSN_MOVZ_W17_1;
+    insn[1]  = INSN_STURB_W17_X19_NEG12;
+    insn[2]  = encode_ldr_literal_x(16, 24);
+    insn[3]  = INSN_MOV_X0_X19;
+    insn[4]  = INSN_BLR_X16;
+    insn[5]  = encode_ldr_literal_x(16, 20);
+    insn[6]  = INSN_BR_X16;
+    insn[7]  = INSN_NOP;
 
     /* Literal slots. memcpy keeps the 64-bit values endian-neutral and
-     * avoids relying on natural alignment of insn[6]/insn[8]. */
-    memcpy(&insn[6], &cranelift_fn, sizeof(cranelift_fn));
-    memcpy(&insn[8], &tb_ret_addr, sizeof(tb_ret_addr));
-    insn[10] = INSN_NOP;
-    insn[11] = INSN_NOP;
+     * avoids relying on natural alignment of insn[8]/insn[10]. */
+    memcpy(&insn[8],  &cranelift_fn, sizeof(cranelift_fn));
+    memcpy(&insn[10], &tb_ret_addr, sizeof(tb_ret_addr));
 
     /*
      * Belt-and-braces cache sync. __builtin___clear_cache *should* be
@@ -1380,9 +1412,11 @@ static void *cranelift_emit_shim(uintptr_t cranelift_fn,
      * on the first few shims) and silent on success.
      */
     if (g_shim_used <= 16 * CRANELIFT_SHIM_BYTES) {
-        uint32_t i0 = insn[0], i3 = insn[3];
+        /* After layout change: LDR insns are at insn[2] and insn[5];
+         * cranelift_fn literal is at insn[8]. */
+        uint32_t i0 = insn[2], i3 = insn[5];
         uint64_t lit_fn = 0;
-        memcpy(&lit_fn, &insn[6], sizeof(lit_fn));
+        memcpy(&lit_fn, &insn[8], sizeof(lit_fn));
         CL_LOG("shim_bytes#%zu base=%p fn=0x%016" PRIxPTR
                " ldr_fn=0x%08x ldr_ret=0x%08x lit_fn=0x%016" PRIx64,
                g_shim_used / CRANELIFT_SHIM_BYTES, base,
