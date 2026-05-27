@@ -486,10 +486,17 @@ impl Translator {
             ));
         }
 
+        /* Phase 3: allocate a chain-slot pair for this TB. The Box
+         * stays alive in ctx.tier2_chain_slots so the raw pointer we
+         * stash here (and bake into emitted GotoTb code) remains valid
+         * for the life of the JIT module. */
+        let chain_slots = ctx.alloc_chain_slot_pair();
+
         let entry = TierTwoEntry {
             code: code_ptr,
             size: code_size,
             tb_pc,
+            chain_slots,
         };
         let unwind = UnwindBuf {
             host_end,

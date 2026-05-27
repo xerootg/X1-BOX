@@ -84,6 +84,18 @@ pub struct TierTwoEntry {
     pub size: usize,
     /// Guest PC the TB starts at.
     pub tb_pc: u64,
+    /// Phase 3 (tier-2 TB chaining): pointer into a heap-allocated
+    /// `Box<[AtomicUsize; 2]>` owned by `JitContext::tier2_chain_slots`.
+    /// Each slot caches the SystemV entry of a target tier-2 TB that
+    /// this TB's GotoTb at index n=0/1 chains to; the JIT-emitted
+    /// GotoTb tail end loads slot[n] and tail-calls if non-zero,
+    /// falling back to chain_continue when zero (which then installs
+    /// the slot for next time). `null` for TBs compiled before
+    /// Phase 3 was enabled or when slot allocation fails. The pointer
+    /// is stable across `JitContext::entries` HashMap rehashing
+    /// because the owning Box lives in the never-cleared
+    /// `tier2_chain_slots` Vec, not inside `TierTwoEntry` itself.
+    pub chain_slots: *const [AtomicUsize; 2],
 }
 
 // SAFETY: TierTwoEntry only holds a raw pointer into an mmap'd arena
@@ -144,6 +156,15 @@ pub struct JitContext {
     pub lru: Mutex<VecDeque<u64>>,
     pub dispatcher: Mutex<Option<crate::dispatcher::Dispatcher>>,
     pub helpers: HelperTable,
+    /// Phase 3: pool of chain-slot pairs. Each pair (Box<[AtomicUsize; 2]>)
+    /// is allocated per-TB-compile and never freed during process life —
+    /// the JIT-emitted code bakes the slot's address as a constant, so
+    /// freeing would dangle. Bounded memory cost: 16 bytes per
+    /// TB-compile-ever (~480 KB after 30k compiles on Halo 2), small
+    /// enough to leak. Per [[feedback_never_revert]] this is the cheap
+    /// path; if it grows problematic later we'd move slots into an
+    /// arena allocated alongside the JIT code itself.
+    pub tier2_chain_slots: Mutex<Vec<Box<[AtomicUsize; 2]>>>,
 }
 
 impl JitContext {
@@ -158,6 +179,7 @@ impl JitContext {
             lru: Mutex::new(VecDeque::new()),
             dispatcher: Mutex::new(None),
             helpers: HelperTable::empty(),
+            tier2_chain_slots: Mutex::new(Vec::new()),
         });
 
         let dispatcher = crate::dispatcher::Dispatcher::spawn(Arc::clone(&ctx));
@@ -206,14 +228,40 @@ impl JitContext {
         self.entries.read().get(&pc).cloned()
     }
 
+    /// Phase 3: allocate a fresh chain-slot pair for a new TB compile.
+    /// The Box is owned by `tier2_chain_slots` (never freed for the
+    /// life of the JitContext); we return a raw pointer that the
+    /// translator bakes into emitted code and TierTwoEntry holds for
+    /// later invalidation. Callers must NOT store the returned pointer
+    /// past `JitContext` lifetime.
+    pub fn alloc_chain_slot_pair(&self) -> *const [AtomicUsize; 2] {
+        let pair: Box<[AtomicUsize; 2]> =
+            Box::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let ptr: *const [AtomicUsize; 2] = pair.as_ref();
+        self.tier2_chain_slots.lock().push(pair);
+        ptr
+    }
+
     /// Drop every cached tier-2 entry. Called from the C bridge on a
     /// QEMU `tb_flush` because all keys (TranslationBlock pointers) are
     /// about to alias completely different guest TBs.
+    ///
+    /// Phase 3 invalidation: also atomically zero every chain slot in
+    /// the slot pool. Past JIT-emitted GotoTb sites still reference
+    /// those slots by raw pointer; zeroing them forces the next
+    /// dispatch through `cranelift_chain_continue` (which re-installs
+    /// only after verifying the new target). The Box owning the slots
+    /// stays in `tier2_chain_slots` — we never deallocate.
     pub fn reset_entries(&self) {
         let mut entries = self.entries.write();
         let mut lru = self.lru.lock();
         entries.clear();
         lru.clear();
+        let slots = self.tier2_chain_slots.lock();
+        for pair in slots.iter() {
+            pair[0].store(0, Ordering::Release);
+            pair[1].store(0, Ordering::Release);
+        }
         self.stats.active_entries.store(0, Ordering::Relaxed);
     }
 
