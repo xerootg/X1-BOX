@@ -326,6 +326,22 @@ bool xemu_settings_load(void)
      * lands. Set X1BOX_HLE=0 to disable, or per-family
      * X1BOX_HLE_YIELD=0 / _KF=0. */
     setenv("X1BOX_HLE", "1", 0);
+
+    /* KiIdleLoop spin gate. Default = 0x3 (yield every 4th idle iter,
+     * 4× the upstream /16 rate). The hot spin TB at 0x8001b02f runs
+     * 80k–170k iters/sec on Pixel 10a; at /16 the X4 governor saw a
+     * sustained 75%+ duty cycle on the vCPU thread and stayed below
+     * 1.2 GHz despite uclamp.min=1024 (PMU "low IPC = low demand"
+     * outvoted uclamp). Yielding more often lets the X4 power-gate
+     * between bursts so the governor recognises burst-mode demand and
+     * unlocks higher freq on the active windows. The IRQ-storm gate
+     * inside the HLE handler (irq_exits > 80%) already self-throttles
+     * to protect against the Bink-attract chain-collapse wedge.
+     * Override via the env var if a scene regresses.
+     *
+     * Same playbook as the Cemu-Android port for Mali/Tensor (see
+     * reference_cemu_mali_playbook memory). */
+    setenv("X1BOX_HLE_KI_IDLE_GATE_MASK", "0x3", 0);
     /* SSE scalar inline emit: default OFF — drift is architectural.
      *
      * Default-ON was attempted twice and reverted both times:

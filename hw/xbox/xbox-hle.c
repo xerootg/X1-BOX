@@ -2012,6 +2012,37 @@ void xbox_hle_get_idle_stats(uint64_t *idle_iters, uint64_t *yields,
 #define IDLE_LOOP_YIELD_NS_DEFAULT  50000  /* 50µs */
 static long g_idle_loop_yield_ns = IDLE_LOOP_YIELD_NS_DEFAULT;
 
+/*
+ * Idle-spin sampling gate. The hot KiIdleLoop spin TB runs ~80k–170k
+ * iters/sec on the X4; checking guest state + (optionally) yielding
+ * on every one would burn the dispatch budget. Default 0xF = sample
+ * every 16th iter (~1% overhead per the comment block above).
+ *
+ * Made tunable 2026-05-26 evening for the sched_pixel/uclamp diag:
+ * on Pixel 10a the X4 governor refuses to boost beyond 1164 MHz when
+ * the spin TB is hammering it, because PMU-aware "low IPC = low
+ * demand" heuristic outvotes uclamp.min=1024. Lowering the mask makes
+ * the vCPU thread spend more time in nanosleep (cooler, lower duty
+ * cycle) which lets the governor see a clear burst-mode pattern and
+ * unlock higher freq on the active windows — the Cemu-Android
+ * playbook for the same Mali/Tensor governor (see
+ * reference_cemu_mali_playbook memory).
+ *
+ *   mask 0xF  /16 (default)       — current conservative behaviour
+ *   mask 0x7  /8                  — 2× yield rate
+ *   mask 0x3  /4                  — 4× yield rate
+ *   mask 0x1  /2                  — 8× yield rate
+ *   mask 0x0  every iter          — maximum, the IRQ-storm gate at
+ *                                   irq_exits>80% already self-throttles
+ *
+ * Override via X1BOX_HLE_KI_IDLE_GATE_MASK (decimal or 0x-prefixed).
+ * Cap at 0xFF — any wider and the periodic safety checks (boot gate,
+ * IRQ-storm gate) get sampled too sparsely to actually catch the
+ * wedge conditions.
+ */
+#define IDLE_LOOP_GATE_MASK_DEFAULT  0xFu
+static uint32_t g_idle_loop_gate_mask = IDLE_LOOP_GATE_MASK_DEFAULT;
+
 void xbox_hle_get_idle_stats(uint64_t *idle_iters, uint64_t *yields,
                               uint64_t *yield_ns_total)
 {
@@ -2034,7 +2065,7 @@ static bool hle_ki_idle_loop_spin(X86CPU *cpu)
      */
     static __thread uint32_t iter;
     iter++;
-    if ((iter & 0xF) != 0) return false;
+    if ((iter & g_idle_loop_gate_mask) != 0) return false;
 
     /* DPC list head is "empty" when its Flink points back to the head VA
      * itself (circular linked list with sentinel). */
@@ -3297,9 +3328,20 @@ void xbox_hle_init(void)
             }
         }
     }
-    HLE_LOG("HLE on: rtl=%d kf=%d yield=%d dsound=%d ki_idle_yield_ns=%ld",
+    {
+        const char *v = getenv("X1BOX_HLE_KI_IDLE_GATE_MASK");
+        if (v && *v) {
+            char *end = NULL;
+            unsigned long parsed = strtoul(v, &end, 0);  /* auto-detect 0x */
+            if (end && *end == '\0' && parsed <= 0xFFu) {
+                g_idle_loop_gate_mask = (uint32_t)parsed;
+            }
+        }
+    }
+    HLE_LOG("HLE on: rtl=%d kf=%d yield=%d dsound=%d "
+            "ki_idle_yield_ns=%ld ki_idle_gate_mask=0x%x",
             g_gate_rtl, g_gate_kf, g_gate_yield, g_gate_dsound,
-            g_idle_loop_yield_ns);
+            g_idle_loop_yield_ns, g_idle_loop_gate_mask);
     sha1_init();
     if (g_gate_dsound) {
         hle_audio_init();
