@@ -150,21 +150,34 @@ fn lower_cc_compute_all_inline(
     l.builder.switch_to_block(helper_block);
     l.builder.seal_block(helper_block);
 
-    let mut sig = Signature::new(CallConv::SystemV);
-    for _ in 0..4 {
-        sig.params.push(AbiParam::new(types::I64));
-    }
-    sig.returns.push(AbiParam::new(types::I64));
-    let sig_ref = l.builder.import_signature(sig);
-    let addr = l
-        .builder
-        .ins()
-        .iconst(l.host_ptr_ty, helper_ptr as i64);
-    let call_inst = l
-        .builder
-        .ins()
-        .call_indirect(sig_ref, addr, &[dst, src1, src2, opv]);
-    let helper_ret = l.builder.inst_results(call_inst)[0];
+    /* Phase 2 (gated X1BOX_DIRECT_BL_EXT=cc|1): prefer the direct
+     * relocated `bl helper_cc_compute_all` over `iconst + call_indirect`.
+     * Saves the 4-insn address materialisation per call. Fall back to
+     * indirect if the helper wasn't registered at Translator::new (the
+     * env var is unset/off, or the X1BOX_CC_INLINE=0 diagnostic switch
+     * zeroed cc_compute_all_fn). */
+    let helper_ret = if let Some(func_ref) =
+        l.declare_helper("helper_cc_compute_all")
+    {
+        let inst = l.builder.ins().call(func_ref, &[dst, src1, src2, opv]);
+        l.builder.inst_results(inst)[0]
+    } else {
+        let mut sig = Signature::new(CallConv::SystemV);
+        for _ in 0..4 {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        sig.returns.push(AbiParam::new(types::I64));
+        let sig_ref = l.builder.import_signature(sig);
+        let addr = l
+            .builder
+            .ins()
+            .iconst(l.host_ptr_ty, helper_ptr as i64);
+        let call_inst = l
+            .builder
+            .ins()
+            .call_indirect(sig_ref, addr, &[dst, src1, src2, opv]);
+        l.builder.inst_results(call_inst)[0]
+    };
     l.builder
         .ins()
         .jump(merge_block, &[BlockArg::Value(helper_ret)]);

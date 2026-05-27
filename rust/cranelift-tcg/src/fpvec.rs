@@ -115,14 +115,21 @@ pub(crate) fn lower_fp(l: &mut Lowering<'_, '_>, raw: u16, op: &DecodedOp) -> Re
                 return Err(TransError::UnsupportedOp(raw));
             }
             let mxcsr = l.read_iarg(op, 0, TcgType::I32)?;
-            let mut sig = Signature::new(CallConv::SystemV);
-            sig.params.push(AbiParam::new(types::I32));
-            let sig_ref = l.builder.import_signature(sig);
-            let addr = l
-                .builder
-                .ins()
-                .iconst(l.host_ptr_ty, flcr_fn as i64);
-            l.builder.ins().call_indirect(sig_ref, addr, &[mxcsr]);
+            /* Phase 2 (gated X1BOX_DIRECT_BL_EXT=flcr|1): direct
+             * relocated bl to cranelift_helper_flcr; fall back to
+             * iconst+call_indirect when not gated. */
+            if let Some(func_ref) = l.declare_helper("cranelift_helper_flcr") {
+                l.builder.ins().call(func_ref, &[mxcsr]);
+            } else {
+                let mut sig = Signature::new(CallConv::SystemV);
+                sig.params.push(AbiParam::new(types::I32));
+                let sig_ref = l.builder.import_signature(sig);
+                let addr = l
+                    .builder
+                    .ins()
+                    .iconst(l.host_ptr_ty, flcr_fn as i64);
+                l.builder.ins().call_indirect(sig_ref, addr, &[mxcsr]);
+            }
             Ok(())
         }
         /*

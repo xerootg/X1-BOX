@@ -116,6 +116,23 @@ impl Translator {
             cranelift_module::default_libcall_names(),
         );
 
+        /* Phase 2 helper symbol registration. chain_continue (above)
+         * was validated 2026-05-27 and ships default-on. The extended
+         * set (cc_compute_all + flcr) correlates with a Halo 2 guest
+         * wedge on Zenfone — chains kept dispatching but the guest
+         * stopped issuing NV097_FLIP_STALL within ~5min of boot. Gated
+         * behind X1BOX_DIRECT_BL_EXT=1 until bisected:
+         *   X1BOX_DIRECT_BL_EXT=cc    — only cc_compute_all direct-bl
+         *   X1BOX_DIRECT_BL_EXT=flcr  — only flcr direct-bl
+         *   X1BOX_DIRECT_BL_EXT=1     — both (legacy alias)
+         * Anything else / unset = both OFF (legacy iconst+call_indirect).
+         * The shape stays so the kill-switch can be flipped without
+         * recompiling once the root cause is found. */
+        let direct_bl_ext = std::env::var("X1BOX_DIRECT_BL_EXT")
+            .unwrap_or_default();
+        let direct_bl_cc = matches!(direct_bl_ext.as_str(), "1" | "cc");
+        let direct_bl_flcr = matches!(direct_bl_ext.as_str(), "1" | "flcr");
+
         /* Phase 2: register cranelift_chain_continue with the JIT
          * builder so cranelift_module's relocation pass can resolve a
          * direct `bl #imm` against it. Pre-bind the name to the
@@ -123,11 +140,27 @@ impl Translator {
          * stashes it in its internal symbol table (backend.rs:115-122).
          * Every tier-2 TB exits via this call once (GotoTb/GotoPtr) so
          * this is the highest-frequency direct-bl target in the JIT. */
+        let mut symbol_pairs: Vec<(&'static str, *const u8)> = Vec::new();
         if env.chain_continue_fn != 0 {
-            jit_builder.symbols(std::iter::once((
+            symbol_pairs.push((
                 "cranelift_chain_continue",
                 env.chain_continue_fn as *const u8,
-            )));
+            ));
+        }
+        if direct_bl_cc && env.cc_compute_all_fn != 0 {
+            symbol_pairs.push((
+                "helper_cc_compute_all",
+                env.cc_compute_all_fn as *const u8,
+            ));
+        }
+        if direct_bl_flcr && env.flcr_fn != 0 {
+            symbol_pairs.push((
+                "cranelift_helper_flcr",
+                env.flcr_fn as *const u8,
+            ));
+        }
+        if !symbol_pairs.is_empty() {
+            jit_builder.symbols(symbol_pairs.iter().copied());
         }
 
         let mut module = JITModule::new(jit_builder);
@@ -136,26 +169,63 @@ impl Translator {
          * so the FuncId is stable across compiles. declare_function
          * with the same name+sig returns the same id; we cache it. */
         let mut helper_funcs: HashMap<&'static str, FuncId> = HashMap::new();
+        let declare_helper = |module: &mut JITModule,
+                              funcs: &mut HashMap<&'static str, FuncId>,
+                              name: &'static str,
+                              sig: Signature| {
+            match module.declare_function(name, Linkage::Import, &sig) {
+                Ok(id) => {
+                    funcs.insert(name, id);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "cranelift-tcg: failed to declare {name}: {e:?} \
+                         (falling back to call_indirect)"
+                    );
+                }
+            }
+        };
+
         if env.chain_continue_fn != 0 {
             let mut sig = Signature::new(CallConv::SystemV);
             sig.params.push(AbiParam::new(host_ptr_ty));
             sig.returns.push(AbiParam::new(types::I64));
-            match module.declare_function(
+            declare_helper(
+                &mut module,
+                &mut helper_funcs,
                 "cranelift_chain_continue",
-                Linkage::Import,
-                &sig,
-            ) {
-                Ok(id) => {
-                    helper_funcs.insert("cranelift_chain_continue", id);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "cranelift-tcg: failed to declare \
-                         cranelift_chain_continue: {e:?} (falling back \
-                         to call_indirect)"
-                    );
-                }
+                sig,
+            );
+        }
+        if direct_bl_cc && env.cc_compute_all_fn != 0 {
+            /* helper_cc_compute_all(dst, src1, src2, op) -> result.
+             * All args/return are target_ulong (= i64 on x86_64-guest /
+             * sign-extended i32 on x86-guest). The lowering passes them
+             * as i64 via read_iarg(.., TcgType::I64). */
+            let mut sig = Signature::new(CallConv::SystemV);
+            for _ in 0..4 {
+                sig.params.push(AbiParam::new(types::I64));
             }
+            sig.returns.push(AbiParam::new(types::I64));
+            declare_helper(
+                &mut module,
+                &mut helper_funcs,
+                "helper_cc_compute_all",
+                sig,
+            );
+        }
+        if direct_bl_flcr && env.flcr_fn != 0 {
+            /* cranelift_helper_flcr(mxcsr: i32) -> void.
+             * Translates x87 MXCSR bits into FPCR via MSR. Single i32
+             * arg, no return. */
+            let mut sig = Signature::new(CallConv::SystemV);
+            sig.params.push(AbiParam::new(types::I32));
+            declare_helper(
+                &mut module,
+                &mut helper_funcs,
+                "cranelift_helper_flcr",
+                sig,
+            );
         }
 
         Ok(Translator {

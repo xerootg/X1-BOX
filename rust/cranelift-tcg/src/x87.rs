@@ -451,18 +451,31 @@ fn lower_fcomi(
     let cc_op_v = read_env_i32(l, x.cc_op_offset as i32);
     let cc_op_i64 = l.builder.ins().uextend(types::I64, cc_op_v);
 
-    let mut sig = Signature::new(CallConv::SystemV);
-    for _ in 0..4 {
-        sig.params.push(AbiParam::new(types::I64));
-    }
-    sig.returns.push(AbiParam::new(types::I64));
-    let sig_ref = l.builder.import_signature(sig);
-    let addr = l.builder.ins().iconst(l.host_ptr_ty, cc_ptr as i64);
-    let call = l
-        .builder
-        .ins()
-        .call_indirect(sig_ref, addr, &[cc_dst, cc_src, cc_src2, cc_op_i64]);
-    let eflags = l.builder.inst_results(call)[0];
+    /* Phase 2 (gated X1BOX_DIRECT_BL_EXT=cc|1): direct relocated bl to
+     * helper_cc_compute_all. Same shape as helper.rs::lower_cc_compute_all_inline
+     * slow path; falls back to iconst+call_indirect when not gated. */
+    let eflags = if let Some(func_ref) =
+        l.declare_helper("helper_cc_compute_all")
+    {
+        let inst = l
+            .builder
+            .ins()
+            .call(func_ref, &[cc_dst, cc_src, cc_src2, cc_op_i64]);
+        l.builder.inst_results(inst)[0]
+    } else {
+        let mut sig = Signature::new(CallConv::SystemV);
+        for _ in 0..4 {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        sig.returns.push(AbiParam::new(types::I64));
+        let sig_ref = l.builder.import_signature(sig);
+        let addr = l.builder.ins().iconst(l.host_ptr_ty, cc_ptr as i64);
+        let call = l
+            .builder
+            .ins()
+            .call_indirect(sig_ref, addr, &[cc_dst, cc_src, cc_src2, cc_op_i64]);
+        l.builder.inst_results(call)[0]
+    };
 
     let mask: i64 = !(CC_Z | CC_P | CC_C);
     let masked = l.builder.ins().band_imm(eflags, mask);
