@@ -240,6 +240,12 @@ struct name_class { const char *prefix; PolicyClass cls; };
 static const struct name_class k_classes[] = {
     { "CPU ",           POLICY_HOT      },   /* "CPU 0/TCG", "CPU 1/TCG", ... */
     { "nv2a.pfifo",     POLICY_HOT_WARM },
+    /* AudioTrack is Android's JNI audio-callback thread, created by SDL
+     * when it opens an audio device. Empirically lands on the big core
+     * (cpu7 on Tensor G4) and steals slices from CPU 0/TCG. WARM is the
+     * right class — low-CPU but we still want it off the big core; the
+     * WARM pin_mid_warm path gives it a dedicated mid core. */
+    { "AudioTrack",     POLICY_WARM     },
     { "cranelift-tcg",  POLICY_WARM     },
     { "pgraph.vk.rend", POLICY_WARM     },
     { "pgraph.vk.comp", POLICY_WARM     },
@@ -268,9 +274,21 @@ struct class_policy {
     uint32_t uclamp_min;       /* 0 = don't set */
     bool     set_affinity;     /* whether to call sched_setaffinity */
     bool     pin_biggest;      /* affinity = single biggest CPU only */
-    bool     pin_mid;          /* affinity = mid-only cluster (HOT_WARM) */
+    bool     pin_mid;          /* affinity = a single hashed mid core */
     bool     exclude_little;   /* affinity = midbig (skip little cluster) */
 };
+
+/*
+ * On pin_mid: we use the whole mid_only_mask (e.g. cpu4-6 on Tensor G4)
+ * instead of pinning each thread to a single mid core. Tried per-thread
+ * single-core pinning on 2026-05-26 (Halo 2 Pixel): each WARM thread on
+ * its own cpu had per-core utilization too low (~15-20%) to convince
+ * sched_pixel to bump the cluster freq — cores stayed at the 578 MHz
+ * idle floor. Letting the kernel float threads within mid_only_mask
+ * lets EAS collapse them onto whichever core wins the EAS lottery,
+ * which earns a freq bump. The cost is some intra-cluster bouncing,
+ * but never to cpu7 (which is reserved for CPU 0/TCG).
+ */
 
 static struct sched_config {
     SchedProfile profile;
@@ -375,6 +393,7 @@ static void apply_profile_defaults(SchedProfile p, struct sched_config *c)
     bool excl_little_hot = false, excl_little_warm = false;
     bool pin_big_hot = false;
     bool pin_mid_pfifo = false;
+    bool pin_mid_warm = false;
     switch (p) {
     case X1BOX_SCHED_OFF:
         /* leave everything 0/false */
@@ -387,7 +406,8 @@ static void apply_profile_defaults(SchedProfile p, struct sched_config *c)
         excl_little_hot  = true;
         excl_little_warm = false;
         pin_big_hot      = false;
-        pin_mid_pfifo    = false;
+        pin_mid_pfifo    = true;  /* pfifo + AudioTrack get a dedicated mid core */
+        pin_mid_warm     = false;
         break;
     case X1BOX_SCHED_MAX:
         hot_min          = 1024;  /* full capacity request */
@@ -398,6 +418,12 @@ static void apply_profile_defaults(SchedProfile p, struct sched_config *c)
         excl_little_warm = true;
         pin_big_hot      = true;
         pin_mid_pfifo    = true;
+        /* MAX hashes each WARM thread name to its own mid core so
+         * mcpx.apu_thread, pgraph.vk.rende, cranelift-tcg etc. don't
+         * fight inside the mid cluster — measured 2026-05-26 with
+         * Halo 2: each was bouncing across 3 cores at 16-43% per
+         * core, none warming any single cache. */
+        pin_mid_warm     = true;
         break;
     }
 
@@ -411,6 +437,7 @@ static void apply_profile_defaults(SchedProfile p, struct sched_config *c)
     excl_little_warm = excl_little_hot;
     pin_big_hot      = env_bool("X1BOX_SCHED_PIN_TCG_BIG",   pin_big_hot);
     pin_mid_pfifo    = env_bool("X1BOX_SCHED_PIN_PFIFO_MID", pin_mid_pfifo);
+    pin_mid_warm     = env_bool("X1BOX_SCHED_PIN_WARM_MID",  pin_mid_warm);
 
     c->by_class[POLICY_NONE] = (struct class_policy){0};
     c->by_class[POLICY_HOT]  = (struct class_policy){
@@ -433,9 +460,9 @@ static void apply_profile_defaults(SchedProfile p, struct sched_config *c)
     };
     c->by_class[POLICY_WARM] = (struct class_policy){
         .uclamp_min     = (uint32_t)(warm_min > 0 ? warm_min : 0),
-        .set_affinity   = excl_little_warm,
+        .set_affinity   = excl_little_warm || pin_mid_warm,
         .pin_biggest    = false,
-        .pin_mid        = false,
+        .pin_mid        = pin_mid_warm,
         .exclude_little = excl_little_warm,
     };
     c->by_class[POLICY_COOL] = (struct class_policy){
@@ -480,8 +507,9 @@ static void init_once_locked(void)
                    g_cfg.by_class[POLICY_HOT_WARM].uclamp_min,
                    (int)g_cfg.by_class[POLICY_HOT_WARM].pin_mid,
                    (int)g_cfg.by_class[POLICY_HOT_WARM].exclude_little);
-        SCHED_LOGI("  policy WARM     : uclamp=%u  excl_little=%d",
+        SCHED_LOGI("  policy WARM     : uclamp=%u  pin_mid=%d  excl_little=%d",
                    g_cfg.by_class[POLICY_WARM].uclamp_min,
+                   (int)g_cfg.by_class[POLICY_WARM].pin_mid,
                    (int)g_cfg.by_class[POLICY_WARM].exclude_little);
         SCHED_LOGI("  policy COOL     : uclamp=%u",
                    g_cfg.by_class[POLICY_COOL].uclamp_min);
@@ -886,7 +914,7 @@ char *sched_android_describe(void)
                      "  big_mask=0x%llx midbig_mask=0x%llx mid_only_mask=0x%llx\n"
                      "  HOT      uclamp=%u set_aff=%d pin_big=%d excl_little=%d\n"
                      "  HOT_WARM uclamp=%u set_aff=%d pin_mid=%d excl_little=%d\n"
-                     "  WARM     uclamp=%u excl_little=%d\n"
+                     "  WARM     uclamp=%u pin_mid=%d excl_little=%d\n"
                      "  COOL     uclamp=%u\n",
                      (int)g_cfg.profile, (int)g_cfg.debug,
                      (int)g_cfg.boost_enabled, (int)g_topo.valid,
@@ -904,6 +932,7 @@ char *sched_android_describe(void)
                      (int)g_cfg.by_class[POLICY_HOT_WARM].pin_mid,
                      (int)g_cfg.by_class[POLICY_HOT_WARM].exclude_little,
                      g_cfg.by_class[POLICY_WARM].uclamp_min,
+                     (int)g_cfg.by_class[POLICY_WARM].pin_mid,
                      (int)g_cfg.by_class[POLICY_WARM].exclude_little,
                      g_cfg.by_class[POLICY_COOL].uclamp_min);
     (void)n;

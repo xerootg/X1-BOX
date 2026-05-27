@@ -19,6 +19,25 @@ option(XEMU_ENABLE_XISO_CONVERTER "Enable ISO->XISO converter library" ON)
 option(XEMU_OPT_NATIVE_FLOAT "Enable native ARM64 float operations for SSE/FPU" OFF)
 option(XEMU_OPT_TCG_PEEPHOLE "Enable TCG optimizer setcond+brcond peephole fusion" OFF)
 option(XEMU_OPT_TB_CACHE_HINTS "Enable persistent TB cache hints (pre-warm on load)" OFF)
+option(XEMU_ENABLE_LTO "Enable LLVM ThinLTO on first-party C/C++ targets (libxemu.so and its static deps)" OFF)
+
+# Probe IPO/LTO support up front so per-target set_property calls at the end
+# of the file can run unconditionally. We deliberately do NOT set
+# CMAKE_INTERPROCEDURAL_OPTIMIZATION globally — SDL2 has its own SDL_LTO knob
+# and the IMPORTED static libs (cranelift_tcg, glib_ep, dsp56300_emu_ffi,
+# xiso_converter_rs) are opaque .a files from external builds. Scoping to
+# our own targets keeps third-party LTO policy independent.
+set(XEMU_LTO_EFFECTIVE FALSE)
+if(XEMU_ENABLE_LTO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT _xemu_ipo_ok OUTPUT _xemu_ipo_msg LANGUAGES C CXX)
+  if(_xemu_ipo_ok)
+    set(XEMU_LTO_EFFECTIVE TRUE)
+    message(STATUS "XEMU_ENABLE_LTO=ON: ThinLTO will be applied to first-party native targets")
+  else()
+    message(WARNING "XEMU_ENABLE_LTO=ON but IPO not supported by this toolchain: ${_xemu_ipo_msg}")
+  endif()
+endif()
 
 find_program(CARGO_EXECUTABLE NAMES cargo cargo.exe)
 if(CARGO_EXECUTABLE MATCHES "-NOTFOUND$" OR NOT CARGO_EXECUTABLE)
@@ -353,8 +372,10 @@ target_compile_options(x87 PRIVATE
   -Wno-error
   # Crank optimization on the lib specifically. Hot paths are fixed-iter
   # Taylor polynomials over software-emulated fpext_t — both inlining
-  # (O3) and loop unrolling pay off. Override -O2 from the perftest
-  # variant default. DO NOT add -ffast-math / -fno-signed-zeros /
+  # (O3) and loop unrolling pay off. Kept explicit even after the
+  # 2026-05-26 xemu_core-wide flip to -O3 -funroll-loops, so the lib
+  # stays maximally optimized regardless of what the parent variant
+  # default does. DO NOT add -ffast-math / -fno-signed-zeros /
   # -freciprocal-math: they break the lib's bit-exact NaN, denorm, and
   # rounding-mode semantics, which is the entire reason we use the lib.
   -O3
@@ -1532,7 +1553,16 @@ target_compile_options(xemu PRIVATE -fexceptions -frtti -g1
 # for why we need this — it catches the "Thread-N" threads that statically
 # linked deps (SDL2, libsamplerate, etc) spawn directly via libc, so they
 # show up with a real name in /proc/<pid>/task/<tid>/comm.
-target_link_options(xemu PRIVATE "-Wl,--wrap=pthread_create")
+#
+# -fno-emulated-tls also needs to flow to the link step. Android NDK clang
+# defaults to emulated TLS for shared libraries, and per-TU compile flags
+# don't influence ThinLTO's link-time codegen — it rebuilds bitcode using
+# link-line flags. Without this, LTO release builds silently swap native
+# TLS (mrs TPIDR_EL0) for __emutls_get_address on the co_tls_* variables
+# (QEMU_DEFINE_STATIC_CO_TLS), which broke bql_locked() state transitions
+# enough that BQL_LOCK_GUARD no-ops when it should acquire — surfaced as
+# a g_assert(bql_locked()) crash in cpu_interrupt on Halo 2 boot.
+target_link_options(xemu PRIVATE "-Wl,--wrap=pthread_create" -fno-emulated-tls)
 
 target_include_directories(xemu PRIVATE
   "${REPO_ROOT}"
@@ -1602,3 +1632,24 @@ target_link_libraries(xemu PRIVATE
   $<$<BOOL:${XEMU_ENABLE_VULKAN}>:SPIRV>
   ${zlib-lib}
 )
+
+# --- LTO (ThinLTO) on first-party native targets ---
+# Applies INTERPROCEDURAL_OPTIMIZATION to the SHARED libxemu.so and the
+# non-IMPORTED static/object libs that feed into it, so the linker can
+# inline across the xemu_core / xemu / x87 / slirp / iconv / volk /
+# spirv_reflect boundaries. IMPORTED targets and third-party FetchContent
+# trees (SDL2, glslang, tomlplusplus, adrenotools) are intentionally
+# skipped — those have their own LTO policy or no compilable sources here.
+# Conditional targets are guarded with if(TARGET …) so configs that turn
+# off Vulkan or the XISO converter still work.
+if(XEMU_LTO_EFFECTIVE)
+  foreach(_xemu_lto_tgt
+      xemu xemu_core xemu_force_keep_objs x87
+      slirp_static iconv_stub
+      volk_static spirv_reflect_static
+      xiso_converter)
+    if(TARGET ${_xemu_lto_tgt})
+      set_property(TARGET ${_xemu_lto_tgt} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
+  endforeach()
+endif()

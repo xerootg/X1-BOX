@@ -51,6 +51,70 @@ pub struct EnvDesc {
     /// falls through to a real call for everything else. 0 disables
     /// the inline path.
     pub cc_compute_all_fn: u64,
+
+    /// Native fp80 inline lowering. Populated by the C side from
+    /// `offsetof(CPUX86State, …)` and the resolved helper-symbol
+    /// addresses (`__hard` variants on AArch64 HARD_FPU). If a helper
+    /// pointer is 0, lower_call falls back to call_indirect for that
+    /// op. See `helper::lower_call_impl` for the pattern-match.
+    pub x87: X87Layout,
+}
+
+/// Offsets within `CPUX86State` and resolved helper-symbol addresses
+/// the inline x87 lowering needs. All offsets are byte counts from the
+/// `env` pointer (or, for `fpreg_native_d_off`, from the start of one
+/// `FPReg` slot).
+#[derive(Clone, Debug, Default)]
+pub struct X87Layout {
+    pub fpregs_offset: u32,
+    pub fpreg_stride: u32,
+    pub fpreg_native_d_off: u32,
+    pub fpstt_offset: u32,
+    pub ft0_native_offset: u32,
+    pub fpus_offset: u32,
+    pub fptags_offset: u32,
+    pub cc_src_offset: u32,
+    pub cc_dst_offset: u32,
+    pub cc_src2_offset: u32,
+    pub cc_op_offset: u32,
+
+    pub fucom_st0_ft0_fn: u64,
+    pub fcomi_st0_ft0_fn: u64,
+    pub fucomi_st0_ft0_fn: u64,
+    pub fxam_st0_fn: u64,
+    pub fldl2t_st0_fn: u64,
+    pub fldl2e_st0_fn: u64,
+    pub fldpi_st0_fn: u64,
+    pub fldlg2_st0_fn: u64,
+    pub fldln2_st0_fn: u64,
+    pub fld1_st0_fn: u64,
+    pub fldz_st0_fn: u64,
+    pub fldz_ft0_fn: u64,
+    pub fpush_fn: u64,
+    pub fpop_fn: u64,
+    pub fdecstp_fn: u64,
+    pub fincstp_fn: u64,
+    pub ffree_stn_fn: u64,
+    pub fmov_st0_ft0_fn: u64,
+    pub fmov_ft0_stn_fn: u64,
+    pub fmov_st0_stn_fn: u64,
+    pub fmov_stn_st0_fn: u64,
+    pub fxchg_st0_stn_fn: u64,
+    pub fchs_st0_fn: u64,
+    pub fabs_st0_fn: u64,
+    pub fsqrt_fn: u64,
+    pub fadd_st0_ft0_fn: u64,
+    pub fmul_st0_ft0_fn: u64,
+    pub fsub_st0_ft0_fn: u64,
+    pub fsubr_st0_ft0_fn: u64,
+    pub fdiv_st0_ft0_fn: u64,
+    pub fdivr_st0_ft0_fn: u64,
+    pub fadd_stn_st0_fn: u64,
+    pub fmul_stn_st0_fn: u64,
+    pub fsub_stn_st0_fn: u64,
+    pub fsubr_stn_st0_fn: u64,
+    pub fdiv_stn_st0_fn: u64,
+    pub fdivr_stn_st0_fn: u64,
 }
 
 impl EnvDesc {
@@ -74,6 +138,7 @@ impl EnvDesc {
             lookup_tb_ptr_fn: 0,
             flcr_fn: 0,
             cc_compute_all_fn: 0,
+            x87: X87Layout::default(),
         }
     }
 
@@ -84,6 +149,7 @@ impl EnvDesc {
     /// The caller must ensure `globals` points to `nb_globals * 3` u32s
     /// and `name_pool` is NUL-terminated and large enough to contain
     /// every name referenced from `globals[]`.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn from_raw(
         env_size: u32,
         tlb_offset: u32,
@@ -97,6 +163,7 @@ impl EnvDesc {
         lookup_tb_ptr_fn: u64,
         flcr_fn: u64,
         cc_compute_all_fn: u64,
+        x87: X87Layout,
     ) -> Self {
         let mut out = Vec::with_capacity(nb_globals as usize);
         if !globals.is_null() && nb_globals > 0 {
@@ -131,6 +198,7 @@ impl EnvDesc {
             lookup_tb_ptr_fn,
             flcr_fn,
             cc_compute_all_fn,
+            x87,
         }
     }
 }

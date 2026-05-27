@@ -21,9 +21,14 @@
  *   X1BOX_SCHED_UCLAMP_COOL=N                (profile default)  uclamp.min for qemu_main / cool helpers
  *   X1BOX_SCHED_EXCLUDE_LITTLE=0|1           (profile default)  mask out the little cluster
  *   X1BOX_SCHED_PIN_TCG_BIG=0|1              (profile default)  pin CPU N/TCG to biggest core
- *   X1BOX_SCHED_PIN_PFIFO_MID=0|1            (profile default)  pin nv2a.pfifo to the mid cluster (not the
- *                                                               biggest core — that's TCG's, and not the
- *                                                               little cluster — too slow)
+ *   X1BOX_SCHED_PIN_PFIFO_MID=0|1            (profile default)  pin nv2a.pfifo + AudioTrack to a single
+ *                                                               hashed mid core (deterministic per thread
+ *                                                               name) — keeps them off the biggest core
+ *                                                               (TCG's) and off the little cluster
+ *   X1BOX_SCHED_PIN_WARM_MID=0|1             (profile default)  pin each WARM thread (mcpx.apu_thread,
+ *                                                               pgraph.vk.rend*, cranelift-tcg, mcpx.voice,
+ *                                                               SDLAudioP2, nv2a.pgraph) to a single hashed
+ *                                                               mid core — stops cluster-internal bouncing
  *   X1BOX_SCHED_DEBUG=0|1                    (0)                log every policy decision
  *
  * Why the extra class: pfifo is the next-loudest thread after TCG, and once

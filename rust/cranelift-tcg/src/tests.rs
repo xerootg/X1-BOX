@@ -24,21 +24,23 @@ fn mk_op(opc: Opc, args: &[u64], oargs: u8, iargs: u8, cargs: u8) -> RawOp {
         nb_cargs: cargs,
         type_: 1, // I64
         flags: crate::opc::flags::TCG_OPF_INT,
+        const_mask: 0,
+        _pad: 0,
         args: a,
     }
 }
 
 unsafe fn init_with_dummy() -> *mut std::ffi::c_void {
-    let desc = CraneliftTcgEnvDesc {
-        env_size: 0x4000,
-        tlb_offset: 0,
-        pc_offset: 0,
-        nb_globals: 0,
-        globals: std::ptr::null(),
-        name_pool: std::ptr::null(),
-        guest_ptr_size: 4,
-        host_ptr_size: 8,
-    };
+    // SAFETY: this is a zero-initialised env desc — every pointer is
+    // null, every offset is 0. The tests below exercise tier-2
+    // compile paths that don't touch the env layout or the new x87
+    // surface, so zeroing is fine. Using std::mem::zeroed() avoids
+    // having to spell out every new field whenever the struct grows.
+    let desc: CraneliftTcgEnvDesc = unsafe { std::mem::zeroed() };
+    let mut desc = desc;
+    desc.env_size = 0x4000;
+    desc.guest_ptr_size = 4;
+    desc.host_ptr_size = 8;
     unsafe { cranelift_tcg_init(&desc) }
 }
 
@@ -105,6 +107,9 @@ fn env_desc_dummy_roundtrip() {
 }
 
 #[test]
-fn raw_op_layout_is_136() {
-    assert_eq!(core::mem::size_of::<RawOp>(), 136);
+fn raw_op_layout_is_144() {
+    // const_mask + _pad bumped RawOp from 136 to 144 bytes; mirror the
+    // const assertion in src/ir.rs at runtime so a future shrink that
+    // breaks the C ABI shows up here as well.
+    assert_eq!(core::mem::size_of::<RawOp>(), 144);
 }

@@ -39,6 +39,7 @@ pub mod translator;
 pub mod memory;
 pub mod helper;
 pub mod fpvec;
+pub mod x87;
 pub mod dispatcher;
 pub mod context;
 pub mod verify;

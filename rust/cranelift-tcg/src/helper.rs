@@ -57,6 +57,21 @@ fn lower_call_impl(l: &mut Lowering<'_, '_>, op: &DecodedOp) -> Result<(), Trans
         return lower_cc_compute_all_inline(l, op, helper_ptr);
     }
 
+    // Native fp80 inline-lowering pass. When the helper-ptr matches one
+    // of the x87 entries the C side published (HARD_FPU mode), emit IR
+    // for the helper body inline and bypass call_indirect entirely. If
+    // the inline path declines (UnsupportedOp), fall through to the
+    // normal call sequence below.
+    match crate::x87::try_lower(l, op, helper_ptr) {
+        Ok(true)  => return Ok(()),
+        Ok(false) => { /* not an x87 helper — fall through */ }
+        Err(TransError::UnsupportedOp(_)) => {
+            /* inline path opted out (e.g. cc_compute_all_fn missing) —
+             * fall through to call_indirect so we don't bail the TB. */
+        }
+        Err(e) => return Err(e),
+    }
+
     // Build a signature: each input becomes an i64 by value, single
     // i64 return value if nb_oargs == 1, none otherwise.
     let mut sig = Signature::new(CallConv::SystemV);

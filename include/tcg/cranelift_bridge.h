@@ -140,6 +140,95 @@ typedef struct CraneliftTcgEnvDesc {
      * through to the C helper for everything else. 0 disables the
      * inline path and routes every call through call_indirect. */
     uintptr_t cc_compute_all_fn;
+
+    /*
+     * Native fp80 (USE_HARD_FPU) inline lowering surface. AArch64
+     * stores guest ST(N) as native double in env->fpregs[i].native_d
+     * and FT0 in env->ft0_native, so the `__hard` variants of every
+     * x87 arith/compare/classify helper reduce to a handful of f64
+     * loads, an arith op, and a store. Cranelift can emit that inline
+     * and skip the call_indirect entirely; the helpers below carry the
+     * runtime addresses of each helper-pointer we know how to inline.
+     *
+     * Layout offsets + helper addresses live in a separate sub-struct
+     * so the env-desc keeps a flat ABI. Any 0 helper pointer leaves
+     * tier-2 on the legacy call_indirect path for that op.
+     *
+     * Exception-flag side effects of save_exception_flags/
+     * merge_exception_flags are deliberately skipped on the inline
+     * path: in HARD_FPU mode merge_exception_flags is a no-op and
+     * save_exception_flags just zeros env->fp_status.exception_flags
+     * — Xbox titles do not observe these IEEE exception bits. If a
+     * future workload depends on env->fp_status.exception_flags being
+     * cleared per-op, that's the first thing to revisit here.
+     */
+    uint32_t fpregs_offset;          /* offsetof(CPUX86State, fpregs[0])  */
+    uint32_t fpreg_stride;           /* sizeof(FPReg)                     */
+    uint32_t fpreg_native_d_off;     /* offsetof(FPReg, native_d)         */
+    uint32_t fpstt_offset;           /* offsetof(CPUX86State, fpstt) [u32]*/
+    uint32_t ft0_native_offset;      /* offsetof(CPUX86State, ft0_native) */
+    uint32_t fpus_offset;            /* offsetof(CPUX86State, fpus) [u16] */
+    uint32_t fptags_offset;          /* offsetof(CPUX86State, fptags[0])  */
+    uint32_t cc_src_offset;          /* offsetof(CPUX86State, cc_src)     */
+    uint32_t cc_dst_offset;          /* offsetof(CPUX86State, cc_dst)     */
+    uint32_t cc_src2_offset;         /* offsetof(CPUX86State, cc_src2)    */
+    uint32_t cc_op_offset;           /* offsetof(CPUX86State, cc_op) [i32]*/
+    uint32_t x87_pad0;               /* keep helper pointers 8-aligned    */
+
+    /* Comparison helpers — set fpus or cc_op/cc_src. */
+    uintptr_t x87_fucom_st0_ft0_fn;
+    uintptr_t x87_fcomi_st0_ft0_fn;
+    uintptr_t x87_fucomi_st0_ft0_fn;
+
+    /* Classification helper. */
+    uintptr_t x87_fxam_st0_fn;
+
+    /* Constant pushers — equivalent to fpush + ST0 = K. */
+    uintptr_t x87_fldl2t_st0_fn;
+    uintptr_t x87_fldl2e_st0_fn;
+    uintptr_t x87_fldpi_st0_fn;
+    uintptr_t x87_fldlg2_st0_fn;
+    uintptr_t x87_fldln2_st0_fn;
+    uintptr_t x87_fld1_st0_fn;
+    uintptr_t x87_fldz_st0_fn;
+    uintptr_t x87_fldz_ft0_fn;
+
+    /* Stack-management helpers — fpush/fpop/fdecstp/fincstp/ffree. */
+    uintptr_t x87_fpush_fn;
+    uintptr_t x87_fpop_fn;
+    uintptr_t x87_fdecstp_fn;
+    uintptr_t x87_fincstp_fn;
+    uintptr_t x87_ffree_stn_fn;
+
+    /* Move helpers — fmov_*. */
+    uintptr_t x87_fmov_st0_ft0_fn;
+    uintptr_t x87_fmov_ft0_stn_fn;
+    uintptr_t x87_fmov_st0_stn_fn;
+    uintptr_t x87_fmov_stn_st0_fn;
+    uintptr_t x87_fxchg_st0_stn_fn;
+
+    /* Unary helpers — fchs/fabs/fsqrt. */
+    uintptr_t x87_fchs_st0_fn;
+    uintptr_t x87_fabs_st0_fn;
+    uintptr_t x87_fsqrt_fn;
+
+    /* Arithmetic helpers — fadd/fmul/fsub/fsubr/fdiv/fdivr ST0_FT0
+     * and STN_ST0 (12 total). The inline-TCG path covers these when
+     * g_use_fp_jit + HARD_FPU_HAS_TCG_FP_OPS are both set, but tier-2
+     * still sees them as call_indirect when the bisect groups are
+     * flipped or when the frontend opts out for any reason. */
+    uintptr_t x87_fadd_st0_ft0_fn;
+    uintptr_t x87_fmul_st0_ft0_fn;
+    uintptr_t x87_fsub_st0_ft0_fn;
+    uintptr_t x87_fsubr_st0_ft0_fn;
+    uintptr_t x87_fdiv_st0_ft0_fn;
+    uintptr_t x87_fdivr_st0_ft0_fn;
+    uintptr_t x87_fadd_stn_st0_fn;
+    uintptr_t x87_fmul_stn_st0_fn;
+    uintptr_t x87_fsub_stn_st0_fn;
+    uintptr_t x87_fsubr_stn_st0_fn;
+    uintptr_t x87_fdiv_stn_st0_fn;
+    uintptr_t x87_fdivr_stn_st0_fn;
 } CraneliftTcgEnvDesc;
 
 /* ------------------------------------------------------------------ */

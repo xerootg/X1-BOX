@@ -29,6 +29,14 @@
 #include "tcg/cranelift_bridge.h"
 #include "tb-cache-hints.h"
 #include "tb-internal.h"  /* GETPC_ADJ for the unwind index */
+/*
+ * Cranelift is Android-aarch64-only (see XEMU_HAVE_CRANELIFT gate in
+ * cranelift-bridge.h), and Android only builds the i386 target — so
+ * pulling in target/i386/cpu.h here is safe and lets us publish exact
+ * offsetof()s for CPUX86State::fpregs / fpstt / fpus etc. to the
+ * Cranelift inline-fp80 lowering path.
+ */
+#include "cpu.h"
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -82,6 +90,96 @@ extern const void *helper_lookup_tb_ptr(CPUArchState *env);
  * time. */
 extern void helper_cc_compute_all(void);
 #define CRANELIFT_HELPER_CC_COMPUTE_ALL ((uintptr_t)&helper_cc_compute_all)
+
+/*
+ * Native fp80 inline lowering — addresses of the x87 helpers we know
+ * how to inline. On AArch64 HARD_FPU these go through the `__hard`
+ * variants (native double storage); on other build configurations the
+ * helpers have a single un-suffixed name. The macros below paper over
+ * the dual-symbol gen by emitting both forwards declarations and
+ * resolving the address through `g_use_fp_jit` at publish time.
+ *
+ * Helpers take CPUArchState* and (optionally) a single int argument.
+ * We declare them with `void(void)` because all we want is the
+ * function address; the real prototypes live in target/i386/helper.h
+ * and would require ODR-incompatible target_ulong declarations here.
+ */
+#if defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__))
+extern bool xemu_get_fp_jit(void);
+#define X1BOX_X87_HELPER_DUAL(name) \
+    extern void glue(helper_, glue(name, __hard))(void); \
+    extern void glue(helper_, glue(name, __soft))(void)
+#define X1BOX_X87_HELPER_ADDR(name) \
+    ((uintptr_t)(xemu_get_fp_jit() ? (void *)&glue(helper_, glue(name, __hard)) \
+                                   : (void *)&glue(helper_, glue(name, __soft))))
+#else
+#define X1BOX_X87_HELPER_DUAL(name) \
+    extern void glue(helper_, name)(void)
+#define X1BOX_X87_HELPER_ADDR(name) \
+    ((uintptr_t)(void *)&glue(helper_, name))
+#endif
+
+X1BOX_X87_HELPER_DUAL(fucom_ST0_FT0);
+X1BOX_X87_HELPER_DUAL(fcomi_ST0_FT0);
+X1BOX_X87_HELPER_DUAL(fucomi_ST0_FT0);
+X1BOX_X87_HELPER_DUAL(fxam_ST0);
+X1BOX_X87_HELPER_DUAL(fldl2t_ST0);
+X1BOX_X87_HELPER_DUAL(fldl2e_ST0);
+X1BOX_X87_HELPER_DUAL(fldpi_ST0);
+X1BOX_X87_HELPER_DUAL(fldlg2_ST0);
+X1BOX_X87_HELPER_DUAL(fldln2_ST0);
+X1BOX_X87_HELPER_DUAL(fld1_ST0);
+X1BOX_X87_HELPER_DUAL(fldz_ST0);
+X1BOX_X87_HELPER_DUAL(fldz_FT0);
+X1BOX_X87_HELPER_DUAL(fpush);
+X1BOX_X87_HELPER_DUAL(fpop);
+X1BOX_X87_HELPER_DUAL(fdecstp);
+X1BOX_X87_HELPER_DUAL(fincstp);
+X1BOX_X87_HELPER_DUAL(ffree_STN);
+X1BOX_X87_HELPER_DUAL(fmov_ST0_FT0);
+X1BOX_X87_HELPER_DUAL(fmov_FT0_STN);
+X1BOX_X87_HELPER_DUAL(fmov_ST0_STN);
+X1BOX_X87_HELPER_DUAL(fmov_STN_ST0);
+X1BOX_X87_HELPER_DUAL(fxchg_ST0_STN);
+X1BOX_X87_HELPER_DUAL(fchs_ST0);
+X1BOX_X87_HELPER_DUAL(fabs_ST0);
+X1BOX_X87_HELPER_DUAL(fsqrt);
+X1BOX_X87_HELPER_DUAL(fadd_ST0_FT0);
+X1BOX_X87_HELPER_DUAL(fmul_ST0_FT0);
+X1BOX_X87_HELPER_DUAL(fsub_ST0_FT0);
+X1BOX_X87_HELPER_DUAL(fsubr_ST0_FT0);
+X1BOX_X87_HELPER_DUAL(fdiv_ST0_FT0);
+X1BOX_X87_HELPER_DUAL(fdivr_ST0_FT0);
+X1BOX_X87_HELPER_DUAL(fadd_STN_ST0);
+X1BOX_X87_HELPER_DUAL(fmul_STN_ST0);
+X1BOX_X87_HELPER_DUAL(fsub_STN_ST0);
+X1BOX_X87_HELPER_DUAL(fsubr_STN_ST0);
+X1BOX_X87_HELPER_DUAL(fdiv_STN_ST0);
+X1BOX_X87_HELPER_DUAL(fdivr_STN_ST0);
+
+/*
+ * Disable inline x87 fp80 lowering by setting X1BOX_X87_INLINE=0.
+ * Default is on, but only effective when fp_jit is also enabled —
+ * the inline path reads env->fpregs[i].native_d (a `double` slot in
+ * the FPReg union) which is only populated when the dispatch picks
+ * the `__hard` helper variants; the __soft variants write the
+ * overlapping floatx80 `.d` field instead. Mixing the two would
+ * read garbage. With fp_jit off, every helper site routes through
+ * the __soft variant; we leave Cranelift on the legacy call_indirect
+ * path so that storage layout stays consistent.
+ */
+static bool cranelift_x87_inline_enabled(void)
+{
+    const char *e = getenv("X1BOX_X87_INLINE");
+    if (e && *e == '0') {
+        return false;
+    }
+#if defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__))
+    return xemu_get_fp_jit();
+#else
+    return false;
+#endif
+}
 
 /*
  * Tier-2 promotion threshold. The TCG-side exec_count saturates at
@@ -472,6 +570,65 @@ static void cranelift_bridge_lazy_init(void)
                               getenv("X1BOX_CC_INLINE")[0] == '0')
                              ? 0u
                              : CRANELIFT_HELPER_CC_COMPUTE_ALL,
+
+        /*
+         * x87 inline-fp80 layout. Offsets are derived from cpu.h at
+         * compile time so any future shuffle of CPUX86State stays in
+         * sync without a hand-maintained mirror.
+         */
+        .fpregs_offset       = (uint32_t)offsetof(CPUX86State, fpregs[0]),
+        .fpreg_stride        = (uint32_t)sizeof(FPReg),
+        .fpreg_native_d_off  = (uint32_t)offsetof(FPReg, native_d),
+        .fpstt_offset        = (uint32_t)offsetof(CPUX86State, fpstt),
+        .ft0_native_offset   = (uint32_t)offsetof(CPUX86State, ft0_native),
+        .fpus_offset         = (uint32_t)offsetof(CPUX86State, fpus),
+        .fptags_offset       = (uint32_t)offsetof(CPUX86State, fptags[0]),
+        .cc_src_offset       = (uint32_t)offsetof(CPUX86State, cc_src),
+        .cc_dst_offset       = (uint32_t)offsetof(CPUX86State, cc_dst),
+        .cc_src2_offset      = (uint32_t)offsetof(CPUX86State, cc_src2),
+        .cc_op_offset        = (uint32_t)offsetof(CPUX86State, cc_op),
+        .x87_pad0            = 0,
+
+#define X87_FN(field, name) \
+        .field = cranelift_x87_inline_enabled() ? X1BOX_X87_HELPER_ADDR(name) : 0
+        X87_FN(x87_fucom_st0_ft0_fn,  fucom_ST0_FT0),
+        X87_FN(x87_fcomi_st0_ft0_fn,  fcomi_ST0_FT0),
+        X87_FN(x87_fucomi_st0_ft0_fn, fucomi_ST0_FT0),
+        X87_FN(x87_fxam_st0_fn,       fxam_ST0),
+        X87_FN(x87_fldl2t_st0_fn,     fldl2t_ST0),
+        X87_FN(x87_fldl2e_st0_fn,     fldl2e_ST0),
+        X87_FN(x87_fldpi_st0_fn,      fldpi_ST0),
+        X87_FN(x87_fldlg2_st0_fn,     fldlg2_ST0),
+        X87_FN(x87_fldln2_st0_fn,     fldln2_ST0),
+        X87_FN(x87_fld1_st0_fn,       fld1_ST0),
+        X87_FN(x87_fldz_st0_fn,       fldz_ST0),
+        X87_FN(x87_fldz_ft0_fn,       fldz_FT0),
+        X87_FN(x87_fpush_fn,          fpush),
+        X87_FN(x87_fpop_fn,           fpop),
+        X87_FN(x87_fdecstp_fn,        fdecstp),
+        X87_FN(x87_fincstp_fn,        fincstp),
+        X87_FN(x87_ffree_stn_fn,      ffree_STN),
+        X87_FN(x87_fmov_st0_ft0_fn,   fmov_ST0_FT0),
+        X87_FN(x87_fmov_ft0_stn_fn,   fmov_FT0_STN),
+        X87_FN(x87_fmov_st0_stn_fn,   fmov_ST0_STN),
+        X87_FN(x87_fmov_stn_st0_fn,   fmov_STN_ST0),
+        X87_FN(x87_fxchg_st0_stn_fn,  fxchg_ST0_STN),
+        X87_FN(x87_fchs_st0_fn,       fchs_ST0),
+        X87_FN(x87_fabs_st0_fn,       fabs_ST0),
+        X87_FN(x87_fsqrt_fn,          fsqrt),
+        X87_FN(x87_fadd_st0_ft0_fn,   fadd_ST0_FT0),
+        X87_FN(x87_fmul_st0_ft0_fn,   fmul_ST0_FT0),
+        X87_FN(x87_fsub_st0_ft0_fn,   fsub_ST0_FT0),
+        X87_FN(x87_fsubr_st0_ft0_fn,  fsubr_ST0_FT0),
+        X87_FN(x87_fdiv_st0_ft0_fn,   fdiv_ST0_FT0),
+        X87_FN(x87_fdivr_st0_ft0_fn,  fdivr_ST0_FT0),
+        X87_FN(x87_fadd_stn_st0_fn,   fadd_STN_ST0),
+        X87_FN(x87_fmul_stn_st0_fn,   fmul_STN_ST0),
+        X87_FN(x87_fsub_stn_st0_fn,   fsub_STN_ST0),
+        X87_FN(x87_fsubr_stn_st0_fn,  fsubr_STN_ST0),
+        X87_FN(x87_fdiv_stn_st0_fn,   fdiv_STN_ST0),
+        X87_FN(x87_fdivr_stn_st0_fn,  fdivr_STN_ST0),
+#undef X87_FN
     };
 
     g_cranelift_ctx = cranelift_tcg_init(&env);
