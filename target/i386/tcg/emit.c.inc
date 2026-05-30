@@ -4716,6 +4716,33 @@ static int sse_comi_inline_enabled(void)
     return cached;
 }
 
+/*
+ * COMI inline-vs-reference shadow (debug). When X1BOX_SSE_COMI_SHADOW=1, every
+ * inline COMISS/UCOMISS also calls helper_sse_comi_shadow, which recomputes the
+ * eflags the helper's way and logs any divergence on the live game's actual
+ * comparisons. Used to chase the COMI-only Halo 2 physics regression — the flag
+ * mapping is correct on paper in both tiers, so this finds the diverging input
+ * empirically. Off by default; only meaningful with COMI inline enabled.
+ */
+static int sse_comi_shadow_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("X1BOX_SSE_COMI_SHADOW");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* a64/b64 = scalar operand bit patterns (f32 zero-extended to 64); res = the
+ * inline-computed eflags. Non-perturbing: the helper only reads + logs. */
+static void gen_comi_shadow_call(TCGv_i64 a64, TCGv_i64 b64, TCGv_i64 res, int is_sd)
+{
+    TCGv_i32 inef = tcg_temp_new_i32();
+    tcg_gen_extrl_i64_i32(inef, res);
+    gen_helper_sse_comi_shadow(tcg_env, a64, b64, inef, tcg_constant_i32(is_sd ? 1 : 0));
+}
+
 static bool gen_VCOMI_inline(DisasContext *s, X86DecodedInsn *decode)
 {
     /* Decoupled from g_use_fp_jit 2026-05-24 — same reasoning as
@@ -4746,6 +4773,9 @@ static bool gen_VCOMI_inline(DisasContext *s, X86DecodedInsn *decode)
         tcg_gen_mov64i_f64(af, ai);
         tcg_gen_mov64i_f64(bf, bi);
         tcg_gen_com_f64(res, af, bf);
+        if (sse_comi_shadow_enabled()) {
+            gen_comi_shadow_call(ai, bi, res, 1);
+        }
     } else {
         TCGv_i32 ai = tcg_temp_new_i32();
         TCGv_i32 bi = tcg_temp_new_i32();
@@ -4756,6 +4786,13 @@ static bool gen_VCOMI_inline(DisasContext *s, X86DecodedInsn *decode)
         tcg_gen_mov32i_f32(af, ai);
         tcg_gen_mov32i_f32(bf, bi);
         tcg_gen_com_f32(res, af, bf);
+        if (sse_comi_shadow_enabled()) {
+            TCGv_i64 a64 = tcg_temp_new_i64();
+            TCGv_i64 b64 = tcg_temp_new_i64();
+            tcg_gen_extu_i32_i64(a64, ai);
+            tcg_gen_extu_i32_i64(b64, bi);
+            gen_comi_shadow_call(a64, b64, res, 0);
+        }
     }
     /*
      * cpu_cc_src is `TCGv` = TCGv_i32 on 32-bit guest (i386). Truncate the
