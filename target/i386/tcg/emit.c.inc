@@ -4703,14 +4703,27 @@ static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
  * 0.29% + helper_ucomiss 0.05%). Quiet vs signaling NaN distinction
  * collapses under XEMU_OPT_NATIVE_FLOAT=1 — the helper itself drops to
  * the same float32_compare_native, so this inline is bit-equivalent.
+ *
+ * Default ON as of 2026-05-30. This was previously the one SSE op that
+ * perturbed Halo 2 physics — root-caused to the tier-2 (Cranelift) com lowering
+ * inverting less<->greater via a mis-lowered combined FloatCC, NOT this tier-1
+ * path. Fixed in fpvec.rs (738afc2cb0) and verified with the COMI shadow
+ * (X1BOX_SSE_COMI_SHADOW=1): 0 divergences on Serious Sam II, physics clean.
+ * Disable with X1BOX_SSE_INLINE_COMI=0; re-verify any device with the shadow.
  */
 static int sse_comi_inline_enabled(void)
 {
     static int cached = -1;
     if (cached < 0) {
+        int on = 1; /* default ON — fixed + shadow-verified 2026-05-30 */
         const char *all = getenv("X1BOX_SSE_INLINE");
         const char *comi = getenv("X1BOX_SSE_INLINE_COMI");
-        int on = (all && *all && *all != '0') || (comi && *comi && *comi != '0');
+        if (all && *all && *all == '0') {
+            on = 0;
+        }
+        if (comi && *comi) {
+            on = (*comi != '0');
+        }
         cached = on ? 1 : 0;
     }
     return cached;
