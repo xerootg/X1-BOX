@@ -175,12 +175,23 @@ pub(crate) fn lower_fp(l: &mut Lowering<'_, '_>, raw: u16, op: &DecodedOp) -> Re
              * "not implemented" before the third install. Decomposing
              * sidesteps the missing condition.
              */
-            let lt_or_uo = l.builder.ins().fcmp(FloatCC::UnorderedOrLessThan, af, bf);
+            /*
+             * CF = less-than OR unordered. cranelift-codegen 0.130.2's aarch64
+             * backend MIS-LOWERS the combined FloatCC::UnorderedOrLessThan here
+             * — device-confirmed via the COMI shadow: COMISS(0.0, -1.0), which
+             * is "greater", came back CF=1 (0x01, "below") instead of 0, i.e.
+             * less<->greater inverted on every ordered compare. ZF/PF via
+             * Equal/Unordered lower correctly, so the fault is specific to the
+             * combined predicate. Decompose into LessThan | Unordered — the
+             * same workaround already applied just below for UnorderedOrEqual.
+             */
+            let lt = l.builder.ins().fcmp(FloatCC::LessThan, af, bf);
             let uo = l.builder.ins().fcmp(FloatCC::Unordered, af, bf);
             let eq = l.builder.ins().fcmp(FloatCC::Equal, af, bf);
-            let cf64 = l.builder.ins().uextend(types::I64, lt_or_uo);
+            let lt64 = l.builder.ins().uextend(types::I64, lt);
             let pf64 = l.builder.ins().uextend(types::I64, uo);
             let eq64 = l.builder.ins().uextend(types::I64, eq);
+            let cf64 = l.builder.ins().bor(lt64, pf64);
             let zf64 = l.builder.ins().bor(eq64, pf64);
             let pf_shifted = l.builder.ins().ishl_imm(pf64, 2);
             let zf_shifted = l.builder.ins().ishl_imm(zf64, 6);
