@@ -735,23 +735,31 @@ static int sse_native_fp_sentinel(void)
 }
 
 /*
- * Per-op gating env vars so the Bungie-screen regression can be bisected:
- *   X1BOX_SSE_INLINE=1      — enables all five ops at once
- *   X1BOX_SSE_INLINE_ADD=1  — just ADDSS/ADDSD
- *   X1BOX_SSE_INLINE_SUB=1  — just SUBSS/SUBSD
- *   X1BOX_SSE_INLINE_MUL=1  — just MULSS/MULSD
- *   X1BOX_SSE_INLINE_DIV=1  — just DIVSS/DIVSD
- *   X1BOX_SSE_INLINE_SQRT=1 — just SQRTSS/SQRTSD
+ * Per-op gating env vars. DIVSS/DIVSD default ON as of 2026-05-30; the rest
+ * default OFF (opt-in). Every var also accepts =0 to force its op OFF, so a
+ * default-on op can be bisected back out:
+ *   X1BOX_SSE_INLINE=1       — enable ALL five ops at once
+ *   X1BOX_SSE_INLINE_ADD=1   — ADDSS/ADDSD
+ *   X1BOX_SSE_INLINE_SUB=1   — SUBSS/SUBSD
+ *   X1BOX_SSE_INLINE_MUL=1   — MULSS/MULSD
+ *   X1BOX_SSE_INLINE_DIV=1   — DIVSS/DIVSD   (default ON; set =0 to disable)
+ *   X1BOX_SSE_INLINE_SQRT=1  — SQRTSS/SQRTSD
  *
- * Flip ONE at a time to find the op that breaks Bungie audio + stuck-input.
- * Default: all OFF → helper path, byte-identical to pre-inline build.
- * See [[project_sse_scalar_inline_gated]] for context.
+ * DIVSS/DIVSD default ON: IEEE-754 division is correctly-rounded, so NEON FDIV
+ * is bit-identical to x86 DIVSS under a matched rounding mode. Validated two
+ * ways: the SSE-on-NEON sentinel reports add..sqrt all bit-match softfloat on
+ * device, and Halo 2 physics is clean on Zenfone 10 with DIV+SQRT-only inline.
+ * The 2026-05 "SSE physics drift" that forced all SSE scalar inline OFF was
+ * traced to the x87/fp80 path, not this correctly-rounded scalar arith
+ * ([[project_sse_neon_physics_drift]]). The sentinel still masks off any op
+ * that diverges on a given device's FPCR (e.g. flush-to-zero on subnormals).
  */
 static int sse_scalar_inline_mask(void)
 {
     static int cached = -1;
     if (cached < 0) {
-        int m = 0;
+        /* DIV default ON — correctly-rounded, sentinel- + physics-validated. */
+        int m = (1u << SSE_FPS_DIV);
         const char *all = getenv("X1BOX_SSE_INLINE");
         if (all && *all && *all != '0') {
             m = (1u << SSE_FPS_ADD) | (1u << SSE_FPS_SUB) | (1u << SSE_FPS_MUL)
@@ -766,8 +774,12 @@ static int sse_scalar_inline_mask(void)
         };
         for (size_t i = 0; i < sizeof(per) / sizeof(per[0]); i++) {
             const char *v = getenv(per[i].name);
-            if (v && *v && *v != '0') {
-                m |= 1u << per[i].bit;
+            if (v && *v) {
+                if (*v != '0') {
+                    m |= 1u << per[i].bit;     /* explicit enable */
+                } else {
+                    m &= ~(1u << per[i].bit);  /* explicit disable (bisect) */
+                }
             }
         }
         /* Never inline an op the sentinel found diverges from softfloat. */
