@@ -735,33 +735,39 @@ static int sse_native_fp_sentinel(void)
 }
 
 /*
- * Per-op gating env vars. DIVSS/DIVSD default ON as of 2026-05-30; the rest
- * default OFF (opt-in). Every var also accepts =0 to force its op OFF, so a
- * default-on op can be bisected back out:
- *   X1BOX_SSE_INLINE=1       — enable ALL five ops at once
- *   X1BOX_SSE_INLINE_ADD=1   — ADDSS/ADDSD
- *   X1BOX_SSE_INLINE_SUB=1   — SUBSS/SUBSD
- *   X1BOX_SSE_INLINE_MUL=1   — MULSS/MULSD
+ * Per-op gating env vars. All five scalar-arith ops default ON as of
+ * 2026-05-30; COMI stays OFF. Every var also accepts =0 to force its op OFF, so
+ * a default-on op can be bisected back out:
+ *   X1BOX_SSE_INLINE=1       — enable all five arith ops AND COMI (testing)
+ *   X1BOX_SSE_INLINE_ADD=1   — ADDSS/ADDSD   (default ON; set =0 to disable)
+ *   X1BOX_SSE_INLINE_SUB=1   — SUBSS/SUBSD   (default ON; set =0 to disable)
+ *   X1BOX_SSE_INLINE_MUL=1   — MULSS/MULSD   (default ON; set =0 to disable)
  *   X1BOX_SSE_INLINE_DIV=1   — DIVSS/DIVSD   (default ON; set =0 to disable)
  *   X1BOX_SSE_INLINE_SQRT=1  — SQRTSS/SQRTSD (default ON; set =0 to disable)
  *
- * DIVSS/DIVSD and SQRTSS/SQRTSD default ON: IEEE-754 div and sqrt are both
- * correctly-rounded, so NEON FDIV/FSQRT are bit-identical to x86 DIVSS/SQRTSS
- * under a matched rounding mode. (SQRT is in fact the safest of the five — it
- * never produces a subnormal from a normal input, so it can't even hit a
- * flush-to-zero edge.) Validated two ways: the SSE-on-NEON sentinel reports
- * add..sqrt all bit-match softfloat on device, and Halo 2 physics is clean on
- * Zenfone 10 with DIV+SQRT-only inline. The 2026-05 "SSE physics drift" that
- * forced all SSE scalar inline OFF was traced to the x87/fp80 path, not this
- * correctly-rounded scalar arith ([[project_sse_neon_physics_drift]]). The
- * sentinel still masks off any op that diverges on a given device's FPCR.
+ * All five scalar-arith ops default ON. Each is IEEE-754 correctly-rounded, so
+ * the NEON op is bit-identical to x86 under a matched rounding mode — the
+ * SSE-on-NEON sentinel proves add..sqrt ALL bit-match softfloat on BOTH test
+ * devices (Adreno + Mali), which makes the inline path behavior-neutral vs the
+ * softfloat helper (same bits, no call overhead). Halo 2 physics confirmed
+ * clean with all five on (Pixel 10a playtest, all-arith-no-COMI).
+ *
+ * COMISS/UCOMISS inline is deliberately NOT in this default — it perturbs
+ * Halo 2 physics (its flag VALUES are correct in both tiers, so the cause is
+ * subtler; tracked separately). The master X1BOX_SSE_INLINE=1 still turns COMI
+ * on for testing. The 2026-05 "SSE physics drift" that originally forced all
+ * scalar inline OFF was the x87/fp80 path, not this correctly-rounded arith
+ * ([[project_sse_neon_physics_drift]]). The sentinel still masks off any op
+ * that diverges on a given device's FPCR (e.g. flush-to-zero on subnormals).
  */
 static int sse_scalar_inline_mask(void)
 {
     static int cached = -1;
     if (cached < 0) {
-        /* DIV + SQRT default ON — correctly-rounded, sentinel- + physics-validated. */
-        int m = (1u << SSE_FPS_DIV) | (1u << SSE_FPS_SQRT);
+        /* All scalar arith default ON — bit-identical to softfloat (sentinel-
+         * proven on Adreno+Mali) + Halo 2 physics-validated. COMI stays off. */
+        int m = (1u << SSE_FPS_ADD) | (1u << SSE_FPS_SUB) | (1u << SSE_FPS_MUL)
+              | (1u << SSE_FPS_DIV) | (1u << SSE_FPS_SQRT);
         const char *all = getenv("X1BOX_SSE_INLINE");
         if (all && *all && *all != '0') {
             m = (1u << SSE_FPS_ADD) | (1u << SSE_FPS_SUB) | (1u << SSE_FPS_MUL)
