@@ -327,17 +327,41 @@ static void glue(gen_fildll_ST0, PREC_SUFFIX)(DisasContext *s, TCGv_i64 arg)
 
 static void glue(gen_fistl_ST0, PREC_SUFFIX)(DisasContext *s, TCGv_i32 arg)
 {
-    glue(glue(tcg_gen_cvt, PRECf), _i32)(arg, get_st0(s));
+    PREC_TYPE st0 = get_st0(s);
+    glue(glue(tcg_gen_cvt, PRECf), _i32)(arg, st0);
+#if PREC == 64 && defined(XBOX)
+    if (g_x87_shadow) {
+        TCGv_i64 sb = tcg_temp_new_i64();
+        tcg_gen_mov64f_i64(sb, st0);
+        gen_helper_x87_shadow_fistl(tcg_env, sb, arg);
+    }
+#endif
 }
 
 static void glue(gen_fistll_ST0, PREC_SUFFIX)(DisasContext *s, TCGv_i64 arg)
 {
-    glue(glue(tcg_gen_cvt, PRECf), _i64)(arg, get_st0(s));
+    PREC_TYPE st0 = get_st0(s);
+    glue(glue(tcg_gen_cvt, PRECf), _i64)(arg, st0);
+#if PREC == 64 && defined(XBOX)
+    if (g_x87_shadow) {
+        TCGv_i64 sb = tcg_temp_new_i64();
+        tcg_gen_mov64f_i64(sb, st0);
+        gen_helper_x87_shadow_fistll(tcg_env, sb, arg);
+    }
+#endif
 }
 
 static void glue(gen_fsts_ST0, PREC_SUFFIX)(DisasContext *s, TCGv_i32 arg)
 {
-    glue(glue(gen_mov, PRECf), _i32)(arg, get_st0(s));
+    PREC_TYPE st0 = get_st0(s);
+    glue(glue(gen_mov, PRECf), _i32)(arg, st0);
+#if PREC == 64 && defined(XBOX)
+    if (g_x87_shadow) {
+        TCGv_i64 sb = tcg_temp_new_i64();
+        tcg_gen_mov64f_i64(sb, st0);
+        gen_helper_x87_shadow_fsts(tcg_env, sb, arg);
+    }
+#endif
 }
 
 static void glue(gen_fstl_ST0, PREC_SUFFIX)(DisasContext *s, TCGv_i64 arg)

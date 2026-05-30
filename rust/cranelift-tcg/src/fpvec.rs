@@ -249,35 +249,16 @@ pub(crate) fn lower_fp(l: &mut Lowering<'_, '_>, raw: u16, op: &DecodedOp) -> Re
             l.write_temp(op.oarg(0), v);
             Ok(())
         }
-        18 => {
-            // cvt32i_f32 = fcvt_to_sint f32 -> i32
-            let a = l.read_iarg(op, 0, TcgType::I32)?;
-            let f = bitcast_to_fp(l, a, types::F32);
-            let v = l.builder.ins().fcvt_to_sint(types::I32, f);
-            l.write_temp(op.oarg(0), v);
-            Ok(())
-        }
-        19 => {
-            let a = l.read_iarg(op, 0, TcgType::I64)?;
-            let f = bitcast_to_fp(l, a, types::F64);
-            let v = l.builder.ins().fcvt_to_sint(types::I32, f);
-            l.write_temp(op.oarg(0), v);
-            Ok(())
-        }
-        23 => {
-            let a = l.read_iarg(op, 0, TcgType::I32)?;
-            let f = bitcast_to_fp(l, a, types::F32);
-            let v = l.builder.ins().fcvt_to_sint(types::I64, f);
-            l.write_temp(op.oarg(0), v);
-            Ok(())
-        }
-        24 => {
-            let a = l.read_iarg(op, 0, TcgType::I64)?;
-            let f = bitcast_to_fp(l, a, types::F64);
-            let v = l.builder.ins().fcvt_to_sint(types::I64, f);
-            l.write_temp(op.oarg(0), v);
-            Ok(())
-        }
+        // cvt*f_i* = x87 FIST/FISTP (float -> signed int). Cranelift's
+        // fcvt_to_sint is round-toward-zero (truncate), and Cranelift IR has no
+        // "convert using the dynamic FPCR rounding mode" op, so tier-2 cannot
+        // honor the guest x87 rounding-control bits: it would truncate even
+        // under the games' default RC=nearest (FISTP 2.7 -> 2 instead of 3,
+        // device-confirmed). Forcing nearest() here would instead break the
+        // RC=toward-zero MSVC ftol idiom (e.g. Serious Sam II). Bail the whole
+        // TB to tier-1, whose aarch64 lowering does FRINTI(per-FPCR)+FCVTZS
+        // correctly for any RC. See HANDOFF_math_xpack.md.
+        18 | 19 | 23 | 24 => Err(TransError::UnsupportedOp(raw)),
         // mov32f_i32 / mov32i_f32 / mov64f_i64 / mov64i_f64 are bitcasts.
         27 | 28 | 29 | 30 => {
             let a = l.read_iarg(op, 0, op.ty)?;

@@ -36,6 +36,8 @@
 #include "exec/log.h"
 
 static int g_use_fp_jit;
+/* X1BOX_X87_SHADOW: log native-fp64 vs true-floatx80(PC=53) conversion divergences */
+static int g_x87_shadow;
 
 #if defined(XBOX)
 struct FPUProfileCounters {
@@ -1819,41 +1821,86 @@ static void gen_flush_fp(DisasContext *s)
 #endif
 
 /*
- * Per-group bisection flags for inline FP ops.
- * Set a group to 0 to force that group through helper functions.
- * Set to 1 to use the inline TCG FP ops path.
- *
- * Note: gen_helper_fp_arith_ST0_FT0 / STN_ST0 (add/sub/mul/div/com)
- * are ALWAYS inline (they bypass these macros) and work correctly.
- * sin/cos always use helpers on ARM64. Only these groups are suspects.
+ * Spill the inline x87 FP temp cache to env->fpregs at a boundary where it can
+ * be OBSERVED with the live values otherwise stranded in TEMP_EBB temps:
+ *  - a guest #PF on an x87 memory operand longjmps out (TCG discards the EBB
+ *    temps; x86_restore_state_to_opc restores only EIP/cc_op, not fpregs), and
+ *  - branch/exception/interrupt-terminated TBs emit their exit inside
+ *    disas_insn, so the i386_tr_tb_stop flush is unreachable dead code; an
+ *    async IRQ taken at that boundary (or the next TB) then reads stale fpregs.
+ * gen_flush_fp() resets fpstt_delta=0, so call ONLY where fpstt_delta is still
+ * whole-instruction-consistent with the runtime fpstt (TB-exit funnels and
+ * before a faulting memory access, NOT mid-instruction). Idempotent + cheap
+ * when the cache is empty (8 NULL-guarded slots).
  */
-#define BISECT_GRP_STACK   1  /* fpush, fpop, fmov_*, fxchg_*, enter_mmx */
-#define BISECT_GRP_LOAD_FT 1  /* flds_FT0, fldl_FT0 (load to FT0, no push) */
-#define BISECT_GRP_LOAD_ST 1  /* flds_ST0, fldl_ST0 (push + load to ST0) */
-#define BISECT_GRP_LOAD_I  1  /* fildl_FT0/ST0, fildll_ST0, fld1, fldz (int loads + constants) */
-#define BISECT_GRP_STORE   1  /* fsts_*, fstl_*, fistl_*, fistll_* */
-#define BISECT_GRP_UNARY   1  /* fchs, fabs, fsqrt */
+#if defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__))
+#define X1BOX_FP_SYNC(s) \
+    do { if (g_use_fp_jit && HARD_FPU_HAS_TCG_FP_OPS) { gen_flush_fp(s); } } while (0)
+#else
+#define X1BOX_FP_SYNC(s) do { (void)(s); } while (0)
+#endif
+
+/*
+ * Runtime per-group bisection mask for the native fp64 x87 path.
+ * A set bit = that group uses the inline TCG-native fp64 path; a clear bit =
+ * force that group through the softfloat helper. The choice is made at
+ * translate time, so it applies to BOTH tier-1 and the Cranelift tier-2
+ * recompile (tier-2 just lowers whatever op stream tier-1 emitted).
+ * Default 0xFFFFFFFF (all native). Set via env X1BOX_X87_FP64_MASK
+ * (strtoul base 0), read once in tcg_x86_init.
+ *
+ * Bits: 0 STACK, 1 LOAD_FT, 2 LOAD_ST, 3 LOAD_I, 4 STORE, 5 UNARY,
+ *       6 ARITH (fadd/fsub/fmul/fdiv), 7 COM (fcom/fucom).
+ * sin/cos and the other transcendentals always use helpers on ARM64.
+ */
+static uint32_t g_x87_fp64_mask = 0xFFFFFFFFu;
+
+/*
+ * X1BOX_X87_FLUSH_EACH=1: spill+clear the inline FP temp cache before EVERY x87
+ * instruction, so the native path reloads operands from env->fpregs each insn
+ * (same memory discipline as the softfloat helpers) instead of caching FP regs
+ * in TCG temps across a TB. Diagnostic for the cross-op caching hypothesis: if
+ * Halo 2 physics is correct at fp64_mask=0xFF *with this on*, the cross-op
+ * inline cache (get_stn/flush/fpstt_delta) is the culprit, not any op's logic.
+ */
+static int g_x87_flush_each = 0;
+
+#define FP64GRP_STACK    (1u << 0)
+#define FP64GRP_LOAD_FT  (1u << 1)
+#define FP64GRP_LOAD_ST  (1u << 2)
+#define FP64GRP_LOAD_I   (1u << 3)
+#define FP64GRP_STORE    (1u << 4)
+#define FP64GRP_UNARY    (1u << 5)
+#define FP64GRP_ARITH    (1u << 6)
+#define FP64GRP_COM      (1u << 7)
+
+#define BISECT_GRP_STACK   FP64GRP_STACK    /* fpush, fpop, fmov_*, fxchg_*, enter_mmx */
+#define BISECT_GRP_LOAD_FT FP64GRP_LOAD_FT  /* flds_FT0, fldl_FT0 (load to FT0, no push) */
+#define BISECT_GRP_LOAD_ST FP64GRP_LOAD_ST  /* flds_ST0, fldl_ST0 (push + load to ST0) */
+#define BISECT_GRP_LOAD_I  FP64GRP_LOAD_I   /* fildl_FT0/ST0, fildll_ST0, fld1, fldz */
+#define BISECT_GRP_STORE   FP64GRP_STORE    /* fsts_*, fstl_*, fistl_*, fistll_* */
+#define BISECT_GRP_UNARY   FP64GRP_UNARY    /* fchs, fabs, fsqrt */
 
 #define GEN_HELPER_FALLBACK_v_v(func, grp) do { \
-        if (!g_use_fp_jit || !HARD_FPU_HAS_TCG_FP_OPS || !(grp)) { \
+        if (!g_use_fp_jit || !HARD_FPU_HAS_TCG_FP_OPS || !(g_x87_fp64_mask & (grp))) { \
             gen_helper_ ## func(tcg_env); \
             return; \
         }} while(0)
 
 #define GEN_HELPER_FALLBACK_v_i(func, arg, grp) do { \
-        if (!g_use_fp_jit || !HARD_FPU_HAS_TCG_FP_OPS || !(grp)) { \
+        if (!g_use_fp_jit || !HARD_FPU_HAS_TCG_FP_OPS || !(g_x87_fp64_mask & (grp))) { \
             gen_helper_ ## func(tcg_env, tcg_constant_i32(arg)); \
             return; \
         }} while(0)
 
 #define GEN_HELPER_FALLBACK_v_T(func, arg, grp) do { \
-        if (!g_use_fp_jit || !HARD_FPU_HAS_TCG_FP_OPS || !(grp)) { \
+        if (!g_use_fp_jit || !HARD_FPU_HAS_TCG_FP_OPS || !(g_x87_fp64_mask & (grp))) { \
             gen_helper_ ## func(tcg_env, arg); \
             return; \
         }} while(0)
 
 #define GEN_HELPER_FALLBACK_T_v(func, arg, grp) do { \
-        if (!g_use_fp_jit || !HARD_FPU_HAS_TCG_FP_OPS || !(grp)) { \
+        if (!g_use_fp_jit || !HARD_FPU_HAS_TCG_FP_OPS || !(g_x87_fp64_mask & (grp))) { \
             gen_helper_ ## func(arg, tcg_env); \
             return; \
         }} while(0)
@@ -2058,7 +2105,9 @@ static void gen_fcos(DisasContext *s)
 
 static void gen_helper_fp_arith_ST0_FT0(DisasContext *s, int op)
 {
-    if (g_use_fp_jit && HARD_FPU_HAS_TCG_FP_OPS) {
+    /* op 2/3 are fcom/fucom (COM group); the rest are arithmetic (ARITH). */
+    uint32_t grp = (op == 2 || op == 3) ? FP64GRP_COM : FP64GRP_ARITH;
+    if (g_use_fp_jit && HARD_FPU_HAS_TCG_FP_OPS && (g_x87_fp64_mask & grp)) {
         fp_pc_wrapper(gen_helper_fp_arith_ST0_FT0)(s, op);
     } else {
         switch (op) {
@@ -2098,7 +2147,8 @@ static void gen_fcom_ST0_FT0(DisasContext *s)
 /* NOTE the exception in "r" op ordering */
 static void gen_helper_fp_arith_STN_ST0(DisasContext *s, int op, int opreg)
 {
-    if (g_use_fp_jit && HARD_FPU_HAS_TCG_FP_OPS) {
+    /* STN_ST0 has no compare form; all ops are arithmetic (ARITH group). */
+    if (g_use_fp_jit && HARD_FPU_HAS_TCG_FP_OPS && (g_x87_fp64_mask & FP64GRP_ARITH)) {
         fp_pc_wrapper(gen_helper_fp_arith_STN_ST0)(s, op, opreg);
     } else {
         TCGv_i32 tmp = tcg_constant_i32(opreg);
@@ -2147,6 +2197,7 @@ static void gen_fldz_FT0(DisasContext *s)
 
 static void gen_exception(DisasContext *s, int trapno)
 {
+    X1BOX_FP_SYNC(s);   /* FP cache must reach env->fpregs before the trap unwinds */
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
     gen_helper_raise_exception(tcg_env, tcg_constant_i32(trapno));
@@ -2855,6 +2906,7 @@ static void gen_unknown_opcode(CPUX86State *env, DisasContext *s)
    privilege checks */
 static void gen_interrupt(DisasContext *s, uint8_t intno)
 {
+    X1BOX_FP_SYNC(s);   /* FP cache must reach env->fpregs before the int unwinds */
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
     gen_helper_raise_interrupt(tcg_env, tcg_constant_i32(intno),
@@ -2885,6 +2937,7 @@ gen_eob(DisasContext *s, int mode)
 {
     bool inhibit_reset;
 
+    X1BOX_FP_SYNC(s);   /* spill FP cache before leaving the TB (tb_stop flush is dead code here) */
     gen_update_cc_op(s);
 
     /* If several instructions disable interrupts, only the first does it.  */
@@ -2955,6 +3008,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
 
     if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)) {
         /* jump to same page: we can use a direct jump */
+        X1BOX_FP_SYNC(s);   /* this branch exits the TB without gen_eob */
         tcg_gen_goto_tb(tb_num);
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
             tcg_gen_movi_tl(cpu_eip, new_eip);
@@ -3055,6 +3109,15 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
     int modrm = s->modrm;
     int mod, rm, op;
 
+#if defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__))
+    /* Diagnostic: flush the inline FP temp cache before each x87 insn so the
+     * native path reloads from env->fpregs (no cross-op caching). See
+     * g_x87_flush_each. No-op when fp_jit is off (cache is empty). */
+    if (g_x87_flush_each && g_use_fp_jit && HARD_FPU_HAS_TCG_FP_OPS) {
+        gen_flush_fp(s);
+    }
+#endif
+
 #if defined(XBOX)
     {
         int xop = ((b & 7) << 3) | ((modrm >> 3) & 7);
@@ -3120,6 +3183,11 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
 
         tcg_gen_mov_tl(last_addr, ea);
         gen_lea_v_seg(s, ea, decode->mem.def_seg, s->override);
+
+        /* The qemu_ld/st below can take a guest #PF mid-instruction; spill the
+         * FP cache first so the fault handler sees current env->fpregs.
+         * fpstt_delta is still whole-instruction-consistent at this point. */
+        X1BOX_FP_SYNC(s);
 
         switch (op) {
         case 0x00 ... 0x07: /* fxxxs */
@@ -4395,6 +4463,21 @@ void tcg_x86_init(void)
 
 #if defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__))
     g_use_fp_jit = g_config.perf.fp_jit;
+    {
+        /* Per-group native-fp64 bisection mask; default all-native. */
+        const char *fp64_mask_env = getenv("X1BOX_X87_FP64_MASK");
+        if (fp64_mask_env && *fp64_mask_env) {
+            g_x87_fp64_mask = (uint32_t)strtoul(fp64_mask_env, NULL, 0);
+        }
+        const char *flush_each_env = getenv("X1BOX_X87_FLUSH_EACH");
+        if (flush_each_env && *flush_each_env) {
+            g_x87_flush_each = (int)strtol(flush_each_env, NULL, 0);
+        }
+        const char *shadow_env = getenv("X1BOX_X87_SHADOW");
+        if (shadow_env && *shadow_env) {
+            g_x87_shadow = (int)strtol(shadow_env, NULL, 0);
+        }
+    }
 #endif
 }
 

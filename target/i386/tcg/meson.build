@@ -19,6 +19,7 @@ i386_ss.add(when: 'CONFIG_TCG', if_true: files(
   'seg_helper.c',
   'tcg-cpu.c',
   'translate.c',
+  'x87_shadow.c',
   'x87_lib_shim.cpp'), if_false: files('tcg-stub.c'))
 
 i386_ss.add(when: 'CONFIG_TCG', if_true: x87_lib_dep)

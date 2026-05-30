@@ -669,6 +669,8 @@ typedef enum {
     I_FP1_FNEG_D    = 0x1e614000,
     I_FP1_FSQRT_D   = 0x1e61c000,
     I_FP1_FCVT_SD   = 0x1e624000,  /* FCVT Sd, Dn (double->single) */
+    I_FP1_FRINTI_S  = 0x1e27c000,  /* FRINTI Sd, Sn (round-to-integral, FPCR mode) */
+    I_FP1_FRINTI_D  = 0x1e67c000,  /* FRINTI Dd, Dn (round-to-integral, FPCR mode) */
 
     /* Scalar FP compare -- Rn, Rm */
     I_FPCMP_FCMP_S  = 0x1e202000,
@@ -3487,6 +3489,19 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc, TCGType type,
         tcg_out32(s, I_FPMOV_D_X | (a1 & 0x1f) << 5 | (a0 & 0x1f));
 #endif
         break;
+    /*
+     * x87 FIST/FISTP (the ONLY users of cvt*f_i*): native float->int via FCVTZS
+     * (round toward zero). A prior fix prepended FRINTI (round-to-integral per
+     * FPCR) to honor the guest rounding mode, but FRINTI mangles SUBNORMAL
+     * inputs into a huge garbage int instead of 0 -- device-found via the x87
+     * shadow on Serious Sam II: 18904 subnormal FISTP m64 at level load ->
+     * corrupt collision geometry -> walk-through-floor. Plain FCVTZS handles
+     * subnormals correctly (tiny -> 0) and matches the MSVC ftol idiom (RC=zero)
+     * exactly. It truncates regardless of RC; whether any title needs RC-nearest
+     * rounding here is validated with X1BOX_X87_SHADOW (if so, replace with an
+     * RC-selected FCVTNS/FCVTMS/FCVTPS/FCVTZS, which also handle subnormals).
+     * FISTTP uses its own truncating helper path and never reaches this op.
+     */
     case INDEX_op_cvt32f_i32:
 #if BISECT_FP_CVT
         tcg_out_fpcvt(s, I_FPCVT_FCVTZS_WS, a0, a1);
