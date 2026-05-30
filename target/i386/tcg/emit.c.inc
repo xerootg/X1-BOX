@@ -743,23 +743,25 @@ static int sse_native_fp_sentinel(void)
  *   X1BOX_SSE_INLINE_SUB=1   — SUBSS/SUBSD
  *   X1BOX_SSE_INLINE_MUL=1   — MULSS/MULSD
  *   X1BOX_SSE_INLINE_DIV=1   — DIVSS/DIVSD   (default ON; set =0 to disable)
- *   X1BOX_SSE_INLINE_SQRT=1  — SQRTSS/SQRTSD
+ *   X1BOX_SSE_INLINE_SQRT=1  — SQRTSS/SQRTSD (default ON; set =0 to disable)
  *
- * DIVSS/DIVSD default ON: IEEE-754 division is correctly-rounded, so NEON FDIV
- * is bit-identical to x86 DIVSS under a matched rounding mode. Validated two
- * ways: the SSE-on-NEON sentinel reports add..sqrt all bit-match softfloat on
- * device, and Halo 2 physics is clean on Zenfone 10 with DIV+SQRT-only inline.
- * The 2026-05 "SSE physics drift" that forced all SSE scalar inline OFF was
- * traced to the x87/fp80 path, not this correctly-rounded scalar arith
- * ([[project_sse_neon_physics_drift]]). The sentinel still masks off any op
- * that diverges on a given device's FPCR (e.g. flush-to-zero on subnormals).
+ * DIVSS/DIVSD and SQRTSS/SQRTSD default ON: IEEE-754 div and sqrt are both
+ * correctly-rounded, so NEON FDIV/FSQRT are bit-identical to x86 DIVSS/SQRTSS
+ * under a matched rounding mode. (SQRT is in fact the safest of the five — it
+ * never produces a subnormal from a normal input, so it can't even hit a
+ * flush-to-zero edge.) Validated two ways: the SSE-on-NEON sentinel reports
+ * add..sqrt all bit-match softfloat on device, and Halo 2 physics is clean on
+ * Zenfone 10 with DIV+SQRT-only inline. The 2026-05 "SSE physics drift" that
+ * forced all SSE scalar inline OFF was traced to the x87/fp80 path, not this
+ * correctly-rounded scalar arith ([[project_sse_neon_physics_drift]]). The
+ * sentinel still masks off any op that diverges on a given device's FPCR.
  */
 static int sse_scalar_inline_mask(void)
 {
     static int cached = -1;
     if (cached < 0) {
-        /* DIV default ON — correctly-rounded, sentinel- + physics-validated. */
-        int m = (1u << SSE_FPS_DIV);
+        /* DIV + SQRT default ON — correctly-rounded, sentinel- + physics-validated. */
+        int m = (1u << SSE_FPS_DIV) | (1u << SSE_FPS_SQRT);
         const char *all = getenv("X1BOX_SSE_INLINE");
         if (all && *all && *all != '0') {
             m = (1u << SSE_FPS_ADD) | (1u << SSE_FPS_SUB) | (1u << SSE_FPS_MUL)
