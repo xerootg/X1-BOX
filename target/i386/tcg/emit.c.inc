@@ -557,6 +557,184 @@ typedef enum {
 } SseFpScalarKind;
 
 /*
+ * SSE-on-NEON sentinel — native aarch64 scalar FP vs softfloat reference.
+ *
+ * gen_sse_scalar_inline() lowers ADD/SUB/MUL/DIV/SQRT to host NEON via
+ * tcg_gen_*_f32/f64. NEON executes under the host FPCR, not the guest MXCSR,
+ * so it can diverge from the softfloat helper path if the device's FPCR has
+ * flush-to-zero enabled (subnormal results -> 0) or a non-nearest rounding
+ * mode. The 2026-05 "SSE physics drift" was ultimately attributed to the
+ * x87/fp80 native path rather than this SSE path (2026-05-29), but we still
+ * want a hard guarantee before trusting native NEON by default.
+ *
+ * At first use we push a battery of vectors — including subnormal inputs and
+ * subnormal-producing results, where FTZ/DAZ would bite — through both the
+ * real NEON instruction (inline asm, so it runs at runtime under the live
+ * FPCR and is never constant-folded) and softfloat configured for x86-SSE
+ * defaults (round-nearest, no FTZ/DAZ — mirroring env->sse_status reset in
+ * fpu_helper.c). Any op that disagrees is masked OFF and falls back to the
+ * softfloat helper, so a misbehaving device silently stays correct.
+ *
+ * Mirrors the self-test discipline of x87_shadow.c / the HLE crypto self-test.
+ * Bypass with X1BOX_SSE_SENTINEL=0 (trust native unconditionally).
+ */
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
+#if defined(__aarch64__)
+#define SSE_N_BIN(nm, insn, T, RG)                                          \
+    static inline T sse_n_##nm(T a, T b) {                                  \
+        T r; __asm__ volatile(insn " %" RG "0, %" RG "1, %" RG "2"          \
+                              : "=w"(r) : "w"(a), "w"(b)); return r; }
+#define SSE_N_UN(nm, insn, T, RG)                                           \
+    static inline T sse_n_##nm(T a) {                                       \
+        T r; __asm__ volatile(insn " %" RG "0, %" RG "1"                    \
+                              : "=w"(r) : "w"(a)); return r; }
+SSE_N_BIN(add_s,  "fadd",  float,  "s")
+SSE_N_BIN(sub_s,  "fsub",  float,  "s")
+SSE_N_BIN(mul_s,  "fmul",  float,  "s")
+SSE_N_BIN(div_s,  "fdiv",  float,  "s")
+SSE_N_UN (sqrt_s, "fsqrt", float,  "s")
+SSE_N_BIN(add_d,  "fadd",  double, "d")
+SSE_N_BIN(sub_d,  "fsub",  double, "d")
+SSE_N_BIN(mul_d,  "fmul",  double, "d")
+SSE_N_BIN(div_d,  "fdiv",  double, "d")
+SSE_N_UN (sqrt_d, "fsqrt", double, "d")
+#undef SSE_N_BIN
+#undef SSE_N_UN
+
+static inline uint32_t sse_bits_s(float f)    { uint32_t u; __builtin_memcpy(&u, &f, 4); return u; }
+static inline float    sse_fromb_s(uint32_t u){ float f;    __builtin_memcpy(&f, &u, 4); return f; }
+static inline uint64_t sse_bits_d(double f)   { uint64_t u; __builtin_memcpy(&u, &f, 8); return u; }
+static inline double   sse_fromb_d(uint64_t u){ double f;   __builtin_memcpy(&f, &u, 8); return f; }
+#endif /* __aarch64__ */
+
+static void sse_sentinel_status(float_status *st)
+{
+    memset(st, 0, sizeof(*st));
+    set_float_rounding_mode(float_round_nearest_even, st);
+    set_float_exception_flags(0, st);
+    set_flush_to_zero(false, st);
+    set_flush_inputs_to_zero(false, st);
+    set_float_2nan_prop_rule(float_2nan_prop_x87, st);
+    set_float_3nan_prop_rule(float_3nan_prop_abc, st);
+    set_float_infzeronan_rule(float_infzeronan_dnan_never |
+                              float_infzeronan_suppress_invalid, st);
+    set_float_default_nan_pattern(0b11000000, st);
+    set_float_ftz_detection(float_ftz_after_rounding, st);
+}
+
+/*
+ * Returns a bitmask (1<<SSE_FPS_*) of ops whose native NEON result is
+ * bit-identical to softfloat across the battery. Cached; logs once on Android.
+ */
+static int sse_native_fp_sentinel(void)
+{
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    const int all = (1u << SSE_FPS_ADD) | (1u << SSE_FPS_SUB)
+                  | (1u << SSE_FPS_MUL) | (1u << SSE_FPS_DIV)
+                  | (1u << SSE_FPS_SQRT);
+#if !defined(__aarch64__)
+    /* x86_64 dev host: native SSE shares the guest's x86 FP semantics. */
+    cached = all;
+    return cached;
+#else
+    const char *byp = getenv("X1BOX_SSE_SENTINEL");
+    if (byp && *byp == '0') {
+        cached = all;
+        return cached;
+    }
+
+    float_status st;
+    sse_sentinel_status(&st);
+
+    /* f32 operand patterns: subnormal in/out, rounding, plain normals. */
+    static const uint32_t v32[][2] = {
+        { 0x3F800000u, 0x33800000u }, /* 1.0 + 2^-24: round-to-even tie     */
+        { 0x40490FDBu, 0x3EAAAAABu }, /* pi * 1/3:    inexact, rounds        */
+        { 0x00800000u, 0x40800000u }, /* FLT_MIN / 4: subnormal quotient     */
+        { 0x00800000u, 0x3F000000u }, /* FLT_MIN * .5: subnormal product     */
+        { 0x00000100u, 0x3F800000u }, /* subnormal * 1: subnormal preserved  */
+        { 0x00800001u, 0x00800000u }, /* normals, subnormal difference       */
+        { 0x00000004u, 0x00000002u }, /* subnormal +/- subnormal             */
+        { 0x40000000u, 0x3FC00000u }, /* 2.0, 1.5: exact sanity              */
+    };
+    static const uint64_t v64[][2] = {
+        { 0x3FF0000000000000ull, 0x3CA0000000000000ull }, /* 1.0 + 2^-53 tie */
+        { 0x400921FB54442D18ull, 0x3FD5555555555555ull }, /* pi * 1/3        */
+        { 0x0010000000000000ull, 0x4010000000000000ull }, /* DBL_MIN / 4     */
+        { 0x0010000000000000ull, 0x3FE0000000000000ull }, /* DBL_MIN * .5    */
+        { 0x0000000000000100ull, 0x3FF0000000000000ull }, /* subnormal * 1   */
+        { 0x4000000000000000ull, 0x3FF8000000000000ull }, /* 2.0, 1.5        */
+    };
+
+    int ok = all;
+    for (size_t i = 0; i < ARRAY_SIZE(v32); i++) {
+        uint32_t a = v32[i][0], b = v32[i][1], sq = a & 0x7FFFFFFFu;
+        struct { int bit; uint32_t nat; float32 ref; } c[] = {
+            { SSE_FPS_ADD,  sse_bits_s(sse_n_add_s(sse_fromb_s(a), sse_fromb_s(b))),
+              float32_add(make_float32(a), make_float32(b), &st) },
+            { SSE_FPS_SUB,  sse_bits_s(sse_n_sub_s(sse_fromb_s(a), sse_fromb_s(b))),
+              float32_sub(make_float32(a), make_float32(b), &st) },
+            { SSE_FPS_MUL,  sse_bits_s(sse_n_mul_s(sse_fromb_s(a), sse_fromb_s(b))),
+              float32_mul(make_float32(a), make_float32(b), &st) },
+            { SSE_FPS_DIV,  sse_bits_s(sse_n_div_s(sse_fromb_s(a), sse_fromb_s(b))),
+              float32_div(make_float32(a), make_float32(b), &st) },
+            { SSE_FPS_SQRT, sse_bits_s(sse_n_sqrt_s(sse_fromb_s(sq))),
+              float32_sqrt(make_float32(sq), &st) },
+        };
+        for (size_t k = 0; k < ARRAY_SIZE(c); k++) {
+            if (c[k].nat != float32_val(c[k].ref) &&
+                !(float32_is_any_nan(make_float32(c[k].nat)) &&
+                  float32_is_any_nan(c[k].ref))) {
+                ok &= ~(1u << c[k].bit);
+            }
+        }
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(v64); i++) {
+        uint64_t a = v64[i][0], b = v64[i][1], sq = a & 0x7FFFFFFFFFFFFFFFull;
+        struct { int bit; uint64_t nat; float64 ref; } c[] = {
+            { SSE_FPS_ADD,  sse_bits_d(sse_n_add_d(sse_fromb_d(a), sse_fromb_d(b))),
+              float64_add(make_float64(a), make_float64(b), &st) },
+            { SSE_FPS_SUB,  sse_bits_d(sse_n_sub_d(sse_fromb_d(a), sse_fromb_d(b))),
+              float64_sub(make_float64(a), make_float64(b), &st) },
+            { SSE_FPS_MUL,  sse_bits_d(sse_n_mul_d(sse_fromb_d(a), sse_fromb_d(b))),
+              float64_mul(make_float64(a), make_float64(b), &st) },
+            { SSE_FPS_DIV,  sse_bits_d(sse_n_div_d(sse_fromb_d(a), sse_fromb_d(b))),
+              float64_div(make_float64(a), make_float64(b), &st) },
+            { SSE_FPS_SQRT, sse_bits_d(sse_n_sqrt_d(sse_fromb_d(sq))),
+              float64_sqrt(make_float64(sq), &st) },
+        };
+        for (size_t k = 0; k < ARRAY_SIZE(c); k++) {
+            if (c[k].nat != float64_val(c[k].ref) &&
+                !(float64_is_any_nan(make_float64(c[k].nat)) &&
+                  float64_is_any_nan(c[k].ref))) {
+                ok &= ~(1u << c[k].bit);
+            }
+        }
+    }
+
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "x1box-ssesentinel",
+        "native NEON vs softfloat: add=%d sub=%d mul=%d div=%d sqrt=%d (1=match)",
+        (ok >> SSE_FPS_ADD) & 1, (ok >> SSE_FPS_SUB) & 1, (ok >> SSE_FPS_MUL) & 1,
+        (ok >> SSE_FPS_DIV) & 1, (ok >> SSE_FPS_SQRT) & 1);
+    if (ok != all) {
+        __android_log_print(ANDROID_LOG_WARN, "x1box-ssesentinel",
+            "DIVERGENCE: op mask 0x%x forced to softfloat (host FPCR FTZ/rounding?)",
+            (unsigned)(all & ~ok));
+    }
+#endif
+    cached = ok;
+    return cached;
+#endif /* __aarch64__ */
+}
+
+/*
  * Per-op gating env vars so the Bungie-screen regression can be bisected:
  *   X1BOX_SSE_INLINE=1      — enables all five ops at once
  *   X1BOX_SSE_INLINE_ADD=1  — just ADDSS/ADDSD
@@ -592,7 +770,8 @@ static int sse_scalar_inline_mask(void)
                 m |= 1u << per[i].bit;
             }
         }
-        cached = m;
+        /* Never inline an op the sentinel found diverges from softfloat. */
+        cached = m & sse_native_fp_sentinel();
     }
     return cached;
 }
