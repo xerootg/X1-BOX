@@ -1730,13 +1730,13 @@ static int overlay_gpu_pct(void)
     return -1;
 }
 
-extern "C" JNIEXPORT jint JNICALL
+extern "C" JNIEXPORT jint JNICALL __attribute__((used))
 Java_com_izzy2lost_x1box_MainActivity_nativeGetCpuUsagePct(JNIEnv *, jobject)
 {
     return (jint)overlay_cpu_pct();
 }
 
-extern "C" JNIEXPORT jint JNICALL
+extern "C" JNIEXPORT jint JNICALL __attribute__((used))
 Java_com_izzy2lost_x1box_MainActivity_nativeGetGpuFreqPct(JNIEnv *, jobject)
 {
     return (jint)overlay_gpu_pct();
