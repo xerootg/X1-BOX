@@ -693,6 +693,28 @@ TranslationBlock *inv_tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
  *
  * Returns: an existing translation block or NULL.
  */
+#ifdef XBOX
+/*
+ * Record the jmp_cache slot a TB is cached at, so tb_jmp_cache_inval_tb can
+ * clear exactly that slot in O(1) instead of flushing the whole 8192-entry
+ * cache (a CF_PCREL TB otherwise forces a full flush on every invalidation —
+ * the dominant TB-churn cost). The hash is CPU-independent so one slot value
+ * is valid for all CPUs. A TB later cached at a DIFFERENT slot (the same
+ * physical code aliased at a second vaddr) escalates to JC_SLOT_MULTI, and
+ * invalidation falls back to a full flush so every occupied slot is cleared.
+ * Benign under races (worst case escalates to MULTI -> flush, still correct).
+ */
+static inline void xemu_jc_record_slot(TranslationBlock *tb, uint32_t hash)
+{
+    int32_t prev = qatomic_read(&tb->jc_slot);
+    if (prev == JC_SLOT_NONE) {
+        qatomic_set(&tb->jc_slot, (int32_t)hash);
+    } else if (prev != (int32_t)hash && prev != JC_SLOT_MULTI) {
+        qatomic_set(&tb->jc_slot, JC_SLOT_MULTI);
+    }
+}
+#endif
+
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     TranslationBlock *tb;
@@ -727,6 +749,9 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 
     jc->array[hash].pc = s.pc;
     qatomic_set(&jc->array[hash].tb, tb);
+#ifdef XBOX
+    xemu_jc_record_slot(tb, hash);
+#endif
 
 hit:
     /*
@@ -2351,6 +2376,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 jc = cpu->tb_jmp_cache;
                 jc->array[h].pc = s.pc;
                 qatomic_set(&jc->array[h].tb, tb);
+#ifdef XBOX
+                xemu_jc_record_slot(tb, h);
+#endif
             } else {
                 tb_cache_notify_lookup_hit();
             }

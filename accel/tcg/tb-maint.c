@@ -929,15 +929,58 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
     qemu_spin_unlock(&dest->jmp_lock);
 }
 
+#ifdef XBOX
+/* O(1) CF_PCREL invalidation gate. Default ON; X1BOX_JC_INVAL_O1=0 forces the
+ * old full-flush path (A/B comparison / emergency revert without a rebuild). */
+static int jc_inval_o1_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("X1BOX_JC_INVAL_O1");
+        cached = (v && *v == '0') ? 0 : 1;
+    }
+    return cached;
+}
+#endif
+
 static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
 {
     CPUState *cpu;
 
     if (tb_cflags(tb) & CF_PCREL) {
+#ifdef XBOX
+        /*
+         * O(1) invalidation: a CF_PCREL TB records the single jmp_cache slot
+         * it occupies (hash(vaddr) — CPU-independent) in tb->jc_slot. Clear
+         * just that slot on each CPU rather than flushing all 8192 entries.
+         * The upstream path flushed the WHOLE cache on every invalidation
+         * (~764/s on Halo 2 / SS2), cratering jc_hit% and driving the
+         * tb_htable_lookup churn cost. A TB cached at more than one vaddr is
+         * marked JC_SLOT_MULTI and falls back to a full flush (rare aliasing).
+         */
+        int32_t slot = qatomic_read(&tb->jc_slot);
+        if (jc_inval_o1_enabled() && slot != JC_SLOT_MULTI) {
+            if (slot >= 0) {
+                CPU_FOREACH(cpu) {
+                    CPUJumpCache *jc = cpu->tb_jmp_cache;
+                    if (qatomic_read(&jc->array[slot].tb) == tb) {
+                        qatomic_set(&jc->array[slot].tb, NULL);
+                    }
+                }
+            }
+            /* JC_SLOT_NONE: never cached -> nothing to clear. */
+        } else {
+            /* JC_SLOT_MULTI (aliased), or O(1) disabled -> full flush. */
+            CPU_FOREACH(cpu) {
+                tcg_flush_jmp_cache(cpu);
+            }
+        }
+#else
         /* A TB may be at any virtual address */
         CPU_FOREACH(cpu) {
             tcg_flush_jmp_cache(cpu);
         }
+#endif
     } else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
 

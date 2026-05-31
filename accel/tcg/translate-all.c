@@ -490,6 +490,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     tb->chain_count[0] = 0;
     tb->chain_count[1] = 0;
     tb->superblock = NULL;
+    /* Same "bump allocator doesn't clear + arena recycle" reasoning as above:
+     * a recycled TB must start uncached, or its first invalidation would clear
+     * (or MULTI-flush on) a jmp_cache slot belonging to a previous tenant. */
+    tb->jc_slot = JC_SLOT_NONE;
 
     /* Check if this PC has a pending tier-1 promotion request. */
     {
@@ -1135,6 +1139,10 @@ TranslationBlock *tb_gen_superblock(CPUState *cpu,
     tb->chain_count[0] = 0;
     tb->chain_count[1] = 0;
     tb->superblock = NULL;
+    /* Same "bump allocator doesn't clear + arena recycle" reasoning as above:
+     * a recycled TB must start uncached, or its first invalidation would clear
+     * (or MULTI-flush on) a jmp_cache slot belonging to a previous tenant. */
+    tb->jc_slot = JC_SLOT_NONE;
     tb_set_page_addr0(tb, phys_pc_a);
     tb_set_page_addr1(tb, (phys_pc_a != phys_pc_b) ? phys_pc_b : -1);
     tb_lock_page0(phys_pc_a);

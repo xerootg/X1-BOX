@@ -189,6 +189,18 @@ struct TranslationBlock {
     uint8_t  cranelift_pending;
     uint32_t chain_count[2]; /* How many times each exit was taken */
     SuperblockInfo *superblock; /* Non-NULL if this is a merged superblock */
+    /*
+     * jmp_cache slot this TB occupies, for O(1) CF_PCREL invalidation.
+     * tb_jmp_cache_hash_func(vaddr) is CPU-independent, so a single slot
+     * value covers every CPU's cache: tb_jmp_cache_inval_tb clears just this
+     * slot instead of flushing all TB_JMP_CACHE_SIZE (8192) entries — which a
+     * CF_PCREL TB otherwise forces on every invalidation. Recorded at the two
+     * jmp_cache insert sites in cpu-exec.c, cleared in accel/tcg/tb-maint.c,
+     * reset here-style in tb_gen_code (the bump allocator does not clear).
+     */
+    int32_t jc_slot;
+#define JC_SLOT_NONE  (-1)  /* never cached in the jmp_cache -> nothing to clear */
+#define JC_SLOT_MULTI (-2)  /* cached at >1 vaddr (aliased) -> fall back to flush */
 #endif
 };
 
