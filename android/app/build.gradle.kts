@@ -69,8 +69,8 @@ android {
         arguments += listOf(
           "-DXEMU_ANDROID_BUILD_ID=3",
           "-DXEMU_ENABLE_XISO_CONVERTER=ON",
-          "-DCMAKE_C_FLAGS_DEBUG=-O2 -g0",
-          "-DCMAKE_CXX_FLAGS_DEBUG=-O2 -g0",
+          "-DCMAKE_C_FLAGS_DEBUG=-O2 -g0 -fvisibility=hidden",
+          "-DCMAKE_CXX_FLAGS_DEBUG=-O2 -g0 -fvisibility=hidden -fvisibility-inlines-hidden",
           "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O3 -funroll-loops -g0 -fvisibility=hidden",
           "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O3 -funroll-loops -g0 -fvisibility=hidden",
           "-DCMAKE_C_FLAGS_RELEASE=-O3 -funroll-loops -g0 -fvisibility=hidden",
