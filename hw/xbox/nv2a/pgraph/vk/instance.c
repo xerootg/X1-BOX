@@ -581,35 +581,41 @@ static bool select_physical_device(PGRAPHState *pg, Error **errp)
                             "enabling Mali descriptor-prefetch tail reservation");
 
         /*
-         * Mali stock driver: serialise CPU↔GPU to 1 in-flight frame.
+         * Mali CPU↔GPU pipeline depth.
          *
-         * The pgraph_vk descriptor-set ring assumes that updates to a
-         * slot at index N happen only after every command buffer that
-         * referenced N has retired. With ≥2 frames in flight on Mali
-         * we hit a deterministic GPU hang ~25 submits in: the Khronos
-         * validator reports `vkCmdBindIndexBuffer added to CB invalid
-         * because bound VkDescriptorSet was destroyed or updated`,
-         * Mali firmware faults on that draw, kcpu fence never signals,
-         * vkWaitForFences returns VK_ERROR_DEVICE_LOST (-4). The crash
-         * surfaces at draw.c flush_all_frames or renderer.c framebuffer-
-         * surface wait, but the cause is the in-flight descriptor reuse.
+         * HISTORY: the pgraph_vk descriptor-set ring assumes a slot at
+         * index N is only updated after every CB that referenced N has
+         * retired. With a SHARED ring across ≥2 in-flight frames Mali
+         * hung deterministically ~25 submits in (validator:
+         * `bound VkDescriptorSet was destroyed or updated`, firmware
+         * fault, fence never signals → VK_ERROR_DEVICE_LOST). We used to
+         * clamp to 1 frame (zero overlap, frame time = CPU+GPU).
          *
-         * Forcing num_active_frames = 1 (handled at runtime by
-         * pgraph_vk_finish's desired_frames check) makes every submit
-         * wait on its own fence before reusing descriptor slots —
-         * eliminates the race entirely. Costs CPU/GPU overlap, gains
-         * BIOS animation that actually completes.
+         * FIX (2026-05-30): the pooled CIS ring (and bindless-UBO ring)
+         * are now PARTITIONED into num_active_frames disjoint windows —
+         * frame K writes only [K*W, (K+1)*W). A frame never updates a set
+         * another in-flight frame's CB binds, so the reuse race is gone
+         * and we can run ≥2 frames for real CPU↔GPU overlap. (The push
+         * UBO ring keeps its drained-only rewind; Mali has no push path.)
          *
-         * Once we have a correct fix for the descriptor lifecycle
-         * (per-state-hash sets or explicit per-CB descriptor tracking)
-         * we can lift this serialisation.
+         * Default to 2 (one frame of pipeline headroom). X1BOX_VK_SUBMIT_FRAMES
+         * overrides for soak/bisect (1 = old serialised behavior; 3 = deeper
+         * pipeline once 2 is proven). Clamped to [1, NUM_SUBMIT_FRAMES].
          */
         extern void xemu_set_submit_frames(int);
-        xemu_set_submit_frames(1);
+        int mali_frames = 2;
+        const char *env = getenv("X1BOX_VK_SUBMIT_FRAMES");
+        if (env && env[0]) {
+            int v = atoi(env);
+            if (v >= 1 && v <= NUM_SUBMIT_FRAMES) {
+                mali_frames = v;
+            }
+        }
+        xemu_set_submit_frames(mali_frames);
         __android_log_print(ANDROID_LOG_INFO, "xemu-vulkan",
-                            "Mali stock driver: clamped submit_frames=1 "
-                            "to avoid descriptor lifetime race "
-                            "(VK_ERROR_DEVICE_LOST workaround)");
+                            "Mali: submit_frames=%d (per-frame descriptor-ring "
+                            "partition; X1BOX_VK_SUBMIT_FRAMES to override)",
+                            mali_frames);
     }
 #endif
 

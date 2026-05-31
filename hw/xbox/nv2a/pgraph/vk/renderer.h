@@ -1214,6 +1214,14 @@ typedef struct PGRAPHVkState {
     int descriptor_set_count;
     int descriptor_set_index;
     int descriptor_set_base_count;
+    /* Per-frame partition of the pooled CIS ring (GPU_QUIRK / Mali multi-frame
+     * safety): frame slot K writes only [window_base, window_base+window_size).
+     * window_size = base_count / num_active_frames (floor), window_base =
+     * current_frame * window_size. At num_active_frames==1 this is the full ring
+     * (base 0, size base_count) — identical to the unpartitioned behavior.
+     * descriptor_set_index stays a flat cursor living inside the window. */
+    int descriptor_set_window_base;
+    int descriptor_set_window_size;
     bool need_descriptor_rebind;
 
     GArray *descriptor_overflow_pools;
@@ -1228,6 +1236,10 @@ typedef struct PGRAPHVkState {
     int ubo_descriptor_set_count;
     int ubo_descriptor_set_index;
     int ubo_descriptor_set_base_count;
+    /* Per-frame partition of the bindless UBO ring (mirror of the pooled-ring
+     * window above; only live when bindless is enabled). */
+    int ubo_descriptor_set_window_base;
+    int ubo_descriptor_set_window_size;
     uint64_t bindless_slot_bitmap[MAX_BINDLESS_TEXTURES / 64];
 #endif
 
@@ -1756,6 +1768,11 @@ void pgraph_vk_flush_all_frames(PGRAPHState *pg);
  * pgraph_vk_flush_all_frames(). Used to gate RT->texture sampling and surface
  * image reuse on the specific surface's write rather than a blanket flush. */
 void pgraph_vk_wait_for_submit(PGRAPHState *pg, uint32_t submit_idx);
+/* Recompute the per-frame descriptor-ring windows (pooled CIS + bindless UBO)
+ * from base_count / num_active_frames / current_frame. Call after init (base_count
+ * set), on a frame-count change, and after a rotation changes current_frame. At
+ * num_active_frames==1 the window is the full ring (base 0). */
+void pgraph_vk_recompute_descriptor_windows(PGRAPHVkState *r);
 void pgraph_vk_flush_draw(NV2AState *d);
 void pgraph_vk_flush_draw_queue(NV2AState *d);
 void pgraph_vk_flush_reorder_window(NV2AState *d);

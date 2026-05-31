@@ -495,6 +495,12 @@ void pgraph_vk_reclaim_descriptor_overflow(PGRAPHVkState *r)
             r->push_ubo_sets,
             r->push_ubo_set_base_count * sizeof(VkDescriptorSet));
     }
+
+    /* Initialize the per-frame descriptor-ring windows. base_count is set just
+     * above and num_active_frames was set in pgraph_vk_init_command_buffers
+     * (renderer.c calls it before pgraph_vk_init_shaders), so both inputs are
+     * valid here. At num_active_frames==1 this yields the full ring. */
+    pgraph_vk_recompute_descriptor_windows(r);
 }
 
 void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
@@ -519,37 +525,27 @@ void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
 
     bool push_desc = use_push_descriptors(r);
 
-#if OPT_BINDLESS_TEXTURES
+    /* ds_wbase_ptr/ds_wsize_ptr select the per-frame window for the partitioned
+     * rings; NULL = unpartitioned (push ring, or any ring at 1 frame collapses
+     * to base 0 anyway). ds_wbase/ds_wlimit below fold both cases uniformly. */
     int *ds_index_ptr;
     int *ds_count_ptr;
+    int *ds_wbase_ptr = NULL;
+    int *ds_wsize_ptr = NULL;
     VkDescriptorSet **ds_array_ptr;
     VkDescriptorSetLayout ds_layout;
     bool ds_include_samplers;
+#if OPT_BINDLESS_TEXTURES
     if (r->bindless_textures_supported) {
         ds_index_ptr = &r->ubo_descriptor_set_index;
         ds_count_ptr = &r->ubo_descriptor_set_count;
         ds_array_ptr = &r->ubo_descriptor_sets;
+        ds_wbase_ptr = &r->ubo_descriptor_set_window_base;
+        ds_wsize_ptr = &r->ubo_descriptor_set_window_size;
         ds_layout = r->ubo_set_layout;
         ds_include_samplers = false;
-    } else if (push_desc) {
-        ds_index_ptr = &r->push_ubo_set_index;
-        ds_count_ptr = &r->push_ubo_set_count;
-        ds_array_ptr = &r->push_ubo_sets;
-        ds_layout = r->push_ubo_set_layout;
-        ds_include_samplers = false;
-    } else {
-        ds_index_ptr = &r->descriptor_set_index;
-        ds_count_ptr = &r->descriptor_set_count;
-        ds_array_ptr = &r->descriptor_sets;
-        ds_layout = r->descriptor_set_layout;
-        ds_include_samplers = true;
-    }
-#else
-    int *ds_index_ptr;
-    int *ds_count_ptr;
-    VkDescriptorSet **ds_array_ptr;
-    VkDescriptorSetLayout ds_layout;
-    bool ds_include_samplers;
+    } else
+#endif
     if (push_desc) {
         ds_index_ptr = &r->push_ubo_set_index;
         ds_count_ptr = &r->push_ubo_set_count;
@@ -560,10 +556,18 @@ void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
         ds_index_ptr = &r->descriptor_set_index;
         ds_count_ptr = &r->descriptor_set_count;
         ds_array_ptr = &r->descriptor_sets;
+        ds_wbase_ptr = &r->descriptor_set_window_base;
+        ds_wsize_ptr = &r->descriptor_set_window_size;
         ds_layout = r->descriptor_set_layout;
         ds_include_samplers = true;
     }
-#endif
+
+    /* Window-relative bounds: partitioned rings use [wbase, wbase+wsize); the
+     * push ring (wbase_ptr==NULL) uses the full [0, count). At 1 frame the
+     * pooled/ubo window is also [0, count), so this is behavior-preserving. */
+    int ds_wbase = ds_wbase_ptr ? *ds_wbase_ptr : 0;
+    int ds_wlimit = ds_wbase_ptr ? (*ds_wbase_ptr + *ds_wsize_ptr)
+                                 : *ds_count_ptr;
 
     bool tex_triggers_new_set = !push_desc && (
 #if OPT_BINDLESS_TEXTURES
@@ -575,13 +579,13 @@ void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
         r->shader_bindings_changed ||
         tex_triggers_new_set ||
         r->need_descriptor_rebind ||
-        !(*ds_index_ptr);
+        (*ds_index_ptr == ds_wbase);
 
-    if (need_new_descriptor_set && *ds_index_ptr >= *ds_count_ptr) {
+    if (need_new_descriptor_set && *ds_index_ptr >= ds_wlimit) {
         OPT_STAT_INC(buf_ds_full);
         pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
         pgraph_vk_flush_all_frames(pg);
-        *ds_index_ptr = 0;
+        *ds_index_ptr = ds_wbase;
     }
 
     if (r->uniforms_changed) {
@@ -665,7 +669,7 @@ void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
         r->shader_bindings_changed ||
         tex_triggers_new_set ||
         r->need_descriptor_rebind ||
-        !(*ds_index_ptr);
+        (*ds_index_ptr == ds_wbase);
 
     if (!need_new_descriptor_set) {
         return;
@@ -673,18 +677,18 @@ void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
 
     if (need_new_descriptor_set &&
         !r->shader_bindings_changed && !r->texture_bindings_changed &&
-        *ds_index_ptr > 0) {
+        *ds_index_ptr > ds_wbase) {
         OPT_STAT_INC(desc_rebind_skips);
         r->need_descriptor_rebind = false;
         return;
     }
     OPT_STAT_INC(desc_rebind_full);
 
-    if (*ds_index_ptr >= *ds_count_ptr) {
+    if (*ds_index_ptr >= ds_wlimit) {
         OPT_STAT_INC(buf_ds_full);
         pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
         pgraph_vk_flush_all_frames(pg);
-        *ds_index_ptr = 0;
+        *ds_index_ptr = ds_wbase;
     }
 
     assert(*ds_index_ptr < *ds_count_ptr);

@@ -2390,6 +2390,20 @@ const enum NV2A_PROF_COUNTERS_ENUM finish_reason_to_counter_enum[] = {
     [VK_FINISH_REASON_STALLED] = NV2A_PROF_FINISH_STALLED,
 };
 
+void pgraph_vk_recompute_descriptor_windows(PGRAPHVkState *r)
+{
+    int nf = r->num_active_frames > 0 ? r->num_active_frames : 1;
+    int cf = r->current_frame;
+    /* FLOOR division: windows never overlap; base_count % nf sets at the top of
+     * the ring stay unused. At nf==1 size==base_count, base==0 (full ring). */
+    r->descriptor_set_window_size = r->descriptor_set_base_count / nf;
+    r->descriptor_set_window_base = cf * r->descriptor_set_window_size;
+#if OPT_BINDLESS_TEXTURES
+    r->ubo_descriptor_set_window_size = r->ubo_descriptor_set_base_count / nf;
+    r->ubo_descriptor_set_window_base = cf * r->ubo_descriptor_set_window_size;
+#endif
+}
+
 void pgraph_vk_wait_for_submit(PGRAPHState *pg, uint32_t submit_idx)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
@@ -2442,11 +2456,13 @@ void pgraph_vk_flush_all_frames(PGRAPHState *pg)
     }
     pgraph_vk_reclaim_descriptor_overflow(r);
 
-    // All GPU work is complete — safe to reuse all descriptor sets
-    r->descriptor_set_index = 0;
+    // All GPU work is complete — safe to reuse all descriptor sets. Rewind to
+    // the CURRENT frame's window base (not 0): current_frame may be nonzero, and
+    // the next draws must write inside this frame's window. At 1 frame base==0.
+    r->descriptor_set_index = r->descriptor_set_window_base;
     r->push_ubo_set_index = 0;
 #if OPT_BINDLESS_TEXTURES
-    r->ubo_descriptor_set_index = 0;
+    r->ubo_descriptor_set_index = r->ubo_descriptor_set_window_base;
 #endif
     pgraph_vk_compute_finish_complete(r);
 }
@@ -2513,6 +2529,14 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
         r->command_buffer = r->command_buffers[0];
         r->aux_command_buffer = r->command_buffers[1];
         r->command_buffer_fence = r->frame_fences[0];
+        /* Frame count changed: re-partition the descriptor rings and rebase the
+         * write cursors into the new current-frame (0) window. flush_all_frames
+         * above already drained, so every window is idle. */
+        pgraph_vk_recompute_descriptor_windows(r);
+        r->descriptor_set_index = r->descriptor_set_window_base;
+#if OPT_BINDLESS_TEXTURES
+        r->ubo_descriptor_set_index = r->ubo_descriptor_set_window_base;
+#endif
     }
 
     assert(!r->in_draw);
@@ -2686,11 +2710,12 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
                 }
 
                 /* Immediate submit: GPU done, descriptor sets safe to
-                 * reuse */
-                r->descriptor_set_index = 0;
+                 * reuse. Rewind to this frame's window base (current_frame
+                 * unchanged here). */
+                r->descriptor_set_index = r->descriptor_set_window_base;
                 r->push_ubo_set_index = 0;
 #if OPT_BINDLESS_TEXTURES
-                r->ubo_descriptor_set_index = 0;
+                r->ubo_descriptor_set_index = r->ubo_descriptor_set_window_base;
 #endif
                 pgraph_vk_compute_finish_complete(r);
             }
@@ -2769,11 +2794,12 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
                     pgraph_vk_complete_staged_downloads(d, r);
                 }
 
-                /* Non-deferred: GPU done, descriptor sets safe to reuse */
-                r->descriptor_set_index = 0;
+                /* Non-deferred: GPU done, descriptor sets safe to reuse.
+                 * Rewind to this frame's window base. */
+                r->descriptor_set_index = r->descriptor_set_window_base;
                 r->push_ubo_set_index = 0;
 #if OPT_BINDLESS_TEXTURES
-                r->ubo_descriptor_set_index = 0;
+                r->ubo_descriptor_set_index = r->ubo_descriptor_set_window_base;
 #endif
                 pgraph_vk_compute_finish_complete(r);
             }
@@ -2861,9 +2887,15 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
                 r->frame_staging[next_frame].staging_src.buffer_offset = 0;
             }
 
-            /* Oldest frame's fence has been waited — its descriptor sets
-             * are safe to reuse. Check if any other frame slot is still
-             * in flight; if not, we can reset indices to 0. */
+            /* The pooled / bindless-UBO rings are rebased into next_frame's
+             * window below (after current_frame advances) — each frame writes
+             * only its own disjoint window, so they no longer need the
+             * all-slots-retired scan. The PUSH-UBO ring (Adreno) is NOT
+             * partitioned and its sets are persistent (vkUpdateDescriptorSets),
+             * so it keeps its original drained-only rewind: reset to 0 only when
+             * no other frame slot is in flight, else a still-in-flight CB could
+             * bind a set the next frame overwrites. The compute ring shares that
+             * drained-only reset (it otherwise self-gates at its own exhaustion). */
             {
                 bool any_in_flight = false;
                 for (int i = 0; i < r->num_active_frames; i++) {
@@ -2873,11 +2905,7 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
                     }
                 }
                 if (!any_in_flight) {
-                    r->descriptor_set_index = 0;
                     r->push_ubo_set_index = 0;
-#if OPT_BINDLESS_TEXTURES
-                    r->ubo_descriptor_set_index = 0;
-#endif
                     pgraph_vk_compute_finish_complete(r);
                 }
             }
@@ -2922,6 +2950,17 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
             r->command_buffer = r->command_buffers[next_frame * 2];
             r->aux_command_buffer = r->command_buffers[next_frame * 2 + 1];
             r->command_buffer_fence = r->frame_fences[next_frame];
+
+            /* Advance the partitioned descriptor-ring write cursors into
+             * next_frame's window. next_frame's fence was waited above, so its
+             * window is idle and safe to overwrite; the previously-current frame
+             * stays in flight in its own (disjoint) window. (push_ubo handled by
+             * the drained-only reset above; it is not partitioned.) */
+            pgraph_vk_recompute_descriptor_windows(r);
+            r->descriptor_set_index = r->descriptor_set_window_base;
+#if OPT_BINDLESS_TEXTURES
+            r->ubo_descriptor_set_index = r->ubo_descriptor_set_window_base;
+#endif
             /*
              * Bump uniform_staging_gen: cached_uniform_buffer_offsets
              * on every ShaderBinding now point into the PREVIOUS
@@ -3057,14 +3096,14 @@ static void begin_pre_draw(PGRAPHState *pg)
         else if (r->uniforms_changed)    { OPT_STAT_INC(sfp_miss_uniforms); sfp_ok = false; }
 #if OPT_BINDLESS_TEXTURES
         else if (r->bindless_textures_supported
-                     ? (r->ubo_descriptor_set_index <= 0)
+                     ? (r->ubo_descriptor_set_index <= r->ubo_descriptor_set_window_base)
                      : r->push_descriptors_supported
                          ? (r->push_ubo_set_index <= 0)
-                         : (r->descriptor_set_index <= 0)) { OPT_STAT_INC(sfp_miss_no_desc); sfp_ok = false; }
+                         : (r->descriptor_set_index <= r->descriptor_set_window_base)) { OPT_STAT_INC(sfp_miss_no_desc); sfp_ok = false; }
 #else
         else if (r->push_descriptors_supported
                      ? (r->push_ubo_set_index <= 0)
-                     : (r->descriptor_set_index <= 0)) { OPT_STAT_INC(sfp_miss_no_desc); sfp_ok = false; }
+                     : (r->descriptor_set_index <= r->descriptor_set_window_base)) { OPT_STAT_INC(sfp_miss_no_desc); sfp_ok = false; }
 #endif
 #if OPT_BINDLESS_TEXTURES
         else if (!r->bindless_textures_supported &&
@@ -3326,17 +3365,17 @@ static void begin_pre_draw(PGRAPHState *pg)
         !r->need_descriptor_rebind &&
 #if OPT_BINDLESS_TEXTURES
         (r->bindless_textures_supported
-             ? (r->ubo_descriptor_set_index > 0)
+             ? (r->ubo_descriptor_set_index > r->ubo_descriptor_set_window_base)
              : r->push_descriptors_supported
                  ? (r->push_ubo_set_index > 0)
-                 : (r->descriptor_set_index > 0)) &&
+                 : (r->descriptor_set_index > r->descriptor_set_window_base)) &&
         (r->bindless_textures_supported || r->push_descriptors_supported ||
              (pg->texture_state_gen == r->last_texture_state_gen &&
               r->texture_vram_gen == r->last_texture_vram_gen)) &&
 #else
         (r->push_descriptors_supported
              ? (r->push_ubo_set_index > 0)
-             : (r->descriptor_set_index > 0)) &&
+             : (r->descriptor_set_index > r->descriptor_set_window_base)) &&
         (r->push_descriptors_supported ||
              (pg->texture_state_gen == r->last_texture_state_gen &&
               r->texture_vram_gen == r->last_texture_vram_gen)) &&
