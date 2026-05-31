@@ -283,7 +283,15 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
      * for it and benefit from the larger window when batched uploads are
      * fat (e.g. surface_scale=3 + bindless textures). */
 #ifdef __ANDROID__
-    size_t staging_size = vram_size;
+    /*
+     * Xbox texture/surface uploads are small — the largest single staged blob
+     * is a surface_scale=3 surface (~22 MB). vram_size (128 MB) was wasteful:
+     * applied to BOTH shared staging buffers AND the per-frame staging_src
+     * (×NUM_SUBMIT_FRAMES), it pinned ~640 MB of GPU memory for a 64 MB
+     * console. Cap at 64 MB — comfortably fits the biggest upload with room
+     * for several in flight; append-time overflow flushes mid-frame.
+     */
+    size_t staging_size = MIN(vram_size, (size_t)(64 * mib));
 #else
     size_t staging_size = vram_size * 2;
 #endif
@@ -309,9 +317,20 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
     size_t index_size = sizeof(pg->inline_elements) * 100;
     index_size = MIN(index_size, mb.index_cap);
 
+    /*
+     * Headroom multiplier over a single max-size inline batch. Desktop keeps
+     * ×10; on Android ×10 reached ~160 MB (×2 shared + ×3 per-frame ≈ 800 MB).
+     * ×2 still holds two full batches — never below one, so a single draw
+     * always fits — and append-time overflow flushes the rest mid-frame.
+     */
+#ifdef __ANDROID__
+    const size_t vertex_inline_mult = 2;
+#else
+    const size_t vertex_inline_mult = 10;
+#endif
     size_t vertex_inline_size = NV2A_VERTEXSHADER_ATTRIBUTES *
                                 NV2A_MAX_BATCH_LENGTH *
-                                4 * sizeof(float) * 10;
+                                4 * sizeof(float) * vertex_inline_mult;
     vertex_inline_size = MIN(vertex_inline_size, mb.vertex_inline_cap);
 
     VK_LOG("buffer_init: vram=%zu staging=%zu compute=%zu",
@@ -427,9 +446,22 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
     int nframes = xemu_get_submit_frames();
 
     size_t uniform_size;
+#ifdef __ANDROID__
+    /*
+     * Uniform data is a few hundred bytes per draw; 16 MB is thousands of
+     * draws of constants per frame, and the ring buffer flushes mid-frame on
+     * overflow. The desktop 128 MB (×2 shared + ×3 per-frame uniform_staging)
+     * pinned ~640 MB on a 64 MB console — the single largest piece of the
+     * buffer over-sizing. Scale a little with frames-in-flight but stay tiny.
+     */
+    if (nframes >= 3)      uniform_size = 16 * mib;
+    else if (nframes == 2) uniform_size = 12 * mib;
+    else                   uniform_size = 8 * mib;
+#else
     if (nframes >= 3)      uniform_size = 128 * mib;
     else if (nframes == 2) uniform_size = 64 * mib;
     else                   uniform_size = 32 * mib;
+#endif
 
     r->storage_buffers[BUFFER_UNIFORM] = (StorageBuffer){
         .alloc_info = device_alloc_create_info,
