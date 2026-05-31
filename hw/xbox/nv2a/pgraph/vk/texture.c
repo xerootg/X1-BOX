@@ -29,9 +29,6 @@
 #include "qemu/fast-hash.h"
 #include "qemu/lru.h"
 #include "renderer.h"
-#ifdef __ANDROID__
-#include <android/log.h>
-#endif
 
 static void texture_cache_release_node_resources(PGRAPHVkState *r, TextureBinding *snode);
 static bool image_pool_acquire(PGRAPHVkState *r, const TextureImageConfig *config,
@@ -123,18 +120,6 @@ void pgraph_vk_texture_budget_tick(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
     size_t cap = r->texture_cache_bytes_max;
-
-#ifdef __ANDROID__
-    /* DIAG: throttled probe of the texture budget state, via direct
-     * android_log so it surfaces regardless of the VK_LOG compile gate. */
-    static unsigned dbg_tick = 0;
-    if ((dbg_tick++ % 60) == 0) {
-        __android_log_print(ANDROID_LOG_ERROR, "hakuX-tex",
-            "tex_budget cap=%zuMB bytes=%zuMB lru_used=%zu img_pool=%d",
-            cap >> 20, r->texture_cache_bytes >> 20,
-            (size_t)r->texture_cache.num_used, r->image_pool_count);
-    }
-#endif
 
     if (!cap) {
         return; /* uncapped (desktop / legacy) */
