@@ -1627,6 +1627,121 @@ extern "C" int SDL_main(int argc, char* argv[]) {
   return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Overlay stat helpers: CPU % (proc/self/stat delta) and GPU % (freq  */
+/* ratio proxy — utilization sysfs is root-only on Pixel).            */
+/* ------------------------------------------------------------------ */
+
+static uint64_t s_cpu_prev_ticks = 0;
+static int64_t  s_cpu_prev_ns    = 0;
+
+static int overlay_cpu_pct(void)
+{
+    FILE *f = fopen("/proc/self/stat", "r");
+    if (!f) return -1;
+    char buf[512];
+    bool ok = (fgets(buf, sizeof(buf), f) != nullptr);
+    fclose(f);
+    if (!ok) return -1;
+
+    /* comm field is wrapped in '(...)' and may contain spaces; find
+     * the last ')' to skip it reliably. */
+    char *p = strrchr(buf, ')');
+    if (!p) return -1;
+    p++;
+
+    /* Fields after ')': state(3) ppid(4) pgrp(5) session(6) tty(7)
+     * tpgid(8) flags(9) minflt(10) cminflt(11) majflt(12) cmajflt(13)
+     * utime(14) stime(15). */
+    unsigned long utime = 0, stime = 0;
+    if (sscanf(p,
+               " %*c %*d %*d %*d %*d %*d %*u"
+               " %*lu %*lu %*lu %*lu %lu %lu",
+               &utime, &stime) != 2) return -1;
+
+    uint64_t ticks = (uint64_t)utime + (uint64_t)stime;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+    int pct = -1;
+    if (s_cpu_prev_ns > 0) {
+        int64_t elapsed_ns = now_ns - s_cpu_prev_ns;
+        uint64_t tick_delta = ticks - s_cpu_prev_ticks;
+        long hz = sysconf(_SC_CLK_TCK);
+        if (hz > 0 && elapsed_ns > 10000000LL) { /* need ≥10 ms window */
+            double cpu_sec  = (double)tick_delta / (double)hz;
+            double wall_sec = (double)elapsed_ns / 1e9;
+            pct = (int)(cpu_sec / wall_sec * 100.0 + 0.5);
+        }
+    }
+    s_cpu_prev_ticks = ticks;
+    s_cpu_prev_ns    = now_ns;
+    return pct; /* >100% = using >1 core; -1 = first call / no data */
+}
+
+/* GPU freq-ratio proxy.  Mali's utilization sysfs node requires root;
+ * cur_freq / max_freq is the next-best thing and what most Android
+ * overlays (GameBench, PerfDog) show for Mali when utilization is
+ * gated.  Adreno path included for portability. */
+static int s_gpu_max_khz = 0; /* 0 = not yet probed */
+
+static void probe_gpu_max_freq(void)
+{
+    /* Mali: available_frequencies is space-separated, highest first */
+    FILE *f = fopen("/sys/class/misc/mali0/device/available_frequencies", "r");
+    if (f) {
+        int v = 0;
+        if (fscanf(f, "%d", &v) == 1 && v > 0) s_gpu_max_khz = v;
+        fclose(f);
+        if (s_gpu_max_khz > 0) return;
+    }
+    /* Adreno: max_gpuclk is in Hz */
+    f = fopen("/sys/class/kgsl/kgsl-3d0/max_gpuclk", "r");
+    if (f) {
+        long v = 0;
+        if (fscanf(f, "%ld", &v) == 1 && v > 0) s_gpu_max_khz = (int)(v / 1000);
+        fclose(f);
+    }
+    if (s_gpu_max_khz == 0) s_gpu_max_khz = -1; /* probed, nothing found */
+}
+
+static int overlay_gpu_pct(void)
+{
+    if (s_gpu_max_khz == 0) probe_gpu_max_freq();
+    if (s_gpu_max_khz <= 0) return -1;
+
+    /* Mali cur_freq in kHz */
+    FILE *f = fopen("/sys/class/misc/mali0/device/cur_freq", "r");
+    if (f) {
+        int cur = 0;
+        bool ok = (fscanf(f, "%d", &cur) == 1 && cur >= 0);
+        fclose(f);
+        if (ok) return (int)((long long)cur * 100 / s_gpu_max_khz);
+    }
+    /* Adreno gpuclk in Hz */
+    f = fopen("/sys/class/kgsl/kgsl-3d0/gpuclk", "r");
+    if (f) {
+        long cur = 0;
+        bool ok = (fscanf(f, "%ld", &cur) == 1 && cur >= 0);
+        fclose(f);
+        if (ok) return (int)((long long)(cur / 1000) * 100 / s_gpu_max_khz);
+    }
+    return -1;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_izzy2lost_x1box_MainActivity_nativeGetCpuUsagePct(JNIEnv *, jobject)
+{
+    return (jint)overlay_cpu_pct();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_izzy2lost_x1box_MainActivity_nativeGetGpuFreqPct(JNIEnv *, jobject)
+{
+    return (jint)overlay_gpu_pct();
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_izzy2lost_x1box_MainActivity_nativeGetFps(JNIEnv *, jobject)
 {
@@ -1649,7 +1764,11 @@ Java_com_izzy2lost_x1box_MainActivity_nativeGetShaderStats(JNIEnv *env, jobject)
     return env->NewStringUTF(buf);
 }
 
-extern "C" JNIEXPORT jstring JNICALL
+/* __attribute__((used)): this JNI entry has no internal C caller (only the
+ * runtime's dynamic lookup references it), so the release -O3 + LTO pipeline
+ * internalizes and dead-strips it -> UnsatisfiedLinkError at runtime when the
+ * {cpu} overlay token fires. `used` pins it as a root. */
+extern "C" JNIEXPORT jstring JNICALL __attribute__((used))
 Java_com_izzy2lost_x1box_MainActivity_nativeGetCpuStats(JNIEnv *env, jobject)
 {
     char buf[512];
@@ -1657,7 +1776,9 @@ Java_com_izzy2lost_x1box_MainActivity_nativeGetCpuStats(JNIEnv *env, jobject)
     return env->NewStringUTF(buf);
 }
 
-extern "C" JNIEXPORT jstring JNICALL
+/* See nativeGetCpuStats above: `used` keeps this JNI-only-referenced export
+ * from being LTO-stripped in release/perftest builds. */
+extern "C" JNIEXPORT jstring JNICALL __attribute__((used))
 Java_com_izzy2lost_x1box_MainActivity_nativeGetWorkloadStats(JNIEnv *env, jobject)
 {
     char buf[512];

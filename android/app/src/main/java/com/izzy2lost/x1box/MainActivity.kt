@@ -114,6 +114,14 @@ class MainActivity : SDLActivity(), InputManager.InputDeviceListener {
       Debug.getMemoryInfo(mi)
       s = s.replace("{mem}", (mi.totalPss / 1024).toString())
     }
+    if ("{cpu_pct}" in s) {
+      val pct = nativeGetCpuUsagePct()
+      s = s.replace("{cpu_pct}", if (pct < 0) "?" else "$pct")
+    }
+    if ("{gpu_pct}" in s) {
+      val pct = nativeGetGpuFreqPct()
+      s = s.replace("{gpu_pct}", if (pct < 0) "?" else "$pct")
+    }
     if ("{pacing}" in s)   s = s.replace("{pacing}", nativeGetFramePacing())
     if ("{shader}" in s)   s = s.replace("{shader}", nativeGetShaderStats())
     if ("{cpu}" in s)      s = s.replace("{cpu}", nativeGetCpuStats())
@@ -669,6 +677,8 @@ class MainActivity : SDLActivity(), InputManager.InputDeviceListener {
   private external fun nativeLoadSnapshot(name: String): Boolean
   private external fun nativeRebootSystem()
   private external fun nativeGetFps(): Int
+  private external fun nativeGetCpuUsagePct(): Int
+  private external fun nativeGetGpuFreqPct(): Int
   private external fun nativeGetFramePacing(): String
   private external fun nativeGetShaderStats(): String
   private external fun nativeGetCpuStats(): String
