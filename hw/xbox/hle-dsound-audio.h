@@ -76,6 +76,24 @@ void hle_audio_buffer_set_volume(uint32_t pBuffer, int32_t lVolume);
 void hle_audio_buffer_set_frequency(uint32_t pBuffer, uint32_t dwFreqHz);
 
 /*
+ * Phase 3: IDirectSoundBuffer::Unlock arrived. The game has just
+ * written `len` bytes at the audio pointer the matching Lock returned
+ * — i.e. raw PCM (or ADPCM) at the buffer's declared format. Push
+ * directly into the HLE ring, lazily creating + format-binding the
+ * slot on first call (via the format FIFO populated by Create probes).
+ *
+ * This is the load-bearing capture path for buffers that NEVER call
+ * SetBufferData — Bink + any other custom-mixer / streaming-into-
+ * static-buffer pattern. Without it, bypass=on produces silence for
+ * those buffers because no Play/SetBufferData ever fires.
+ *
+ * Caller has already capped `len` (see xbox-hle.c). Safe to call
+ * before init.
+ */
+void hle_audio_buffer_unlock_write(uint32_t pBuffer,
+                                   const uint8_t *bytes, uint32_t len);
+
+/*
  * Format-capture FIFO. Hook the various Create* entries as declining
  * probes — they snapshot the WAVEFORMATEX from the guest descriptor,
  * push it here, then return false so the real Create runs and gives
@@ -122,11 +140,41 @@ void hle_audio_stream_flush(uint32_t pStream);
 void hle_audio_drain(float *front_left, float *front_right,
                      unsigned n_samples);
 
+/* Number of stereo sample frames currently queued in the ring.
+ * Used by vp.c to decide whether to use HLE audio or fall back
+ * to MCPX VP output when the ring is dry. */
+unsigned hle_audio_ring_available(void);
+
 /*
  * Telemetry: per-API call counts, ring fullness, slot occupancy.
  * Logged from xbox_hle_log_stats() on the existing 100K-TB cadence.
  */
 void hle_audio_log_stats(void);
+
+/*
+ * Phase-2 parity counters. vp.c's per-voice bypass increments
+ * voice_off_bypass when it fires voice_off(); the real voice_process
+ * path increments voice_off_real. We want the bypass/real ratio
+ * within [0.8, 1.2] over a measurement window — outside that means
+ * the bypass's cursor advance is drifting from MCPX semantics.
+ */
+void hle_audio_count_voice_off_bypass(void);
+void hle_audio_count_voice_off_real(void);
+
+/*
+ * Phase-1 voices-per-frame histogram. Called once per EP-frame from
+ * vp.c with the number of voices the bypass path processed this
+ * frame. Bucketing: 0, 1-2, 3-4, 5-8, 9-16, 17-32, 33-64, 64+.
+ */
+void hle_audio_record_bypass_active_voices(unsigned n);
+
+/*
+ * Phase-2 stream_process latency tracking. Caller stamps before and
+ * after the snoop body; we maintain count/sum/min/max/over-budget.
+ * "over_budget" counts calls that exceeded 5 ms — the realtime cap
+ * documented in the plan.
+ */
+void hle_audio_record_stream_process_latency_ns(uint64_t ns);
 
 #ifdef __cplusplus
 }

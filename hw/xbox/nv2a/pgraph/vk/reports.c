@@ -155,9 +155,25 @@ void pgraph_vk_process_pending_reports_internal(NV2AState *d)
             NV2A_VK_DPRINTF("Cleared");
             r->zpass_pixel_count_result = 0;
         } else {
+            /*
+             * X1BOX workaround (xemu #2328): on Adreno the GPU occlusion query
+             * returns a raw ZPASS count of 0 for far/small bounding boxes that
+             * ARE visible (Mali returns >0), so Serious Sam 2 occlusion-culls
+             * the whole object -> structures pop in/out per frame. The game's
+             * occlusion threshold is >1, so report a count safely above it when
+             * the (scale-normalized) count is 0. Trade-off: weakens occlusion
+             * culling (occluded geometry still hidden by the depth test, so no
+             * visual artifact in-game, but the loading screen can flicker).
+             * Proper fix TODO: stop the bbox occlusion query returning a false
+             * 0 (coverage/depth of the proxy on Adreno) so real culling stays.
+             */
+            uint32_t reported_zpass =
+                (uint32_t)(r->zpass_pixel_count_result / result_divisor);
+            if (reported_zpass == 0) {
+                reported_zpass = 0x10000u;
+            }
             pgraph_write_zpass_pixel_cnt_report(
-                d, report->parameter,
-                r->zpass_pixel_count_result / result_divisor);
+                d, report->parameter, reported_zpass);
         }
 
         QSIMPLEQ_REMOVE_HEAD(&r->report_queue, entry);

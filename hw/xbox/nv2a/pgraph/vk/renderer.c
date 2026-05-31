@@ -1656,6 +1656,15 @@ void pgraph_vk_check_memory_budget(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    /*
+     * Primary, robust control: enforce the absolute texture-cache byte budget
+     * and service any pending Android onTrimMemory request. This does not rely
+     * on the Vulkan heap budget below, which is meaningless on UMA (Adreno)
+     * where the "budget" is ~all of system RAM and the usage ratio never trips
+     * even as the system OOMs.
+     */
+    pgraph_vk_texture_budget_tick(pg);
+
     VkPhysicalDeviceMemoryProperties const *props;
     vmaGetMemoryProperties(r->allocator, &props);
 

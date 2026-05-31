@@ -138,6 +138,9 @@ class XPackActivity : AppCompatActivity() {
             if (pack.patternPatchCount > 0) {
                 append(" · ").append(pack.patternPatchCount).append(" pattern")
             }
+            if (pack.cavePatchCount > 0) {
+                append(" · ").append(pack.cavePatchCount).append(" cave")
+            }
             if (pack.shaderOverrideCount > 0) {
                 append(" · ").append(pack.shaderOverrideCount).append(" shader")
             }

@@ -552,11 +552,17 @@ class MainActivity : SDLActivity(), InputManager.InputDeviceListener {
 
   override fun onTrimMemory(level: Int) {
     DebugLog.i(TAG) { "onTrimMemory(level=$level)" }
+    // Forward OS memory pressure to the GPU texture cache so it sheds early
+    // (before the KGSL allocator OOMs). Guarded: trim callbacks can fire
+    // before the native lib is loaded.
+    try { nativeOnTrimMemory(level) } catch (_: Throwable) { }
     super.onTrimMemory(level)
   }
 
   override fun onLowMemory() {
     DebugLog.w(TAG) { "onLowMemory()" }
+    // No level here; treat as the most severe (TRIM_MEMORY_COMPLETE == 80).
+    try { nativeOnTrimMemory(80) } catch (_: Throwable) { }
     super.onLowMemory()
   }
 
@@ -638,6 +644,7 @@ class MainActivity : SDLActivity(), InputManager.InputDeviceListener {
   private external fun nativeResumeEmulation()
   private external fun nativeSetReturnToLibraryOnExit(enable: Boolean)
   private external fun nativeExitEmulation()
+  private external fun nativeOnTrimMemory(level: Int)
 
   private fun slotName(slot: Int) = "android_slot_$slot"
 

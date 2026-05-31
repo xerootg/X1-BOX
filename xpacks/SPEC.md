@@ -42,7 +42,7 @@ xbe_code_sha1 = "abc...40hex"         # optional — restrict to specific builds
 xbe_code_sha1 = "abc...40hex, def..." # comma-separated for multi-build packs
 
 [[patch]]
-kind = "bytes" | "pattern_bytes" | "shader"
+kind = "bytes" | "pattern_bytes" | "cave" | "shader"
 # kind-specific fields follow
 ```
 
@@ -127,6 +127,68 @@ The scan reads guest memory in 64 KB chunks with overlap, skips unmapped
 pages, and uses a first-byte filter before the full compare. Cost per scan
 of a 64 MB range is well below a frame.
 
+### `kind = "cave"`
+
+Injects new x86 code at a free guest-virtual address (the "cave") and
+installs a 5-byte `JMP rel32` trampoline at the site you want to intercept.
+Used when `bytes` isn't expressive enough — `bytes` can overwrite existing
+instructions but can't *add* logic, so things like "return early from this
+function", "skip this loop", or "run a host-style fast path" need a cave.
+
+```toml
+[[patch]]
+kind            = "cave"
+description     = "human-readable"
+trampoline_at   = 0x00123110            # required — JMP rel32 install site
+trampoline_size = 5                     # optional — bytes displaced (5..15, default 5)
+expected        = "55 8B EC 83 EC"      # optional — pre-image at trampoline_at
+cave_at         = 0x002B0000            # required — where the cave body lives
+cave_expected   = "00 00 00 00"         # optional — verify cave site is free
+cave_bytes      = "C2 08 00"            # required — x86 body (here: `ret 8`)
+return_in_cave  = true                  # optional — cave handles its own return
+```
+
+Cave layout when `return_in_cave = false` (default):
+
+```
+cave_at:   [cave_bytes]
+           [original displaced bytes]      trampoline_size B
+           [JMP rel32 back to trampoline_at + trampoline_size]   5 B
+```
+
+Trampoline at `trampoline_at`:
+
+```
+[JMP rel32 -> cave_at]                    5 B
+[NOP * (trampoline_size - 5)]             0..10 B
+```
+
+When `return_in_cave = true`, `cave_bytes` is written verbatim with no
+appended tail — the author is responsible for control flow exiting the
+cave (typically `ret`, `ret imm16`, `jmp`, etc.).
+
+Sharp edges:
+
+- **`trampoline_size` must cover whole x86 instructions.** The five-byte
+  `JMP rel32` overwrites complete instructions only — if the original site
+  has instructions whose total length crosses 5 bytes (e.g. `push ebp`
+  (1) + `mov ebp, esp` (2) + `sub esp, 8` (3) = 6 B), set
+  `trampoline_size = 6`. Including a correct `expected` is the practical
+  safeguard.
+- **Cave site must be free.** The loader doesn't allocate guest memory. Pick
+  unused padding in the xbe (post-section padding, .bss-adjacent slack,
+  known-zero `.rdata` tail) and verify with `cave_expected`. If the site is
+  actually live code/data, the pack will be refused at apply time.
+- **Stack discipline / flag preservation** is the author's responsibility.
+  If the displaced bytes were inside a function with active locals, the cave
+  body must preserve `eax/ecx/edx`-style scratch convention or push/pop
+  what it clobbers.
+- **No relocation of displaced instructions.** The displaced bytes are
+  copied verbatim. If any of them are PC-relative (`call`, conditional
+  jumps, `jmp short/near`), the copy will branch to the wrong place. Avoid
+  trampolining onto PC-relative instructions; pick a spot a few bytes later
+  or earlier.
+
 ### `kind = "shader"`
 
 Replaces a Vulkan SPIR-V module keyed by the GLSL source hash xemu computes
@@ -176,6 +238,7 @@ matching is case-insensitive.
 |---|---|---|
 | `bytes` | First `xemu_get_xbe_info()` success per title id | [xemu-xbe.c](xemu-xbe.c) |
 | `pattern_bytes` | First attempt at xbe-detect + retry on every guest frame via `nv2a_profile_flip_stall()` until found | [hw/xbox/nv2a/pgraph/profile.c](hw/xbox/nv2a/pgraph/profile.c) |
+| `cave` | First `xemu_get_xbe_info()` success per title id (same as `bytes`) | [xemu-xbe.c](xemu-xbe.c) |
 | `shader` | On GLSL→SPIR-V compile | [hw/xbox/nv2a/pgraph/vk/glsl.c](hw/xbox/nv2a/pgraph/vk/glsl.c) |
 
 Pack enable/disable changes take effect on the **next game launch**.
@@ -202,9 +265,16 @@ Toggling a switch does not re-patch a running guest.
 
 ## Out of scope
 
-- **Code caves** — injecting new x86 + trampoline. Doable but needs a small
-  relocator for the original bytes saved into the cave's return path.
-  Would be an additional `kind = "cave"` in a future schema.
+- **Cave memory allocator** — the loader does not grow guest memory.
+  `kind = "cave"` requires the author to nominate a free region. A future
+  extension could carve a dedicated cave heap out of an unused
+  physical-RAM range and hand out offsets, removing the "find a hole"
+  burden from authors.
+- **Displaced-bytes relocator** — caves copy the displaced trampoline
+  bytes verbatim. PC-relative instructions (`call rel32`, conditional
+  jumps, `jmp short/near`) at the trampoline site will branch wrong; the
+  author must pick a non-PC-relative window. A relocator that rewrites
+  `E8/E9` displacements at copy time could lift that restriction.
 - **File overlay** — replacing files inside the disc image. xemu reads at
   the LBA/sector level via ATAPI, with no file-level hook; would require
   either pre-launch ISO staging or an XDVDFS-aware sector intercept.

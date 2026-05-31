@@ -44,6 +44,7 @@ typedef struct MemoryBudget {
     int image_pool_max;
     int surface_image_pool_max;
     size_t surface_image_pool_bytes_max; /* 0 = uncapped (legacy) */
+    size_t texture_cache_bytes_max;      /* 0 = uncapped (legacy) */
 } MemoryBudget;
 
 static MemoryBudget compute_memory_budget(PGRAPHVkState *r)
@@ -96,6 +97,7 @@ static MemoryBudget compute_memory_budget(PGRAPHVkState *r)
         b.image_pool_max = 128;
         b.surface_image_pool_max = 64;
         b.surface_image_pool_bytes_max = 0; /* uncapped on desktop */
+        b.texture_cache_bytes_max = 0;      /* uncapped on desktop */
     } else {
         size_t budget = b.renderer_budget;
         b.vertex_inline_cap = MAX(8 * mib, budget / 5);
@@ -149,6 +151,23 @@ static MemoryBudget compute_memory_budget(PGRAPHVkState *r)
             pool_bytes = 64 * mib;
         }
         b.surface_image_pool_bytes_max = pool_bytes;
+
+        /*
+         * Texture-cache bytes cap. The cache is otherwise count-only (1024
+         * entries); a full cache of RGBA8+mip textures pins ~2.8 GB on Halo 2
+         * — nearly 3x the entire renderer budget — and OOM-crashes the Adreno
+         * KGSL allocator mid-combat (the other consumers all respect the
+         * budget; the texture cache did not). Textures are the primary
+         * legitimate GPU consumer, so give them the largest slice (~45% of the
+         * renderer budget), floored at 192 MB so small-budget devices keep a
+         * usable working set. The LRU sheds the cold tail to stay under this;
+         * the live working set (bound/in-flight) is never evicted.
+         */
+        size_t tex_bytes = budget * 45 / 100;
+        if (tex_bytes < 192 * mib) {
+            tex_bytes = 192 * mib;
+        }
+        b.texture_cache_bytes_max = tex_bytes;
     }
 
     return b;
@@ -216,12 +235,24 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
     r->image_pool_max = mb.image_pool_max;
     r->surface_image_pool_max = mb.surface_image_pool_max;
     r->surface_image_pool_bytes_max = mb.surface_image_pool_bytes_max;
+    r->texture_cache_bytes_max = mb.texture_cache_bytes_max;
+    /* On-device tuning without a rebuild: X1BOX_TEX_CACHE_MB overrides the
+     * texture-cache byte cap (MB). 0/unset keeps the computed default. */
+    {
+        const char *tex_mb_env = getenv("X1BOX_TEX_CACHE_MB");
+        if (tex_mb_env && *tex_mb_env) {
+            long v = strtol(tex_mb_env, NULL, 10);
+            if (v > 0) {
+                r->texture_cache_bytes_max = (size_t)v * mib;
+            }
+        }
+    }
 
     VK_LOG_ERROR("memory_budget: total_heap=%zuMB budget=%s%zuMB "
                  "vtx_inline_cap=%zuMB index_cap=%zuMB staging_cap=%zuMB "
                  "pf_vtx=%zuMB pf_idx=%zuMB pf_uni=%zuMB pf_stg=%zuMB "
                  "shader_cache=%zu tex_cache=%zu img_pool=%d "
-                 "surf_pool=%d surf_pool_bytes=%zuMB",
+                 "surf_pool=%d surf_pool_bytes=%zuMB tex_cache_bytes=%zuMB",
                  mb.total_heap >> 20,
                  mb.renderer_budget == SIZE_MAX ? "uncapped/" : "",
                  mb.renderer_budget == SIZE_MAX ? 0 : mb.renderer_budget >> 20,
@@ -236,7 +267,8 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
                  mb.texture_cache_entries,
                  mb.image_pool_max,
                  mb.surface_image_pool_max,
-                 mb.surface_image_pool_bytes_max >> 20);
+                 mb.surface_image_pool_bytes_max >> 20,
+                 r->texture_cache_bytes_max >> 20);
 
     /* Xbox had 64 MB total UMA; no game stages more than 1× VRAM in flight
      * because the guest can't address that much. On Mali UMA (Android) the
@@ -289,6 +321,22 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
         .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
     };
+    /*
+     * Write-combined streaming upload for the append-only staging buffers
+     * (GPU_QUIRK_WC_STREAM_UPLOAD). SEQUENTIAL_WRITE lets VMA pick uncached /
+     * write-combined host memory: CPU writes (pgraph_vk_append_to_buffer is a
+     * pure forward memcpy) stream straight to RAM, the explicit vmaFlush in
+     * sync_staging_buffer no-ops, and the GPU reads via the existing
+     * HOST->TRANSFER barrier. ONLY valid for buffers the CPU never reads back —
+     * so NOT STAGING_DST (surface readback) or vertex_ram (frame-propagation
+     * memcpy reads it). Falls back to the cached RANDOM info when the quirk is
+     * off (e.g. a future driver that streams WC poorly).
+     */
+    VmaAllocationCreateInfo host_wc_alloc_create_info = host_alloc_create_info;
+    if (r->gpu_quirks & GPU_QUIRK_WC_STREAM_UPLOAD) {
+        host_wc_alloc_create_info.flags =
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+    }
     VmaAllocationCreateInfo device_alloc_create_info = {
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .flags = 0,
@@ -301,7 +349,7 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
     };
 
     r->storage_buffers[BUFFER_STAGING_SRC] = (StorageBuffer){
-        .alloc_info = host_alloc_create_info,
+        .alloc_info = host_wc_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         .buffer_size = staging_size,
     };
@@ -330,7 +378,7 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
     };
 
     r->storage_buffers[BUFFER_INDEX_STAGING] = (StorageBuffer){
-        .alloc_info = host_alloc_create_info,
+        .alloc_info = host_wc_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         .buffer_size = index_size,
     };
@@ -348,7 +396,8 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
         .alloc_info = host_alloc_create_info,
         .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
         .buffer_size = memory_region_size(d->vram)
-                     + (r->is_mali ? MALI_DESCRIPTOR_TAIL_RESERVATION : 0),
+                     + ((r->gpu_quirks & GPU_QUIRK_DESCRIPTOR_TAIL_PAD)
+                            ? MALI_DESCRIPTOR_TAIL_RESERVATION : 0),
     };
 
     r->bitmap_size = memory_region_size(d->vram) / 4096;
@@ -369,7 +418,7 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
     };
 
     r->storage_buffers[BUFFER_VERTEX_INLINE_STAGING] = (StorageBuffer){
-        .alloc_info = host_alloc_create_info,
+        .alloc_info = host_wc_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         .buffer_size = vertex_inline_size,
     };
@@ -390,7 +439,7 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
     };
 
     r->storage_buffers[BUFFER_UNIFORM_STAGING] = (StorageBuffer){
-        .alloc_info = host_alloc_create_info,
+        .alloc_info = host_wc_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         .buffer_size = uniform_size,
     };
@@ -465,22 +514,22 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
                              stg_max);
 
         fs->index_staging = (StorageBuffer){
-            .alloc_info = host_alloc_create_info,
+            .alloc_info = host_wc_alloc_create_info,
             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             .buffer_size = idx_cap,
         };
         fs->vertex_inline_staging = (StorageBuffer){
-            .alloc_info = host_alloc_create_info,
+            .alloc_info = host_wc_alloc_create_info,
             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             .buffer_size = vtx_cap,
         };
         fs->uniform_staging = (StorageBuffer){
-            .alloc_info = host_alloc_create_info,
+            .alloc_info = host_wc_alloc_create_info,
             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             .buffer_size = uni_cap,
         };
         fs->staging_src = (StorageBuffer){
-            .alloc_info = host_alloc_create_info,
+            .alloc_info = host_wc_alloc_create_info,
             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             .buffer_size = stg_cap,
         };
@@ -490,7 +539,8 @@ bool pgraph_vk_init_buffers(NV2AState *d, Error **errp)
             .alloc_info = host_alloc_create_info,
             .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
             .buffer_size = memory_region_size(d->vram)
-                         + (r->is_mali ? MALI_DESCRIPTOR_TAIL_RESERVATION : 0),
+                         + ((r->gpu_quirks & GPU_QUIRK_DESCRIPTOR_TAIL_PAD)
+                            ? MALI_DESCRIPTOR_TAIL_RESERVATION : 0),
         };
         fs->vertex_ram_flush_min = VK_WHOLE_SIZE;
         fs->vertex_ram_flush_max = 0;
@@ -643,7 +693,8 @@ bool pgraph_vk_buffer_has_space_for(PGRAPHState *pg, int index,
     PGRAPHVkState *r = pg->vk_renderer_state;
     StorageBuffer *b = get_staging_buffer(r, index);
     VkDeviceSize usable = b->buffer_size;
-    if (r->is_mali && usable > MALI_DESCRIPTOR_TAIL_RESERVATION) {
+    if ((r->gpu_quirks & GPU_QUIRK_DESCRIPTOR_TAIL_PAD) &&
+        usable > MALI_DESCRIPTOR_TAIL_RESERVATION) {
         usable -= MALI_DESCRIPTOR_TAIL_RESERVATION;
     }
     return (ROUND_UP(b->buffer_offset, alignment) + size) <= usable;

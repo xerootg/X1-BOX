@@ -605,6 +605,38 @@ typedef enum FinishReason {
     VK_FINISH_REASON_STALLED,
 } FinishReason;
 
+/*
+ * GPU behavior quirks, computed once at device init (pgraph_vk_init_instance,
+ * from vendorID/driver) into PGRAPHVkState::gpu_quirks. Centralizes what used
+ * to be scattered `r->is_mali` checks so per-driver tuning lives in one place;
+ * `is_mali` remains the raw device fact that currently drives most of these.
+ * Behaviour today: every Mali quirk is set iff is_mali, so migrating an
+ * `is_mali` test to its quirk flag is behavior-preserving.
+ */
+enum {
+    /* Pad descriptor-bound vertex buffers by MALI_DESCRIPTOR_TAIL_RESERVATION
+     * so Mali's tile-binner prefetch lands on mapped pages. */
+    GPU_QUIRK_DESCRIPTOR_TAIL_PAD   = 1u << 0,
+    /* Submit aux + main command buffers as two single-CB submits joined by a
+     * binary semaphore (Mali faults on a 2-CB VkSubmitInfo). */
+    GPU_QUIRK_SPLIT_AUX_MAIN_SUBMIT = 1u << 1,
+    /* Use a bounded fence wait with explicit VK_ERROR_DEVICE_LOST detection
+     * and graceful shutdown instead of an unbounded wait. */
+    GPU_QUIRK_FENCE_TIMEOUT_WATCH   = 1u << 2,
+    /* Bake the component swizzle into RGBA8 at upload (Mali drops
+     * VkComponentMapping on R8/R8G8 sampled views). */
+    GPU_QUIRK_COLOR_FORMAT_BAKE     = 1u << 3,
+    /* Never sample a color render target directly as a texture; copy it to a
+     * separate image first. */
+    GPU_QUIRK_NO_COLOR_DIRECT_BIND  = 1u << 4,
+    /* Allocate the append-only CPU->GPU staging buffers as write-combined
+     * (VMA HOST_ACCESS_SEQUENTIAL_WRITE) rather than cached: CPU writes stream
+     * straight through with no flush, faster for sequential upload. Only for
+     * write-only buffers (NOT STAGING_DST readback or vertex_ram, which the
+     * CPU reads back). Beneficial on all vendors; default-on. */
+    GPU_QUIRK_WC_STREAM_UPLOAD      = 1u << 5,
+};
+
 typedef enum {
     RCMD_DRAW,
     RCMD_CLEAR_SURFACE,
@@ -1035,6 +1067,9 @@ typedef struct PGRAPHVkState {
      * buffer that is bound by descriptor — see pgraph_vk_buffer_has_space_for.
      */
     bool is_mali;
+    /* Bitmask of GPU_QUIRK_* (see enum above), derived from is_mali/driver at
+     * init. Prefer testing a specific quirk over r->is_mali at new sites. */
+    uint32_t gpu_quirks;
     VkDescriptorSetLayout push_tex_set_layout;
     VkDescriptorSetLayout push_ubo_set_layout;
     VkDescriptorPool push_ubo_pool;
@@ -1361,6 +1396,17 @@ typedef struct PGRAPHVkState {
     ShaderModuleCacheEntry *shader_module_cache_entries;
     size_t shader_module_cache_target;
     size_t texture_cache_target;
+    /*
+     * Live GPU bytes held by texture-cache images (in-cache + pooled),
+     * measured exactly via vmaGetAllocationInfo at create/destroy. The cache
+     * is otherwise capped only by entry COUNT (texture_cache_target, default
+     * 1024); without a byte cap a full cache of RGBA8+mip textures pins
+     * ~2.8 GB on Halo 2 and OOM-crashes the Adreno KGSL allocator mid-combat
+     * (the surface pool already has the equivalent byte cap; the texture cache
+     * did not). texture_cache_bytes_max == 0 means uncapped (desktop/legacy).
+     */
+    size_t texture_cache_bytes;
+    size_t texture_cache_bytes_max;
     int image_pool_max;
     int surface_image_pool_max;
     /* Companion byte cap for the surface image pool. See
@@ -1652,6 +1698,13 @@ bool pgraph_vk_check_textures_fast_skip(PGRAPHState *pg);
 void pgraph_vk_mark_textures_possibly_dirty(NV2AState *d, hwaddr addr,
                                             hwaddr size);
 void pgraph_vk_trim_texture_cache(PGRAPHState *pg);
+/* Enforce the texture-cache byte budget + consume any Android onTrimMemory
+ * request. Called per-draw from pgraph_vk_check_memory_budget. */
+void pgraph_vk_texture_budget_tick(PGRAPHState *pg);
+/* Set from the Android onTrimMemory JNI bridge (any thread). Consumed on the
+ * pgraph thread by pgraph_vk_texture_budget_tick. level = ComponentCallbacks2
+ * TRIM_MEMORY_* value. */
+void pgraph_vk_request_texture_trim(int level);
 
 // compile_worker.c
 #if OPT_ASYNC_COMPILE

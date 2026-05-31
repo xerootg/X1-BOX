@@ -13,9 +13,10 @@
  *     hle_audio_drain). Single-producer / single-consumer with seq_cst
  *     atomic head/tail indices.
  *
- *   - PCM 16/8-bit mono/stereo → 48 kHz stereo float linear resample
- *     during the push. We don't decode XADPCM yet (that's the next
- *     pass — Halo 2 streams a lot of it).
+ *   - PCM 16/8-bit mono/stereo and WAVE_FORMAT_XBOX_ADPCM (0x69) →
+ *     48 kHz stereo float linear resample. ADPCM is pre-decoded to
+ *     PCM16 at buffer-ingestion time (SetBufferData), matching XEFU's
+ *     upstream-decode model (see hw/xbox/XEFU_AUDIO_NOTES.md).
  *
  *   - Per-call telemetry surfaced via hle_audio_log_stats().
  *
@@ -64,8 +65,9 @@ typedef struct hle_audio_slot {
     uint32_t freq_override;  /* 0 = use native sample_rate */
     bool     playing;
     bool     looping;
-    bool     is_stream;      /* true → continuous packets; false → static */
-    bool     format_bound;   /* false until first Set/Push pops the FIFO */
+    bool     is_stream;       /* true → continuous packets; false → static */
+    bool     format_bound;    /* false until first Set/Push pops the FIFO */
+    bool     pcm_predecoded;  /* pcm[] holds PCM16 even when format_tag==0x69 */
     uint64_t hit_set;        /* SetBufferData count */
     uint64_t hit_play;       /* Play count */
     uint64_t hit_stop;
@@ -105,6 +107,25 @@ static struct {
     uint64_t fmt_pushes;
     uint64_t fmt_pops;
     uint64_t fmt_drops_full;
+
+    /* Phase-2 bypass parity. Incremented from vp.c on each voice_off
+     * call from the respective code path. Ratio bypass/real should sit
+     * in [0.8, 1.2] over the measurement window — if it drifts, the
+     * pitch LUT or end-of-buffer logic is misaligned. */
+    uint64_t voice_off_bypass;
+    uint64_t voice_off_real;
+
+    /* Phase-1 per-EP-frame voices-bypassed histogram. 8 buckets:
+     * idx 0: 0 voices, 1: 1-2, 2: 3-4, 3: 5-8, 4: 9-16, 5: 17-32,
+     * 6: 33-64, 7: 64+. */
+    uint64_t bypass_voice_hist[8];
+
+    /* Phase-2 stream_process snoop latency tracker. Histogram + range
+     * is the minimum to verify the 5 ms realtime cap holds. */
+    uint64_t spp_lat_count;
+    uint64_t spp_lat_sum_ns;
+    uint64_t spp_lat_max_ns;
+    uint64_t spp_lat_over_5ms;     /* exceeded 5 ms budget */
 } g;
 
 static bool g_inited;
@@ -264,8 +285,18 @@ static int16_t *adpcm_decode_buffer(const uint8_t *adpcm, uint32_t adpcm_len,
     uint32_t n_blocks = adpcm_len / block_align;
     if (!n_blocks) return NULL;
 
-    /* 64 PCM samples per channel per block (8 chunks × 8 samples). */
-    const uint32_t samples_per_block = 64u;
+    /*
+     * Samples per block: adpcm_decode_block returns 1 + chunks*8 composite
+     * samples, where chunks = (block_align - channels*4) / (channels*4).
+     * For the common Xbox 36-byte/mono, 72-byte/stereo block: 65 samples.
+     * Must NOT use the historical constant 64 — that under-allocates by one
+     * sample per block and causes a heap write overflow on large buffers.
+     */
+    uint32_t hdr_bytes = 4u * (uint32_t)channels;
+    if (block_align <= hdr_bytes) return NULL;
+    uint32_t chunks = (block_align - hdr_bytes) / ((uint32_t)channels * 4u);
+    uint32_t samples_per_block = 1u + chunks * 8u;
+
     uint32_t total_pcm_samples = n_blocks * samples_per_block * channels;
     int16_t *pcm = malloc(total_pcm_samples * sizeof(int16_t));
     if (!pcm) return NULL;
@@ -343,7 +374,9 @@ static void push_slot_to_ring(hle_audio_slot *s)
     if (s->freq_override) in_rate = s->freq_override;
     float gain = volume_to_gain(s->lVolume);
 
-    if (s->format_tag == 1u /* WAVE_FORMAT_PCM */) {
+    /* Fast path: PCM or pre-decoded ADPCM (hle_audio_buffer_set_data decodes
+     * ADPCM at ingestion time; pcm_predecoded is the flag). */
+    if (s->format_tag == 1u || s->pcm_predecoded) {
         push_pcm_to_ring(s->pcm, s->len,
                          s->bits ? s->bits : 16u,
                          s->channels ? s->channels : 1u,
@@ -351,7 +384,10 @@ static void push_slot_to_ring(hle_audio_slot *s)
         g.pushes++;
         return;
     }
-    if (s->format_tag == 0x69u /* WAVE_FORMAT_XBOX_ADPCM */) {
+    /* Fallback: ADPCM that wasn't pre-decoded (e.g. slot populated via a
+     * path other than hle_audio_buffer_set_data — should not happen in
+     * normal use but handled defensively). */
+    if (s->format_tag == 0x69u) {
         uint32_t frames = 0;
         uint16_t ch = s->channels ? s->channels : 1u;
         int16_t *pcm = adpcm_decode_buffer(s->pcm, s->len, ch,
@@ -421,12 +457,38 @@ void hle_audio_buffer_set_data(uint32_t pBuffer,
                      channels ? channels : 1u,
                      bits_per_sample ? bits_per_sample : 16u);
 
+    s->pcm_predecoded = false;
     free(s->pcm);
     s->pcm = malloc(len);
     if (!s->pcm) { s->len = 0; return; }
     memcpy(s->pcm, bytes, len);
     s->len = len;
     s->hit_set++;
+
+    /*
+     * Pre-decode ADPCM at ingestion time rather than on every Play call.
+     * Matches XEFU's upstream-decode model: the FSDX HLE shim decodes
+     * ADPCM → PCM16 before the buffer ever reaches the VP/XMA layer.
+     * After this point s->pcm holds PCM16 and pcm_predecoded is true;
+     * push_slot_to_ring then takes the fast PCM path on every Play.
+     *
+     * Note: format_tag is NOT changed — it stays 0x69 so that a subsequent
+     * SetBufferData with new ADPCM data (format_bound=true, no FIFO pop)
+     * correctly re-decodes rather than storing raw ADPCM as PCM.
+     */
+    if (s->format_tag == 0x69u && s->pcm && s->len) {
+        uint32_t frames = 0;
+        uint16_t ch = s->channels ? s->channels : 1u;
+        int16_t *decoded = adpcm_decode_buffer(s->pcm, s->len, ch,
+                                               s->block_align, &frames);
+        if (decoded) {
+            free(s->pcm);
+            s->pcm = (uint8_t *)decoded;
+            s->len = frames * ch * sizeof(int16_t);
+            s->bits = 16u;
+            s->pcm_predecoded = true;
+        }
+    }
 }
 
 void hle_audio_buffer_play(uint32_t pBuffer, bool looping)
@@ -463,6 +525,49 @@ void hle_audio_buffer_set_frequency(uint32_t pBuffer, uint32_t dwFreqHz)
     hle_audio_slot *s = slot_find(pBuffer);
     if (!s) return;
     s->freq_override = dwFreqHz;
+}
+
+void hle_audio_buffer_unlock_write(uint32_t pBuffer,
+                                   const uint8_t *bytes, uint32_t len)
+{
+    if (!g_inited) hle_audio_init();
+    if (!pBuffer || !bytes || !len) return;
+
+    hle_audio_slot *s = slot_alloc(pBuffer);
+    if (!s) return;
+
+    /* Lazy format binding via the Create-time FIFO, same path
+     * SetBufferData uses. Bink Creates the buffer (Create probe pushes
+     * the format), then writes via Lock/Unlock — the first Unlock
+     * pops the format and binds. Fallback assumes 22050/mono/16-bit
+     * if no Create probe landed (defensive). */
+    slot_bind_format(s, 1u /* WAVE_FORMAT_PCM */, 22050u, 1u, 16u);
+
+    uint32_t in_rate = s->sample_rate ? s->sample_rate : 22050u;
+    if (s->freq_override) in_rate = s->freq_override;
+    float gain = volume_to_gain(s->lVolume);
+
+    if (s->format_tag == 1u) {
+        push_pcm_to_ring(bytes, len, s->bits ? s->bits : 16u,
+                         s->channels ? s->channels : 1u, in_rate, gain);
+        g.pushes++;
+    } else if (s->format_tag == 0x69u) {
+        uint32_t frames = 0;
+        uint16_t ch = s->channels ? s->channels : 1u;
+        int16_t *pcm = adpcm_decode_buffer(bytes, len, ch,
+                                           s->block_align, &frames);
+        if (pcm) {
+            push_pcm_to_ring((uint8_t *)pcm,
+                             frames * ch * sizeof(int16_t),
+                             16u, ch, in_rate, gain);
+            free(pcm);
+            g.pushes++;
+        }
+    } else {
+        g.pushes_skipped_unknown_fmt++;
+    }
+    s->hit_set++;     /* reuse the set counter — Unlock-writes are
+                       * functionally "set buffer data piecewise" */
 }
 
 /* ------------------------------------------------------------------ */
@@ -568,6 +673,12 @@ void hle_audio_stream_flush(uint32_t pStream)
     (void)pStream;
 }
 
+unsigned hle_audio_ring_available(void)
+{
+    if (!g_inited) return 0;
+    return ring_used();
+}
+
 void hle_audio_drain(float *front_left, float *front_right,
                      unsigned n_samples)
 {
@@ -590,6 +701,42 @@ void hle_audio_drain(float *front_left, float *front_right,
     if (serve < n_samples) {
         g.drain_underflow_samples += (n_samples - serve);
     }
+}
+
+void hle_audio_count_voice_off_bypass(void)
+{
+    if (!g_inited) return;
+    g.voice_off_bypass++;
+}
+
+void hle_audio_count_voice_off_real(void)
+{
+    if (!g_inited) return;
+    g.voice_off_real++;
+}
+
+void hle_audio_record_bypass_active_voices(unsigned n)
+{
+    if (!g_inited) return;
+    unsigned b;
+    if      (n == 0)   b = 0;
+    else if (n <= 2)   b = 1;
+    else if (n <= 4)   b = 2;
+    else if (n <= 8)   b = 3;
+    else if (n <= 16)  b = 4;
+    else if (n <= 32)  b = 5;
+    else if (n <= 64)  b = 6;
+    else               b = 7;
+    g.bypass_voice_hist[b]++;
+}
+
+void hle_audio_record_stream_process_latency_ns(uint64_t ns)
+{
+    if (!g_inited) return;
+    g.spp_lat_count++;
+    g.spp_lat_sum_ns += ns;
+    if (ns > g.spp_lat_max_ns) g.spp_lat_max_ns = ns;
+    if (ns > 5000000ull) g.spp_lat_over_5ms++;
 }
 
 void hle_audio_log_stats(void)
@@ -626,4 +773,36 @@ void hle_audio_log_stats(void)
            (unsigned long long)g.fmt_pushes,
            (unsigned long long)g.fmt_pops,
            (unsigned long long)g.fmt_drops_full);
+
+    /* Phase-2 parity + Phase-1 voice histogram + stream_process latency.
+     * Each block is emitted only if it has data, to keep the title-
+     * screen log readable when Phase 2/3 aren't active yet. */
+    if (g.voice_off_bypass || g.voice_off_real) {
+        HA_LOG("voice_off bypass=%llu real=%llu",
+               (unsigned long long)g.voice_off_bypass,
+               (unsigned long long)g.voice_off_real);
+    }
+    uint64_t hist_total = 0;
+    for (unsigned i = 0; i < 8; i++) hist_total += g.bypass_voice_hist[i];
+    if (hist_total) {
+        HA_LOG("bypass_voices_hist 0=%llu 1-2=%llu 3-4=%llu 5-8=%llu "
+               "9-16=%llu 17-32=%llu 33-64=%llu 64+=%llu",
+               (unsigned long long)g.bypass_voice_hist[0],
+               (unsigned long long)g.bypass_voice_hist[1],
+               (unsigned long long)g.bypass_voice_hist[2],
+               (unsigned long long)g.bypass_voice_hist[3],
+               (unsigned long long)g.bypass_voice_hist[4],
+               (unsigned long long)g.bypass_voice_hist[5],
+               (unsigned long long)g.bypass_voice_hist[6],
+               (unsigned long long)g.bypass_voice_hist[7]);
+    }
+    if (g.spp_lat_count) {
+        uint64_t avg = g.spp_lat_sum_ns / g.spp_lat_count;
+        HA_LOG("stream_process_lat n=%llu avg_ns=%llu max_ns=%llu "
+               "over_5ms=%llu",
+               (unsigned long long)g.spp_lat_count,
+               (unsigned long long)avg,
+               (unsigned long long)g.spp_lat_max_ns,
+               (unsigned long long)g.spp_lat_over_5ms);
+    }
 }

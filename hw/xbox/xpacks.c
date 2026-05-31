@@ -90,6 +90,25 @@ typedef struct ShaderOverride {
     char *file_abs;         /* absolute path to .spv */
 } ShaderOverride;
 
+/* Code-cave patch: writes a body of x86 into a caller-nominated free region
+ * (cave_at) and installs a 5-byte JMP rel32 trampoline at trampoline_at. By
+ * default the loader appends the displaced bytes of the original site and a
+ * return-jump back to trampoline_at + trampoline_size; with return_in_cave
+ * set the cave body is written verbatim (author handles its own return). */
+typedef struct CavePatch {
+    char *description;
+    uint32_t trampoline_at;     /* guest VA — where to install JMP rel32 */
+    uint32_t trampoline_size;   /* bytes displaced at the trampoline (>=5) */
+    uint8_t *expected;          /* optional pre-image at trampoline_at */
+    size_t expected_len;
+    uint32_t cave_at;           /* guest VA — where to write the cave body */
+    uint8_t *cave_expected;     /* optional pre-image at cave_at */
+    size_t cave_expected_len;
+    uint8_t *cave_bytes;        /* required — x86 body */
+    size_t cave_bytes_len;
+    bool return_in_cave;        /* skip auto-appended displaced+return tail */
+} CavePatch;
+
 typedef struct XPack {
     char *id;               /* "<title_id>/<pack_dir>" */
     char *dir_abs;          /* absolute pack directory */
@@ -100,6 +119,7 @@ typedef struct XPack {
     GPtrArray *match_xbe_sha1;
     GArray *bytes_patches;  /* BytesPatch */
     GArray *pattern_patches;/* PatternPatch */
+    GArray *cave_patches;   /* CavePatch */
     GArray *shader_ovr;     /* ShaderOverride */
 } XPack;
 
@@ -339,6 +359,7 @@ typedef enum {
     SEC_MATCH,
     SEC_PATCH_BYTES,
     SEC_PATCH_PATTERN,
+    SEC_PATCH_CAVE,
     SEC_PATCH_SHADER,
     SEC_PATCH_UNKNOWN,
 } ManifestSection;
@@ -352,6 +373,10 @@ typedef struct {
     PatternPatch cur_pattern;
     bool cur_pattern_have_replace;
     bool cur_pattern_have_signature;
+    CavePatch cur_cave;
+    bool cur_cave_have_body;
+    bool cur_cave_have_trampoline;
+    bool cur_cave_have_cave_at;
     ShaderOverride cur_shader;
     bool cur_shader_have;
 } ParseState;
@@ -375,6 +400,18 @@ static void reset_cur_pattern(ParseState *st)
     memset(&st->cur_pattern, 0, sizeof(st->cur_pattern));
     st->cur_pattern_have_replace = false;
     st->cur_pattern_have_signature = false;
+}
+
+static void reset_cur_cave(ParseState *st)
+{
+    g_free(st->cur_cave.description);
+    g_free(st->cur_cave.expected);
+    g_free(st->cur_cave.cave_expected);
+    g_free(st->cur_cave.cave_bytes);
+    memset(&st->cur_cave, 0, sizeof(st->cur_cave));
+    st->cur_cave_have_body = false;
+    st->cur_cave_have_trampoline = false;
+    st->cur_cave_have_cave_at = false;
 }
 
 static void reset_cur_shader(ParseState *st)
@@ -408,6 +445,21 @@ static void flush_current_patch(ParseState *st)
             st->cur_pattern_have_signature = false;
         } else {
             reset_cur_pattern(st);
+        }
+    } else if (st->section == SEC_PATCH_CAVE) {
+        if (st->cur_cave_have_body &&
+            st->cur_cave_have_trampoline &&
+            st->cur_cave_have_cave_at) {
+            if (st->cur_cave.trampoline_size == 0) {
+                st->cur_cave.trampoline_size = 5;
+            }
+            g_array_append_val(st->pack->cave_patches, st->cur_cave);
+            memset(&st->cur_cave, 0, sizeof(st->cur_cave));
+            st->cur_cave_have_body = false;
+            st->cur_cave_have_trampoline = false;
+            st->cur_cave_have_cave_at = false;
+        } else {
+            reset_cur_cave(st);
         }
     } else if (st->section == SEC_PATCH_SHADER) {
         if (st->cur_shader_have && st->cur_shader.file_abs) {
@@ -496,6 +548,10 @@ static void parse_manifest_line(ParseState *st, char *line)
                 reset_cur_bytes(st);
                 reset_cur_pattern(st);
                 st->section = SEC_PATCH_PATTERN;
+            } else if (!strcmp(val, "cave")) {
+                reset_cur_bytes(st);
+                reset_cur_cave(st);
+                st->section = SEC_PATCH_CAVE;
             } else if (!strcmp(val, "bytes")) {
                 /* already bytes */
             } else {
@@ -531,6 +587,10 @@ static void parse_manifest_line(ParseState *st, char *line)
             } else if (!strcmp(val, "bytes")) {
                 reset_cur_pattern(st);
                 st->section = SEC_PATCH_BYTES;
+            } else if (!strcmp(val, "cave")) {
+                reset_cur_pattern(st);
+                reset_cur_cave(st);
+                st->section = SEC_PATCH_CAVE;
             }
         } else if (!strcmp(key, "description")) {
             g_free(st->cur_pattern.description);
@@ -566,6 +626,63 @@ static void parse_manifest_line(ParseState *st, char *line)
             if (parse_hex_byte_string(val, &st->cur_pattern.replace,
                                       &st->cur_pattern.replace_len)) {
                 st->cur_pattern_have_replace = true;
+            }
+        }
+        break;
+    case SEC_PATCH_CAVE:
+        if (!strcmp(key, "kind")) {
+            if (!strcmp(val, "bytes")) {
+                reset_cur_cave(st);
+                st->section = SEC_PATCH_BYTES;
+            } else if (!strcmp(val, "pattern_bytes")) {
+                reset_cur_cave(st);
+                st->section = SEC_PATCH_PATTERN;
+            } else if (!strcmp(val, "shader")) {
+                reset_cur_cave(st);
+                st->section = SEC_PATCH_SHADER;
+            }
+        } else if (!strcmp(key, "description")) {
+            g_free(st->cur_cave.description);
+            st->cur_cave.description = g_strdup(val);
+        } else if (!strcmp(key, "trampoline_at")) {
+            if (parse_u32(val, &st->cur_cave.trampoline_at)) {
+                st->cur_cave_have_trampoline = true;
+            }
+        } else if (!strcmp(key, "trampoline_size")) {
+            parse_u32(val, &st->cur_cave.trampoline_size);
+        } else if (!strcmp(key, "expected")) {
+            g_free(st->cur_cave.expected);
+            st->cur_cave.expected = NULL;
+            st->cur_cave.expected_len = 0;
+            parse_hex_byte_string(val, &st->cur_cave.expected,
+                                  &st->cur_cave.expected_len);
+        } else if (!strcmp(key, "cave_at")) {
+            if (parse_u32(val, &st->cur_cave.cave_at)) {
+                st->cur_cave_have_cave_at = true;
+            }
+        } else if (!strcmp(key, "cave_expected")) {
+            g_free(st->cur_cave.cave_expected);
+            st->cur_cave.cave_expected = NULL;
+            st->cur_cave.cave_expected_len = 0;
+            parse_hex_byte_string(val, &st->cur_cave.cave_expected,
+                                  &st->cur_cave.cave_expected_len);
+        } else if (!strcmp(key, "cave_bytes")) {
+            g_free(st->cur_cave.cave_bytes);
+            st->cur_cave.cave_bytes = NULL;
+            st->cur_cave.cave_bytes_len = 0;
+            if (parse_hex_byte_string(val, &st->cur_cave.cave_bytes,
+                                      &st->cur_cave.cave_bytes_len)) {
+                st->cur_cave_have_body = true;
+            }
+        } else if (!strcmp(key, "return_in_cave")) {
+            /* accept true/false/1/0/yes/no */
+            const char *v = val;
+            while (*v == ' ' || *v == '\t') v++;
+            if (!g_ascii_strcasecmp(v, "true") || !strcmp(v, "1") ||
+                !g_ascii_strcasecmp(v, "yes")) {
+                st->cur_cave.return_in_cave = true;
+            } else {
+                st->cur_cave.return_in_cave = false;
             }
         }
         break;
@@ -605,6 +722,7 @@ static XPack *load_pack_from_dir(const char *title_id_dir,
     pack->dir_abs = g_build_filename(title_id_dir, pack_dir_name, NULL);
     pack->bytes_patches   = g_array_new(FALSE, FALSE, sizeof(BytesPatch));
     pack->pattern_patches = g_array_new(FALSE, FALSE, sizeof(PatternPatch));
+    pack->cave_patches    = g_array_new(FALSE, FALSE, sizeof(CavePatch));
     pack->shader_ovr      = g_array_new(FALSE, FALSE, sizeof(ShaderOverride));
 
     ParseState st = { 0 };
@@ -643,6 +761,14 @@ static void free_pack(XPack *pack)
         g_free(pp->replace);
     }
     g_array_free(pack->pattern_patches, TRUE);
+    for (guint i = 0; i < pack->cave_patches->len; i++) {
+        CavePatch *cp = &g_array_index(pack->cave_patches, CavePatch, i);
+        g_free(cp->description);
+        g_free(cp->expected);
+        g_free(cp->cave_expected);
+        g_free(cp->cave_bytes);
+    }
+    g_array_free(pack->cave_patches, TRUE);
     for (guint i = 0; i < pack->shader_ovr->len; i++) {
         ShaderOverride *so = &g_array_index(pack->shader_ovr, ShaderOverride, i);
         g_free(so->file_abs);
@@ -698,10 +824,11 @@ static void discover_packs(uint32_t title_id)
                         g_array_append_val(g_packs, pack);
                         qemu_log_mask(LOG_GUEST_ERROR,
                             XPACKS_TAG ": loaded pack '%s' (%s) "
-                            "[%u bytes, %u pattern, %u shader]\n",
+                            "[%u bytes, %u pattern, %u cave, %u shader]\n",
                             pack->id, pack->name ? pack->name : "",
                             pack->bytes_patches->len,
                             pack->pattern_patches->len,
+                            pack->cave_patches->len,
                             pack->shader_ovr->len);
                     } else {
                         qemu_log_mask(LOG_GUEST_ERROR,
@@ -866,6 +993,155 @@ static int apply_bytes_patch(const XPack *pack, const BytesPatch *bp)
     return 1;
 }
 
+/* Layout when return_in_cave=false:
+ *
+ *   cave_at:                  [cave_bytes]
+ *                             [original displaced bytes]   (trampoline_size B)
+ *                             [JMP rel32 back]             (5 B)
+ *
+ * Trampoline_at gets:
+ *                             [JMP rel32 -> cave_at]       (5 B)
+ *                             [NOP * (trampoline_size-5)]
+ *
+ * When return_in_cave=true, cave_bytes is the full body and the loader does
+ * not append displaced+return tail — the author is responsible for control
+ * flow exiting the cave (typically `ret`, `ret imm16`, or a jmp/call out).
+ */
+static int apply_cave_patch(const XPack *pack, const CavePatch *cp)
+{
+    if (!cp->cave_bytes_len || !cp->cave_bytes) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+            XPACKS_TAG ": [%s] cave missing cave_bytes — refusing\n",
+            pack->id);
+        return 0;
+    }
+    uint32_t tramp_sz = cp->trampoline_size ? cp->trampoline_size : 5;
+    if (tramp_sz < 5 || tramp_sz > 15) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+            XPACKS_TAG ": [%s] cave trampoline_size=%u out of range [5,15]\n",
+            pack->id, tramp_sz);
+        return 0;
+    }
+
+    /* Verify trampoline_at pre-image (load-bearing safety). */
+    if (cp->expected_len) {
+        uint8_t *buf = g_malloc(cp->expected_len);
+        if (!guest_read(cp->trampoline_at, buf, cp->expected_len)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                XPACKS_TAG ": [%s] cave read failed at trampoline_at 0x%08X\n",
+                pack->id, cp->trampoline_at);
+            g_free(buf);
+            return 0;
+        }
+        if (memcmp(buf, cp->expected, cp->expected_len) != 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                XPACKS_TAG ": [%s] cave expected-mismatch at 0x%08X — "
+                "refusing '%s'\n",
+                pack->id, cp->trampoline_at,
+                cp->description ? cp->description : "(no description)");
+            g_free(buf);
+            return 0;
+        }
+        g_free(buf);
+    }
+
+    /* Verify cave_at pre-image (catches collisions with real code/data). */
+    if (cp->cave_expected_len) {
+        uint8_t *buf = g_malloc(cp->cave_expected_len);
+        if (!guest_read(cp->cave_at, buf, cp->cave_expected_len)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                XPACKS_TAG ": [%s] cave read failed at cave_at 0x%08X\n",
+                pack->id, cp->cave_at);
+            g_free(buf);
+            return 0;
+        }
+        if (memcmp(buf, cp->cave_expected, cp->cave_expected_len) != 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                XPACKS_TAG ": [%s] cave_expected-mismatch at 0x%08X — "
+                "refusing '%s' (cave site not free)\n",
+                pack->id, cp->cave_at,
+                cp->description ? cp->description : "(no description)");
+            g_free(buf);
+            return 0;
+        }
+        g_free(buf);
+    }
+
+    /* Read the displaced bytes from trampoline_at — needed for the cave tail
+     * unless return_in_cave is set. We always read them to validate the page
+     * is mapped before we start writing anywhere. */
+    uint8_t displaced[16];
+    if (!guest_read(cp->trampoline_at, displaced, tramp_sz)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+            XPACKS_TAG ": [%s] cave failed to read %u displaced bytes at 0x%08X\n",
+            pack->id, tramp_sz, cp->trampoline_at);
+        return 0;
+    }
+
+    /* Build the cave body in a host buffer first, then write atomically. */
+    size_t total = cp->cave_bytes_len;
+    if (!cp->return_in_cave) {
+        total += tramp_sz + 5;   /* displaced + JMP rel32 back */
+    }
+    uint8_t *cave_buf = g_malloc(total);
+    memcpy(cave_buf, cp->cave_bytes, cp->cave_bytes_len);
+
+    if (!cp->return_in_cave) {
+        memcpy(cave_buf + cp->cave_bytes_len, displaced, tramp_sz);
+        /* Return JMP sits at cave_at + cave_bytes_len + tramp_sz; rel32 is
+         * computed relative to the END of the 5-byte JMP. */
+        uint32_t return_site = cp->cave_at +
+                               (uint32_t)cp->cave_bytes_len + tramp_sz;
+        uint32_t return_next = return_site + 5;
+        uint32_t target = cp->trampoline_at + tramp_sz;
+        int32_t  rel = (int32_t)(target - return_next);
+        uint8_t *jmp = cave_buf + cp->cave_bytes_len + tramp_sz;
+        jmp[0] = 0xE9;
+        jmp[1] = (uint8_t)(rel & 0xFF);
+        jmp[2] = (uint8_t)((rel >> 8) & 0xFF);
+        jmp[3] = (uint8_t)((rel >> 16) & 0xFF);
+        jmp[4] = (uint8_t)((rel >> 24) & 0xFF);
+    }
+
+    /* Write cave first so a torn install can't leave the trampoline pointing
+     * at uninitialized memory. */
+    if (!guest_write(cp->cave_at, cave_buf, total)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+            XPACKS_TAG ": [%s] cave write failed at 0x%08X (%zu bytes)\n",
+            pack->id, cp->cave_at, total);
+        g_free(cave_buf);
+        return 0;
+    }
+    g_free(cave_buf);
+
+    /* Now install the trampoline. JMP rel32 + optional NOPs. */
+    uint8_t tramp[16];
+    uint32_t tramp_next = cp->trampoline_at + 5;
+    int32_t  tramp_rel = (int32_t)(cp->cave_at - tramp_next);
+    tramp[0] = 0xE9;
+    tramp[1] = (uint8_t)(tramp_rel & 0xFF);
+    tramp[2] = (uint8_t)((tramp_rel >> 8) & 0xFF);
+    tramp[3] = (uint8_t)((tramp_rel >> 16) & 0xFF);
+    tramp[4] = (uint8_t)((tramp_rel >> 24) & 0xFF);
+    for (uint32_t i = 5; i < tramp_sz; i++) {
+        tramp[i] = 0x90; /* NOP padding to instruction boundary */
+    }
+    if (!guest_write(cp->trampoline_at, tramp, tramp_sz)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+            XPACKS_TAG ": [%s] cave trampoline write failed at 0x%08X\n",
+            pack->id, cp->trampoline_at);
+        return 0;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+        XPACKS_TAG ": [%s] cave installed — trampoline 0x%08X (%u B) -> "
+        "cave 0x%08X (%zu B%s) — %s\n",
+        pack->id, cp->trampoline_at, tramp_sz, cp->cave_at, total,
+        cp->return_in_cave ? "" : ", +displaced+return",
+        cp->description ? cp->description : "(no description)");
+    return 1;
+}
+
 int xpacks_apply_for_xbe(const struct xbe *xbe)
 {
     if (!xbe || !xbe->cert) return 0;
@@ -899,6 +1175,10 @@ int xpacks_apply_for_xbe(const struct xbe *xbe)
         for (guint j = 0; j < pack->bytes_patches->len; j++) {
             BytesPatch *bp = &g_array_index(pack->bytes_patches, BytesPatch, j);
             total += apply_bytes_patch(pack, bp);
+        }
+        for (guint j = 0; j < pack->cave_patches->len; j++) {
+            CavePatch *cp = &g_array_index(pack->cave_patches, CavePatch, j);
+            total += apply_cave_patch(pack, cp);
         }
         pending_pattern += pack->pattern_patches->len;
     }

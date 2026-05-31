@@ -635,6 +635,24 @@
             android:text="@string/settings_hrtf"
             android:textColor="@color/xemu_text_muted" />
 
+          <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/switch_hle_dsound_bypass"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/settings_hle_dsound_bypass"
+            android:textColor="@color/xemu_text_muted" />
+
+          <TextView
+            android:id="@+id/tv_hle_dsound_bypass_subtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:layout_marginBottom="2dp"
+            android:text="@string/settings_hle_dsound_bypass_subtitle"
+            android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+            android:textColor="@color/xemu_text_muted" />
+
           <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

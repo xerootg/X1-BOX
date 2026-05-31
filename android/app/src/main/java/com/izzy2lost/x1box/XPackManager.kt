@@ -30,6 +30,7 @@ object XPackManager {
         val description: String,
         val bytesPatchCount: Int,
         val patternPatchCount: Int,
+        val cavePatchCount: Int,
         val shaderOverrideCount: Int,
     )
 
@@ -146,6 +147,7 @@ object XPackManager {
         var description = ""
         var bytesCount = 0
         var patternCount = 0
+        var caveCount = 0
         var shaderCount = 0
         var section = "root"
         var currentKind = "bytes"
@@ -156,6 +158,7 @@ object XPackManager {
             when (currentKind) {
                 "bytes" -> bytesCount++
                 "pattern_bytes" -> patternCount++
+                "cave" -> caveCount++
                 "shader" -> shaderCount++
             }
             sawPatch = false
@@ -208,6 +211,7 @@ object XPackManager {
             description = description,
             bytesPatchCount = bytesCount,
             patternPatchCount = patternCount,
+            cavePatchCount = caveCount,
             shaderOverrideCount = shaderCount,
         )
     }

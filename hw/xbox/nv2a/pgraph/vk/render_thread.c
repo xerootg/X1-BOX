@@ -142,7 +142,7 @@ static void process_finish(PGRAPHVkState *r, RenderCommand *cmd)
     vkResetFences(r->device, 1, &cmd->finish.fence);
 
 #ifdef __ANDROID__
-    if (r->is_mali) {
+    if (r->gpu_quirks & GPU_QUIRK_SPLIT_AUX_MAIN_SUBMIT) {
         /*
          * Mali stock driver path: split aux + main into two separate
          * single-CB submits, joined by a per-frame semaphore. Two reasons:
@@ -255,7 +255,7 @@ static void process_finish(PGRAPHVkState *r, RenderCommand *cmd)
      * Routed through __android_log_assert (see [[feedback_vk_check_logging]])
      * so the message survives libc's abort path.
      */
-    if (r->is_mali) {
+    if (r->gpu_quirks & GPU_QUIRK_FENCE_TIMEOUT_WATCH) {
         const uint64_t timeout_ns = 4000ULL * 1000ULL * 1000ULL;
         VkResult wait = vkWaitForFences(r->device, 1, &cmd->finish.fence,
                                         VK_TRUE, timeout_ns);

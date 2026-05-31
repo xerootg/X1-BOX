@@ -698,6 +698,7 @@ struct DisplaySettings {
   bool use_dsp = false;
   bool use_dsp_jit = true;
   bool hrtf = false;
+  bool hle_dsound_bypass = false;
   bool cache_shaders = true;
   bool net_enable = false;
   std::string renderer = "vulkan";
@@ -771,6 +772,7 @@ static bool WriteConfigToml(const std::string& config_path,
   audio->insert_or_assign("hrtf", ds.hrtf);
   audio->insert_or_assign("use_dsp", ds.use_dsp);
   audio->insert_or_assign("use_dsp_jit", ds.use_dsp_jit);
+  android->insert_or_assign("hle_dsound_bypass", ds.hle_dsound_bypass);
   if (!audio->contains("volume_limit")) {
     audio->insert_or_assign("volume_limit", 1.0);
   }
@@ -992,8 +994,16 @@ static SetupFiles SyncSetupFiles() {
       GetPrefBool(env, activity, "vsync", false));
   ds.unlock_framerate = GetPrefBool(env, activity, "unlock_framerate", true);
   ds.skip_boot_anim = GetPrefBool(env, activity, "setting_skip_boot_anim", true);
-  ds.use_dsp = GetPrefBool(env, activity, "setting_use_dsp", false);
-  ds.use_dsp_jit = GetPrefBool(env, activity, "setting_use_dsp_jit", true);
+  ds.hle_dsound_bypass = GetPrefBool(env, activity, "setting_hle_dsound_bypass", false);
+  if (ds.hle_dsound_bypass) {
+    setenv("X1BOX_HLE_DSOUND_BYPASS", "1", 1);
+  }
+  /* When bypass is on, DSP is forced off both here and in the UI — no point
+   * running GP/EP effects on a VP output path that is being bypassed. */
+  ds.use_dsp = ds.hle_dsound_bypass ? false
+               : GetPrefBool(env, activity, "setting_use_dsp", false);
+  ds.use_dsp_jit = ds.hle_dsound_bypass ? false
+                   : GetPrefBool(env, activity, "setting_use_dsp_jit", true);
   ds.hrtf = GetPrefBool(env, activity, "setting_hrtf",
                          GetPrefBool(env, activity, "hrtf", false));
   ds.cache_shaders = GetPrefBool(env, activity, "setting_cache_shaders", true);
@@ -1801,6 +1811,23 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_izzy2lost_x1box_MainActivity_nativeExitEmulation(JNIEnv *, jobject)
 {
     xemu_android_request_exit();
+}
+
+/*
+ * Android onTrimMemory bridge. MainActivity forwards ComponentCallbacks2 trim
+ * levels here so the GPU texture cache can shed EARLY (before the KGSL
+ * allocator OOMs) when the OS reports memory pressure. Storing the request is
+ * a lone atomic; the actual eviction runs on the pgraph thread at the next
+ * draw (pgraph_vk_texture_budget_tick), so this is safe to call from the JVM
+ * thread at any time, including before the renderer exists.
+ */
+extern "C" void pgraph_vk_request_texture_trim(int level);
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_izzy2lost_x1box_MainActivity_nativeOnTrimMemory(JNIEnv *, jobject,
+                                                         jint level)
+{
+    pgraph_vk_request_texture_trim((int)level);
 }
 
 /*

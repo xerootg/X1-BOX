@@ -327,6 +327,15 @@ bool xemu_settings_load(void)
      * X1BOX_HLE_YIELD=0 / _KF=0. */
     setenv("X1BOX_HLE", "1", 0);
 
+    /* DSound HLE — telemetry on by default so per-handler hit rates
+     * surface for measurement. Bypass stays OFF by default — every
+     * combination tried 2026-05-23 / 2026-05-27 wedged Halo 2 (voice
+     * IRQ never fires through the bypass cursor-advance path). The
+     * cursor advance + voice_off pattern is correct on paper but
+     * something MCPX-side gates the IRQ on more than CBO>=EBO. Needs
+     * standalone debugging before turning on. */
+    setenv("X1BOX_HLE_DSOUND", "1", 0);
+
     /* KiIdleLoop spin gate. Default = 0x3 (yield every 4th idle iter,
      * 4× the upstream /16 rate). The hot spin TB at 0x8001b02f runs
      * 80k–170k iters/sec on Pixel 10a; at /16 the X4 governor saw a
@@ -704,6 +713,11 @@ bool xemu_settings_load(void)
             char fifo_str[16];
             snprintf(fifo_str, sizeof(fifo_str), "%d", fifo_frames);
             setenv("XEMU_ANDROID_AUDIO_FIFO_FRAMES", fifo_str, 1);
+        }
+        if (auto bypass = android_cfg["hle_dsound_bypass"].value<bool>()) {
+            if (*bypass) {
+                setenv("X1BOX_HLE_DSOUND_BYPASS", "1", 1);
+            }
         }
         if (auto audio_driver = android_cfg["audio_driver"].value<std::string>()) {
             std::string driver = *audio_driver;

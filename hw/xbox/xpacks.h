@@ -9,6 +9,10 @@
  *   kind = "pattern_bytes"  pattern-anchored guest memory patch
  *                           (tag-data / map overlays — retries on every tick
  *                            until the pattern appears, since maps load late)
+ *   kind = "cave"           code cave + JMP rel32 trampoline
+ *                           (inject new x86 at a free address, redirect a
+ *                            site to it; loader appends displaced bytes +
+ *                            return jump unless return_in_cave is set)
  *   kind = "shader"         SPIR-V replacement keyed by GLSL hash
  *                           (intercepted in pgraph_vk compile path)
  *

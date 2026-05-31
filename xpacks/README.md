@@ -1,8 +1,9 @@
 # xpacks — x1-box patch packs
 
-Cemu-style mod packs for x1-box. Three patch kinds: static `bytes` (xbe
-code/data), `pattern_bytes` (tag/map data via signature scan), and `shader`
-(Vulkan SPIR-V replacement). Full spec: [SPEC.md](SPEC.md).
+Cemu-style mod packs for x1-box. Four patch kinds: static `bytes` (xbe
+code/data), `pattern_bytes` (tag/map data via signature scan), `cave`
+(inject new x86 + JMP rel32 trampoline), and `shader` (Vulkan SPIR-V
+replacement). Full spec: [SPEC.md](SPEC.md).
 
 Drop a directory under
 `<sdcard>/Android/data/com.izzy2lost.x1box/files/xpacks/<TITLE_ID>/<pack>/`
@@ -51,6 +52,18 @@ search_offset  = 0x10                    # bytes from match site to patch site
 expected       = "00 00 80 3F"           # optional pre-image guard
 replace        = "00 00 00 40"
 
+# code cave + JMP rel32 trampoline (inject new x86 at a free guest VA)
+[[patch]]
+kind            = "cave"
+description     = "..."
+trampoline_at   = 0x00123110             # required — JMP rel32 install site
+expected        = "55 8B EC 83 EC"       # optional — pre-image at trampoline
+trampoline_size = 5                      # optional — bytes displaced (5..15)
+cave_at         = 0x002B0000             # required — free region for cave body
+cave_expected   = "00 00 00 ..."         # optional — verify cave site is free
+cave_bytes      = "C2 08 00"             # required — x86 body (here: ret 8)
+return_in_cave  = true                   # optional — cave does its own return
+
 # pgraph_vk SPIR-V override keyed by GLSL hash
 [[patch]]
 kind      = "shader"
@@ -88,6 +101,11 @@ rewrite, not a binary patch).
 - **Pattern patches** first attempt at xbe-detect, then retry every guest
   frame via `nv2a_profile_flip_stall()` until each signature is resident.
   Throttled internally to one scan per second.
+- **Cave patches** apply once at xbe-detect, same timing as bytes. The cave
+  body + (optional) displaced bytes + return-jump are written to `cave_at`,
+  then a 5-byte JMP rel32 (NOP-padded to `trampoline_size`) is installed at
+  `trampoline_at`. Both `expected` and `cave_expected` are load-bearing
+  safety: a mismatch refuses the pack.
 - **Shader overrides** apply during pgraph_vk's GLSL → SPIR-V compile. The
   override bypasses both the on-disk SPV cache and the glslang compiler.
 

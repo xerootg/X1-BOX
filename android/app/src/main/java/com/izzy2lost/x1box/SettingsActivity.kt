@@ -310,9 +310,10 @@ class SettingsActivity : AppCompatActivity() {
     val toggleThread      = findViewById<MaterialButtonToggleGroup>(R.id.toggle_tcg_thread)
     val btnMulti          = findViewById<MaterialButton>(R.id.btn_thread_multi)
     val btnSingle         = findViewById<MaterialButton>(R.id.btn_thread_single)
-    val switchDsp         = findViewById<MaterialSwitch>(R.id.switch_use_dsp)
-    val switchDspJit      = findViewById<MaterialSwitch>(R.id.switch_use_dsp_jit)
-    val switchHrtf        = findViewById<MaterialSwitch>(R.id.switch_hrtf)
+    val switchDsp             = findViewById<MaterialSwitch>(R.id.switch_use_dsp)
+    val switchDspJit          = findViewById<MaterialSwitch>(R.id.switch_use_dsp_jit)
+    val switchHrtf            = findViewById<MaterialSwitch>(R.id.switch_hrtf)
+    val switchHleDsoundBypass = findViewById<MaterialSwitch>(R.id.switch_hle_dsound_bypass)
     val switchShaders     = findViewById<MaterialSwitch>(R.id.switch_cache_shaders)
     val switchFpu         = findViewById<MaterialSwitch>(R.id.switch_hard_fpu)
     val switchX87Lib      = findViewById<MaterialSwitch>(R.id.switch_x87_lib)
@@ -453,6 +454,26 @@ class SettingsActivity : AppCompatActivity() {
     switchDsp.isChecked     = prefs.getBoolean("setting_use_dsp", false)
     switchDspJit.isChecked  = prefs.getBoolean("setting_use_dsp_jit", true)
     switchHrtf.isChecked    = prefs.getBoolean(PREF_HRTF, false)
+    switchHleDsoundBypass.isChecked = prefs.getBoolean("setting_hle_dsound_bypass", false)
+
+    fun applyDspConflict(bypassOn: Boolean) {
+      if (bypassOn) {
+        switchDsp.isChecked    = false
+        switchDspJit.isChecked = false
+        switchDsp.isEnabled    = false
+        switchDspJit.isEnabled = false
+      } else {
+        switchDsp.isEnabled    = true
+        switchDspJit.isEnabled = true
+        switchDsp.isChecked    = prefs.getBoolean("setting_use_dsp", false)
+        switchDspJit.isChecked = prefs.getBoolean("setting_use_dsp_jit", true)
+      }
+    }
+
+    applyDspConflict(switchHleDsoundBypass.isChecked)
+    switchHleDsoundBypass.setOnCheckedChangeListener { _, isChecked ->
+      applyDspConflict(isChecked)
+    }
     switchShaders.isChecked = prefs.getBoolean("setting_cache_shaders", true)
     switchFpu.isChecked     = prefs.getBoolean("setting_hard_fpu", true)
     switchX87Lib.isChecked  = prefs.getBoolean("setting_x87_lib", false)
@@ -563,6 +584,7 @@ class SettingsActivity : AppCompatActivity() {
         .putString(OrientationPreferences.PREF_UI_ORIENTATION, selectedUiOrientation.prefValue)
         .putString(OrientationPreferences.PREF_GAME_ORIENTATION, selectedGameOrientation.prefValue)
         .putString("setting_tcg_thread", selectedThread)
+        .putBoolean("setting_hle_dsound_bypass", switchHleDsoundBypass.isChecked)
         .putBoolean("setting_use_dsp", switchDsp.isChecked)
         .putBoolean("setting_use_dsp_jit", switchDspJit.isChecked)
         .putBoolean(PREF_HRTF, switchHrtf.isChecked)

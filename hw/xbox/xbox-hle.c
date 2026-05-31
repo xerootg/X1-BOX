@@ -2823,27 +2823,28 @@ static bool hle_h2_intro_dispatcher(X86CPU *cpu)
 /*  XBE-side DSound HLE (Halo 2 leaf stubs)                            */
 /* ------------------------------------------------------------------ */
 /*
- * Scaffold for the Cxbx-Reloaded DSound HLE port. Today this is just
- * the **leaf** API stubs: pure-control entry points (Play/Stop/Pause +
- * all Set*) where stubbing means silent audio but no guest crash. The
- * stateful entry points (DirectSoundCreate, CreateSoundBuffer/Stream,
- * Lock/Unlock, GetStatus, GetCurrentPosition) write guest-visible OUT
- * structs and are left to fall through to the real Xbox SDK code path
- * for now — a follow-up will port Cxbx-R's HybridDSBuffer model and an
- * SDL-audio backend.
+ * Xbox 1 DirectSound HLE — snoop+continue implementation.
  *
- * Entry-point VAs are hardcoded for halo2-default.xbe; identified from
- * retained DSound symbols in Ghidra (see [[project_halo2_xpack_mod_
- * candidates]] sibling work). Other titles will need their own
- * resolution pass.
+ * Architecture (validated against XEFU's Xbox-on-360 BC emulator —
+ * see hw/xbox/XEFU_AUDIO_NOTES.md for the full RE findings):
+ *
+ *   Create probes   → capture WAVEFORMATEX into format FIFO (decline)
+ *   SetBufferData   → copy bytes + pre-decode ADPCM→PCM16 (decline)
+ *   Play/Stop       → feed HLE ring + signal bypass (decline)
+ *   SetVolume/Freq  → update per-slot gain/rate (decline)
+ *   Stream_Process  → push packet into ring (decline)
+ *   Unlock          → push Lock/Unlock writes into ring (decline)
+ *
+ * All handlers return false (decline) so the real Xbox SDK code also
+ * runs — MCPX voices get activated and their cursors advance. The vp.c
+ * bypass drain (X1BOX_HLE_DSOUND_BYPASS=1) reads our decoded PCM ring
+ * instead of the MCPX VP output, providing the audio path.
+ *
+ * Entry-point VAs are hardcoded for halo2-default.xbe; other titles
+ * need their own VA resolution pass.
  *
  * Xbox COM ABI: __stdcall with `this` on the stack as arg-0. Return
- * value in EAX. Callee pops ret + N*4. Floats are passed in 32-bit
- * slots (so SetPosition(this,x,y,z,dwApply) = 5 slots, SetOrientation
- * with two float3 vectors + this + dwApply = 8 slots).
- *
- * Stubs all return DS_OK (0). DSound success is HRESULT==0 — the game
- * branches on `if (FAILED(hr))` so any non-negative value is fine.
+ * value in EAX. Callee pops ret + N*4. Floats are 32-bit stack slots.
  */
 #define HALO2_DSOUND_PC_LO 0x00379d00u
 #define HALO2_DSOUND_PC_HI 0x0037fd00u
@@ -2887,16 +2888,7 @@ DSOUND_STUB(4)
 DSOUND_STUB(5)
 DSOUND_STUB(8)
 
-/*
- * Real handlers that drive hle_audio_*. Same stdcall pop discipline as
- * the stubs, but with actual side effects.
- *
- * v1 assumes WAVE_FORMAT_PCM 22050 Hz mono 16-bit for any captured
- * buffer — that's Halo 2's dominant UI-sound default. Buffers that
- * use a different format will sound wrong-pitched (rate) or quiet
- * (8-bit treated as 16-bit). Format detection from the buffer's
- * WAVEFORMATEX is the next sub-task — see [[project_dsound_hle_scaffold]].
- */
+/* Real handlers that drive hle_audio_*. */
 /*
  * All buffer/stream method handlers are SNOOP+DECLINE as of 2026-05-23.
  *
@@ -2951,33 +2943,89 @@ DSOUND_STUB(8)
  * follow-up). At that point the handlers will take ownership too, so
  * the realtime-deadline concern disappears.
  */
+/*
+ * Phase 2: snoop+continue. When the bypass gate (X1BOX_HLE_DSOUND_BYPASS)
+ * is on, these handlers feed the HLE audio backend ring with the same
+ * data the real CDirectSoundBuffer impl will mix — the vp.c bypass
+ * suppresses the real mix and emits our captured audio instead. All
+ * return false so the real impl ALSO runs (to keep MCPX cursors moving
+ * for the game's GetCurrentPosition / SE2FE_IDLE_VOICE handshake).
+ *
+ * When the gate is off, every handler is a pure `return false` — same
+ * as the prior decline-only state. The early-return on `!g_gate_dsound_
+ * bypass` keeps Phase 1 telemetry-only mode at zero added cost.
+ *
+ * Caps documented per call site. Realtime budget for these handlers is
+ * the EP-frame period (~670 us). The 64KB SetBufferData snoop typically
+ * fires once per buffer create (cold); the 16KB Stream_Process snoop
+ * fires per packet at ~250 Hz peak — both well under budget.
+ */
+
+/* IDirectSoundBuffer::SetBufferData(this, pvBufferData, dwBufferBytes) */
 static bool hle_dsound_set_buffer_data(X86CPU *cpu)
 {
-    (void)cpu;
+    if (!g_gate_dsound_bypass) return false;
+    CPUX86State *env = &cpu->env;
+    uint32_t pBuffer  = hle_arg32(env, 0);
+    uint32_t pData    = hle_arg32(env, 1);
+    uint32_t dwBytes  = hle_arg32(env, 2);
+    if (!pBuffer || !pData || !dwBytes) return false;
+    if (dwBytes > 65536u) dwBytes = 65536u;       /* 64KB cap */
+    uint8_t *scratch = malloc(dwBytes);
+    if (!scratch) return false;
+    if (g_read(pData, scratch, dwBytes)) {
+        hle_audio_buffer_set_data(pBuffer, scratch, dwBytes,
+                                  /*tag fallback*/ 1u,
+                                  /*rate*/ 0u, /*ch*/ 1u, /*bits*/ 16u);
+    }
+    free(scratch);
     return false;
 }
 
+/* IDirectSoundBuffer::Play(this, dwReserved1, dwReserved2, dwFlags)
+ * DSBPLAY_LOOPING = 0x1 in the dwFlags arg-3. */
 static bool hle_dsound_play(X86CPU *cpu)
 {
-    (void)cpu;
+    if (!g_gate_dsound_bypass) return false;
+    CPUX86State *env = &cpu->env;
+    uint32_t pBuffer = hle_arg32(env, 0);
+    uint32_t flags   = hle_arg32(env, 3);
+    if (!pBuffer) return false;
+    hle_audio_buffer_play(pBuffer, (flags & 0x1u) != 0u);
     return false;
 }
 
+/* IDirectSoundBuffer::Stop(this) */
 static bool hle_dsound_stop(X86CPU *cpu)
 {
-    (void)cpu;
+    if (!g_gate_dsound_bypass) return false;
+    uint32_t pBuffer = hle_arg32(&cpu->env, 0);
+    if (!pBuffer) return false;
+    hle_audio_buffer_stop(pBuffer);
     return false;
 }
 
+/* IDirectSoundBuffer::SetVolume(this, lVolume)   lVolume is signed 1/100 dB */
 static bool hle_dsound_set_volume(X86CPU *cpu)
 {
-    (void)cpu;
+    if (!g_gate_dsound_bypass) return false;
+    CPUX86State *env = &cpu->env;
+    uint32_t pBuffer = hle_arg32(env, 0);
+    int32_t  lVolume = (int32_t)hle_arg32(env, 1);
+    if (!pBuffer) return false;
+    hle_audio_buffer_set_volume(pBuffer, lVolume);
     return false;
 }
 
+/* IDirectSoundBuffer::SetFrequency(this, dwFreqHz) */
 static bool hle_dsound_set_frequency(X86CPU *cpu)
 {
-    (void)cpu;
+    if (!g_gate_dsound_bypass) return false;
+    CPUX86State *env = &cpu->env;
+    uint32_t pBuffer  = hle_arg32(env, 0);
+    uint32_t dwFreqHz = hle_arg32(env, 1);
+    if (!pBuffer) return false;
+    hle_audio_buffer_set_frequency(pBuffer, dwFreqHz);
     return false;
 }
 
@@ -3058,18 +3106,94 @@ static bool hle_idsound_create_stream_probe(X86CPU *cpu)
  *  +16  hCompletionEvent / pContext (union; not touched here)
  *  +20  prtTimestamp        (guest pointer; ignored)
  */
-/* Stream Process — snoop stripped (see comment on the buffer handlers
- * above). The g_read of guest packet bytes on every Process call was
- * what corrupted Bink-video audio + drifted physics. Pure decline. */
+/* CDirectSoundStream::Process(this, pInput, pOutput)
+ *
+ * Phase 2: snoop+continue under the bypass gate. The packet body
+ * snoop is capped at 16 KB (Halo 2 .wma packets are ~8 KB) — the
+ * 4MB g_read in the 2026-05-23 first-snoop iteration is what blew
+ * the realtime budget. Latency is timed end-to-end and reported via
+ * hle_audio_record_stream_process_latency_ns; the 5 ms over-budget
+ * counter is the realtime guardrail.
+ */
 static bool hle_dsound_stream_process(X86CPU *cpu)
 {
-    (void)cpu;
+    if (!g_gate_dsound_bypass) return false;
+    int64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    CPUX86State *env = &cpu->env;
+    uint32_t pThis   = hle_arg32(env, 0);
+    uint32_t pInput  = hle_arg32(env, 1);
+    if (!pThis || !pInput) goto done;
+
+    uint32_t pvBuffer = 0;
+    uint32_t dwMaxSize = 0;
+    if (!g_read32(pInput + 0,  &pvBuffer))  goto done;
+    if (!g_read32(pInput + 4,  &dwMaxSize)) goto done;
+    if (!pvBuffer || !dwMaxSize) goto done;
+    if (dwMaxSize > 16384u) dwMaxSize = 16384u;     /* 16KB cap */
+
+    uint8_t *scratch = malloc(dwMaxSize);
+    if (scratch) {
+        if (g_read(pvBuffer, scratch, dwMaxSize)) {
+            hle_audio_stream_push_packet(pThis, scratch, dwMaxSize);
+        }
+        free(scratch);
+    }
+done:
+    hle_audio_record_stream_process_latency_ns(
+        (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_HOST) - t0));
     return false;
 }
 
 static bool hle_dsound_mcpx_stream_flush(X86CPU *cpu)
 {
-    (void)cpu;
+    if (!g_gate_dsound_bypass) return false;
+    uint32_t pStream = hle_arg32(&cpu->env, 0);
+    if (pStream) hle_audio_stream_flush(pStream);
+    return false;
+}
+
+/*
+ * IDirectSoundBuffer::Unlock(this, pvAudioPtr1, dwAudio1Bytes,
+ *                            pvAudioPtr2, dwAudio2Bytes)
+ *
+ * Phase 3: closes the capture gap for buffers that fill via Lock/Unlock
+ * instead of SetBufferData. Bink + custom-mixer paths do this; without
+ * a snoop here, bypass=on goes silent for them. Each region is capped
+ * at 32KB so even a Bink 600ms-ring full-region Unlock stays well under
+ * the realtime budget.
+ */
+static bool hle_dsound_unlock(X86CPU *cpu)
+{
+    if (!g_gate_dsound_bypass) return false;
+    CPUX86State *env = &cpu->env;
+    uint32_t pBuffer  = hle_arg32(env, 0);
+    uint32_t pAudio1  = hle_arg32(env, 1);
+    uint32_t dwSize1  = hle_arg32(env, 2);
+    uint32_t pAudio2  = hle_arg32(env, 3);
+    uint32_t dwSize2  = hle_arg32(env, 4);
+    if (!pBuffer) return false;
+
+    const uint32_t CAP = 32768u;
+    if (pAudio1 && dwSize1) {
+        uint32_t n = dwSize1 > CAP ? CAP : dwSize1;
+        uint8_t *scratch = malloc(n);
+        if (scratch) {
+            if (g_read(pAudio1, scratch, n)) {
+                hle_audio_buffer_unlock_write(pBuffer, scratch, n);
+            }
+            free(scratch);
+        }
+    }
+    if (pAudio2 && dwSize2) {
+        uint32_t n = dwSize2 > CAP ? CAP : dwSize2;
+        uint8_t *scratch = malloc(n);
+        if (scratch) {
+            if (g_read(pAudio2, scratch, n)) {
+                hle_audio_buffer_unlock_write(pBuffer, scratch, n);
+            }
+            free(scratch);
+        }
+    }
     return false;
 }
 
@@ -3109,6 +3233,20 @@ static const struct {
     /* Stream pump — real handlers driving the audio backend */
     { "CDirectSoundStream_Process",            0x0037ad25u, hle_dsound_stream_process        },
     { "CMcpxStream_Flush",                     0x0037fbfeu, hle_dsound_mcpx_stream_flush     },
+
+    /* Phase 1 surface-parity sweep — decline-only. Counters tell us
+     * which entries Halo 2 actually exercises so we can decide which
+     * to promote to snoop+continue in Phase 2 / full-intercept in
+     * Phase 3. All bodies are `return false; (void)cpu;` (hle_dsound_stub_0). */
+    { "IDirectSoundBuffer_Lock",               0x0037b7b3u, hle_dsound_stub_0 },
+    { "IDirectSoundBuffer_Unlock",             0x00379f40u, hle_dsound_unlock },
+    { "IDirectSoundBuffer_GetCurrentPosition", 0x0037b777u, hle_dsound_stub_0 },
+    { "IDirectSoundBuffer_GetStatus",          0x0037b75bu, hle_dsound_stub_0 },
+    { "DirectSoundCreate",                     0x0037d797u, hle_dsound_stub_0 },
+    { "CDirectSoundStream_FlushEx",            0x0037adedu, hle_dsound_stub_0 },
+    { "CDirectSoundStream_Pause",              0x0037ad9cu, hle_dsound_stub_0 },
+    { "CDirectSoundStream_Constructor",        0x0037c9e5u, hle_dsound_stub_0 },
+    { "CMcpxStream_Discontinuity",             0x0037fb0eu, hle_dsound_stub_0 },
 };
 
 static bool g_dsound_installed;

@@ -557,6 +557,23 @@ static bool select_physical_device(PGRAPHState *pg, Error **errp)
     /* Vendor IDs that drive runtime quirks. Mali (ARM) needs a tail
      * reservation on descriptor-bound buffers; see PGRAPHVkState::is_mali. */
     r->is_mali = (r->device_props.vendorID == 0x13B5u);
+
+    /*
+     * Derive the GPU_QUIRK_* bitmask (see enum in renderer.h). Every Mali-driven
+     * quirk is set iff is_mali, so migrating an existing `r->is_mali` test to its
+     * named quirk is behaviour-preserving today; per-driver tuning later is a
+     * one-line change here. GPU_QUIRK_WC_STREAM_UPLOAD (write-combined streaming
+     * upload) is a general win and is enabled on all vendors by default.
+     */
+    r->gpu_quirks = 0;
+    if (r->is_mali) {
+        r->gpu_quirks |= GPU_QUIRK_DESCRIPTOR_TAIL_PAD |
+                         GPU_QUIRK_SPLIT_AUX_MAIN_SUBMIT |
+                         GPU_QUIRK_FENCE_TIMEOUT_WATCH |
+                         GPU_QUIRK_COLOR_FORMAT_BAKE |
+                         GPU_QUIRK_NO_COLOR_DIRECT_BIND;
+    }
+    r->gpu_quirks |= GPU_QUIRK_WC_STREAM_UPLOAD;
 #ifdef __ANDROID__
     if (r->is_mali) {
         __android_log_print(ANDROID_LOG_INFO, "xemu-vulkan",

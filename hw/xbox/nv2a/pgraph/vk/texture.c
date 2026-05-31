@@ -29,11 +29,131 @@
 #include "qemu/fast-hash.h"
 #include "qemu/lru.h"
 #include "renderer.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 static void texture_cache_release_node_resources(PGRAPHVkState *r, TextureBinding *snode);
 static bool image_pool_acquire(PGRAPHVkState *r, const TextureImageConfig *config,
                                VkImage *out_image, VmaAllocation *out_allocation);
 static void image_pool_drain(PGRAPHVkState *r);
+
+/* ---- Texture-cache GPU-memory budget (byte cap + backpressure shed) -------
+ *
+ * The texture cache is count-capped (texture_cache_target, default 1024) but
+ * each entry is a full VkImage; a full cache of RGBA8+mip textures pins
+ * ~2.8 GB on Halo 2 and OOM-crashes the Adreno KGSL allocator mid-combat. We
+ * track the EXACT GPU bytes of every live texture image (via
+ * vmaGetAllocationInfo, no format guessing) and enforce an absolute budget by
+ * shedding the LRU. The absolute cap is deliberately independent of the Vulkan
+ * heap "budget": on UMA (Adreno) that budget ~= all system RAM, so the
+ * usage/budget ratio in pgraph_vk_check_memory_budget never trips even as the
+ * system OOMs. lru_try_evict_one never evicts a bound or in-flight texture, so
+ * shedding is always safe; what cannot be shed (the live working set) simply
+ * stays, which is correct.
+ */
+
+/* onTrimMemory level from the Android JNI bridge (set on any thread; consumed
+ * on the pgraph thread in pgraph_vk_texture_budget_tick). -1 = no request. */
+static int g_texture_trim_request = -1;
+
+void pgraph_vk_request_texture_trim(int level)
+{
+    qatomic_set(&g_texture_trim_request, level);
+}
+
+static size_t tex_alloc_bytes(PGRAPHVkState *r, VmaAllocation allocation)
+{
+    if (allocation == VK_NULL_HANDLE) {
+        return 0;
+    }
+    VmaAllocationInfo info;
+    vmaGetAllocationInfo(r->allocator, allocation, &info);
+    return info.size;
+}
+
+static inline void tex_bytes_add(PGRAPHVkState *r, VmaAllocation a)
+{
+    r->texture_cache_bytes += tex_alloc_bytes(r, a);
+}
+
+static inline void tex_bytes_sub(PGRAPHVkState *r, VmaAllocation a)
+{
+    size_t b = tex_alloc_bytes(r, a);
+    r->texture_cache_bytes =
+        (r->texture_cache_bytes > b) ? r->texture_cache_bytes - b : 0;
+}
+
+/*
+ * Shed live texture GPU memory down to `target` bytes. Frees idle pooled images
+ * first (immediate, never in use), then evicts LRU cache entries — each evicted
+ * image returns to the pool and is drained on the next pass. Stops when under
+ * target or when no further progress is possible (everything left is bound or
+ * in-flight). Runs only on the pgraph thread.
+ */
+static void texture_cache_shed_to(PGRAPHVkState *r, size_t target)
+{
+    bool progress = true;
+    while (r->texture_cache_bytes > target && progress) {
+        progress = false;
+        while (r->texture_cache_bytes > target && r->image_pool_count > 0) {
+            PooledImage *o = QTAILQ_FIRST(&r->image_pool);
+            QTAILQ_REMOVE(&r->image_pool, o, entry);
+            tex_bytes_sub(r, o->allocation);
+            vmaDestroyImage(r->allocator, o->image, o->allocation);
+            g_free(o);
+            r->image_pool_count--;
+            progress = true;
+        }
+        if (r->texture_cache_bytes <= target) {
+            break;
+        }
+        if (lru_try_evict_one(&r->texture_cache)) {
+            progress = true;
+        }
+    }
+}
+
+/*
+ * Per-draw budget tick (called from pgraph_vk_check_memory_budget). Consumes
+ * any pending Android onTrimMemory request and sheds EARLY below the cap,
+ * proportional to severity; otherwise enforces the steady-state absolute cap.
+ */
+void pgraph_vk_texture_budget_tick(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    size_t cap = r->texture_cache_bytes_max;
+
+#ifdef __ANDROID__
+    /* DIAG: throttled probe of the texture budget state, via direct
+     * android_log so it surfaces regardless of the VK_LOG compile gate. */
+    static unsigned dbg_tick = 0;
+    if ((dbg_tick++ % 60) == 0) {
+        __android_log_print(ANDROID_LOG_ERROR, "hakuX-tex",
+            "tex_budget cap=%zuMB bytes=%zuMB lru_used=%zu img_pool=%d",
+            cap >> 20, r->texture_cache_bytes >> 20,
+            (size_t)r->texture_cache.num_used, r->image_pool_count);
+    }
+#endif
+
+    if (!cap) {
+        return; /* uncapped (desktop / legacy) */
+    }
+
+    int trim = qatomic_xchg(&g_texture_trim_request, -1);
+    if (trim >= 0) {
+        /* TRIM_MEMORY_RUNNING_CRITICAL == 15; >= that (or any background
+         * level) means real system pressure -> shed hard. Lighter levels
+         * (RUNNING_LOW/MODERATE) shed gently below the steady cap. */
+        size_t tgt = (trim >= 15) ? cap / 2 : (cap * 3) / 4;
+        texture_cache_shed_to(r, tgt);
+        return;
+    }
+
+    if (r->texture_cache_bytes > cap) {
+        texture_cache_shed_to(r, cap);
+    }
+}
 
 static const VkImageType dimensionality_to_vk_image_type[] = {
     0,
@@ -170,7 +290,8 @@ static uint8_t *mali_bake_swizzle_to_rgba8(int color_format,
  */
 static VkColorFormatInfo get_color_format_info(PGRAPHVkState *r, int color_format)
 {
-    if (r->is_mali && mali_format_needs_bake(color_format)) {
+    if ((r->gpu_quirks & GPU_QUIRK_COLOR_FORMAT_BAKE) &&
+        mali_format_needs_bake(color_format)) {
         VkColorFormatInfo baked = {
             .vk_format = VK_FORMAT_R8G8B8A8_UNORM,
             .component_map = {
@@ -356,7 +477,8 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
     }
 
     PGRAPHVkState *r = pg->vk_renderer_state;
-    bool mali_bake = r->is_mali && mali_format_needs_bake(s.color_format);
+    bool mali_bake = (r->gpu_quirks & GPU_QUIRK_COLOR_FORMAT_BAKE) &&
+                     mali_format_needs_bake(s.color_format);
 
     TextureLayout *layout = g_malloc0(sizeof(TextureLayout));
 
@@ -1222,7 +1344,8 @@ static bool check_surface_to_texture_compatiblity(PGRAPHVkState *r,
      * surface holds raw channel-ordered bytes while the texture view expects
      * the swizzle baked into a different layout. Force a copy path instead.
      */
-    if (r->is_mali && mali_format_needs_bake(shape->color_format)) {
+    if ((r->gpu_quirks & GPU_QUIRK_COLOR_FORMAT_BAKE) &&
+        mali_format_needs_bake(shape->color_format)) {
         return false;
     }
 
@@ -1623,7 +1746,8 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
      * actually wants. Costs one blit per such bind; cheap vs a GPU TDR.
      * Zeta direct-bind already uses DEPTH_STENCIL_READ_ONLY_OPTIMAL so it
      * doesn't need this; only color is affected. */
-    bool is_mali_color_direct_bind = surface_to_texture && r->is_mali &&
+    bool is_mali_color_direct_bind = surface_to_texture &&
+        (r->gpu_quirks & GPU_QUIRK_NO_COLOR_DIRECT_BIND) &&
         surface && surface->color;
     if (is_mali_color_direct_bind && binding_found) {
         snode->draw_time = 0;
@@ -1825,6 +1949,9 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     };
 
     VkResult create_result = VK_SUCCESS;
+    /* Pool reuse keeps the original allocation's bytes already counted; only a
+     * fresh vmaCreateImage adds to texture_cache_bytes (see budget block). */
+    bool tex_image_is_new = false;
     if (image_pool_acquire(r, &pool_cfg, &snode->image, &snode->allocation)) {
         snode->current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         OPT_STAT_INC(tex_pool_hits);
@@ -1832,6 +1959,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         create_result = vmaCreateImage(r->allocator, &image_create_info,
                                        &alloc_create_info, &snode->image,
                                        &snode->allocation, NULL);
+        tex_image_is_new = true;
         OPT_STAT_INC(tex_pool_misses);
     }
     if (create_result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
@@ -1886,6 +2014,10 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         VK_LOG_ERROR("vmaCreateImage FATAL: result=%d", create_result);
     }
     assert(create_result == VK_SUCCESS && "vmaCreateImage failed");
+
+    if (tex_image_is_new && create_result == VK_SUCCESS) {
+        tex_bytes_add(r, snode->allocation);
+    }
 
     VkImageViewCreateInfo image_view_create_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -2317,6 +2449,7 @@ static void image_pool_release(PGRAPHVkState *r,
         PooledImage *oldest = QTAILQ_FIRST(&r->image_pool);
         assert(oldest != NULL);
         QTAILQ_REMOVE(&r->image_pool, oldest, entry);
+        tex_bytes_sub(r, oldest->allocation);
         vmaDestroyImage(r->allocator, oldest->image, oldest->allocation);
         g_free(oldest);
         r->image_pool_count--;
@@ -2335,6 +2468,7 @@ static void image_pool_drain(PGRAPHVkState *r)
     PooledImage *entry, *next;
     QTAILQ_FOREACH_SAFE(entry, &r->image_pool, entry, next) {
         QTAILQ_REMOVE(&r->image_pool, entry, entry);
+        tex_bytes_sub(r, entry->allocation);
         vmaDestroyImage(r->allocator, entry->image, entry->allocation);
         g_free(entry);
     }
