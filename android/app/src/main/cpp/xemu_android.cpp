@@ -686,6 +686,7 @@ struct SetupFiles {
   std::string config_path;
   std::string inline_aio_flag_path;
   std::string audio_driver;  // SDL audio driver hint ("aaudio", "android", "dummy")
+  std::string env_vars;      // raw "KEY=val;KEY2=val2" string from env_vars pref
 };
 
 struct DisplaySettings {
@@ -818,6 +819,42 @@ static bool WriteConfigToml(const std::string& config_path,
   return true;
 }
 
+static void ApplyEnvVars(const std::string& envVars) {
+    /*
+     * env_vars pref is a `;`-separated list of KEY=VAL pairs (newlines
+     * also work as separators for readability). Splitting only on
+     * newline (the std::getline default) silently absorbs every entry
+     * after the first into that first entry's value — the user's
+     * `KEY1=v1;KEY2=v2` becomes one setenv("KEY1", "v1;KEY2=v2"), and
+     * any flag that downstream code derives from KEY1's value gets
+     * polluted with the rest of the string. We saw that on 2026-05-24
+     * with `XEMU_ANDROID_GDB_PORT=1234;X1BOX_ADPF_ENABLED=1`: -gdb
+     * tcp:: was passed the full polluted port, failed bind, destroyed
+     * a chardev, and FORTIFY aborted on the next lock — looked like a
+     * mystery boot crash.
+     */
+    if (envVars.empty()) return;
+    size_t pos = 0;
+    while (pos < envVars.size()) {
+        size_t next = envVars.find_first_of(";\n\r", pos);
+        if (next == std::string::npos) next = envVars.size();
+        std::string entry = envVars.substr(pos, next - pos);
+        pos = next + 1;
+        size_t s = entry.find_first_not_of(" \t");
+        size_t e = entry.find_last_not_of(" \t");
+        if (s == std::string::npos) continue;
+        entry = entry.substr(s, e - s + 1);
+        if (entry.empty()) continue;
+        auto eq = entry.find('=');
+        if (eq == std::string::npos || eq == 0) continue;
+        std::string key = entry.substr(0, eq);
+        std::string val = entry.substr(eq + 1);
+        setenv(key.c_str(), val.c_str(), 1);
+        __android_log_print(ANDROID_LOG_INFO, kLogTag, "env: %s=%s",
+                            key.c_str(), val.c_str());
+    }
+}
+
 static SetupFiles SyncSetupFiles() {
   SetupFiles out{};
   JNIEnv* env = GetEnv();
@@ -847,42 +884,8 @@ static SetupFiles SyncSetupFiles() {
   out.eeprom = base + "/eeprom.bin";
   out.inline_aio_flag_path = base + "/inline_aio_required.flag";
 
-  std::string envVars = GetPrefString(env, activity, "env_vars");
-  if (!envVars.empty()) {
-    /*
-     * env_vars pref is a `;`-separated list of KEY=VAL pairs (newlines
-     * also work as separators for readability). Splitting only on
-     * newline (the std::getline default) silently absorbs every entry
-     * after the first into that first entry's value — the user's
-     * `KEY1=v1;KEY2=v2` becomes one setenv("KEY1", "v1;KEY2=v2"), and
-     * any flag that downstream code derives from KEY1's value gets
-     * polluted with the rest of the string. We saw that on 2026-05-24
-     * with `XEMU_ANDROID_GDB_PORT=1234;X1BOX_ADPF_ENABLED=1`: -gdb
-     * tcp:: was passed the full polluted port, failed bind, destroyed
-     * a chardev, and FORTIFY aborted on the next lock — looked like a
-     * mystery boot crash.
-     */
-    size_t pos = 0;
-    while (pos < envVars.size()) {
-      size_t next = envVars.find_first_of(";\n\r", pos);
-      if (next == std::string::npos) next = envVars.size();
-      std::string entry = envVars.substr(pos, next - pos);
-      pos = next + 1;
-      /* Trim surrounding whitespace so `A=1 ; B=2` works too. */
-      size_t s = entry.find_first_not_of(" \t");
-      size_t e = entry.find_last_not_of(" \t");
-      if (s == std::string::npos) continue;
-      entry = entry.substr(s, e - s + 1);
-      if (entry.empty()) continue;
-      auto eq = entry.find('=');
-      if (eq == std::string::npos || eq == 0) continue;
-      std::string key = entry.substr(0, eq);
-      std::string val = entry.substr(eq + 1);
-      setenv(key.c_str(), val.c_str(), 1);
-      __android_log_print(ANDROID_LOG_INFO, kLogTag,
-                          "env: %s=%s", key.c_str(), val.c_str());
-    }
-  }
+  out.env_vars = GetPrefString(env, activity, "env_vars");
+  ApplyEnvVars(out.env_vars);
 
   const std::string mcpxPath = GetPrefString(env, activity, "mcpxPath");
   const std::string flashPath = GetPrefString(env, activity, "flashPath");
@@ -1468,6 +1471,10 @@ extern "C" int SDL_main(int argc, char* argv[]) {
     LogInfoFmt("Config final dvd=%s", g_config.sys.files.dvd_path ? g_config.sys.files.dvd_path : "(null)");
     LogInfoFmt("Config final eeprom=%s", g_config.sys.files.eeprom_path ? g_config.sys.files.eeprom_path : "(null)");
 
+    /* Re-apply env_vars after xemu_settings_load so user overrides win over
+     * the XEMU_ANDROID_* defaults set with overwrite=1 inside settings_load. */
+    ApplyEnvVars(setup.env_vars);
+
     std::vector<std::string> arg_storage;
     arg_storage.emplace_back("xemu");
     if (IsTcgTuningEnabled()) {
@@ -1639,6 +1646,22 @@ Java_com_izzy2lost_x1box_MainActivity_nativeGetShaderStats(JNIEnv *env, jobject)
 {
     char buf[256];
     nv2a_profile_get_shader_stats_str(buf, sizeof(buf));
+    return env->NewStringUTF(buf);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_izzy2lost_x1box_MainActivity_nativeGetCpuStats(JNIEnv *env, jobject)
+{
+    char buf[512];
+    nv2a_profile_get_cpu_timing_str(buf, sizeof(buf));
+    return env->NewStringUTF(buf);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_izzy2lost_x1box_MainActivity_nativeGetWorkloadStats(JNIEnv *env, jobject)
+{
+    char buf[512];
+    nv2a_profile_get_workload_str(buf, sizeof(buf));
     return env->NewStringUTF(buf);
 }
 

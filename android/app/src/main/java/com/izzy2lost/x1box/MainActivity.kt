@@ -9,8 +9,10 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.hardware.input.InputManager
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Debug
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
@@ -43,6 +45,8 @@ import org.libsdl.app.SDLSurface
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -85,11 +89,36 @@ class MainActivity : SDLActivity(), InputManager.InputDeviceListener {
   private var fpsTextView: TextView? = null
   private val fpsHandler = Handler(Looper.getMainLooper())
   private val fpsUpdateInterval = 1000L
+  private var overlayTemplate: String = "{fps} FPS"
+  private val batteryManager: BatteryManager by lazy {
+    getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+  }
+  private val timeFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
   private val fpsRunnable = object : Runnable {
     override fun run() {
-      fpsTextView?.text = "FPS: ${nativeGetFps()}"
+      fpsTextView?.text = expandOverlayTemplate(overlayTemplate)
       fpsHandler.postDelayed(this, fpsUpdateInterval)
     }
+  }
+
+  private fun expandOverlayTemplate(template: String): String {
+    var s = template
+    if ("{fps}" in s)      s = s.replace("{fps}", nativeGetFps().toString())
+    if ("{time}" in s)     s = s.replace("{time}", LocalTime.now().format(timeFormatter))
+    if ("{battery}" in s) {
+      val lvl = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+      s = s.replace("{battery}", if (lvl < 0) "?" else lvl.toString())
+    }
+    if ("{mem}" in s) {
+      val mi = Debug.MemoryInfo()
+      Debug.getMemoryInfo(mi)
+      s = s.replace("{mem}", (mi.totalPss / 1024).toString())
+    }
+    if ("{pacing}" in s)   s = s.replace("{pacing}", nativeGetFramePacing())
+    if ("{shader}" in s)   s = s.replace("{shader}", nativeGetShaderStats())
+    if ("{cpu}" in s)      s = s.replace("{cpu}", nativeGetCpuStats())
+    if ("{workload}" in s) s = s.replace("{workload}", nativeGetWorkloadStats())
+    return s.replace("\\n", "\n")
   }
 
   override fun loadLibraries() {
@@ -334,7 +363,6 @@ class MainActivity : SDLActivity(), InputManager.InputDeviceListener {
       setShadowLayer(2f, 1f, 1f, Color.BLACK)
       setPadding(16, 8, 16, 8)
       setBackgroundColor(Color.argb(100, 0, 0, 0))
-      maxLines = 1
       visibility = View.GONE
     }
     val params = RelativeLayout.LayoutParams(
@@ -393,8 +421,9 @@ class MainActivity : SDLActivity(), InputManager.InputDeviceListener {
       registerVirtualController()
     }, 1000)
 
-    val showFps = getSharedPreferences("x1box_prefs", MODE_PRIVATE)
-      .getBoolean("show_fps", false)
+    val prefs2 = getSharedPreferences("x1box_prefs", MODE_PRIVATE)
+    val showFps = prefs2.getBoolean("show_fps", false)
+    overlayTemplate = prefs2.getString("fps_overlay_template", "{fps} FPS") ?: "{fps} FPS"
     fpsTextView?.visibility = if (showFps) View.VISIBLE else View.GONE
     fpsHandler.removeCallbacks(fpsRunnable)
     if (showFps) {
@@ -640,6 +669,10 @@ class MainActivity : SDLActivity(), InputManager.InputDeviceListener {
   private external fun nativeLoadSnapshot(name: String): Boolean
   private external fun nativeRebootSystem()
   private external fun nativeGetFps(): Int
+  private external fun nativeGetFramePacing(): String
+  private external fun nativeGetShaderStats(): String
+  private external fun nativeGetCpuStats(): String
+  private external fun nativeGetWorkloadStats(): String
   private external fun nativePauseEmulation()
   private external fun nativeResumeEmulation()
   private external fun nativeSetReturnToLibraryOnExit(enable: Boolean)

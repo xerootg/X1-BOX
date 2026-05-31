@@ -997,6 +997,50 @@
                 android:text="@string/settings_dashboard_import_action" />
             </LinearLayout>
 
+            <View
+              android:layout_width="match_parent"
+              android:layout_height="1dp"
+              android:layout_marginTop="16dp"
+              android:layout_marginBottom="16dp"
+              android:background="@color/xemu_outline_variant" />
+
+            <TextView
+              android:layout_width="wrap_content"
+              android:layout_height="wrap_content"
+              android:layout_marginBottom="8dp"
+              android:background="@drawable/section_header_background"
+              android:text="Env Vars"
+              android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
+              android:textColor="@color/xemu_green_light" />
+
+            <LinearLayout
+              android:id="@+id/layout_env_var_rows"
+              android:layout_width="match_parent"
+              android:layout_height="wrap_content"
+              android:orientation="vertical" />
+
+            <View
+              android:layout_width="match_parent"
+              android:layout_height="1dp"
+              android:layout_marginTop="8dp"
+              android:layout_marginBottom="16dp"
+              android:background="@color/xemu_outline_variant" />
+
+            <TextView
+              android:layout_width="wrap_content"
+              android:layout_height="wrap_content"
+              android:layout_marginBottom="8dp"
+              android:background="@drawable/section_header_background"
+              android:text="Flag Files"
+              android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
+              android:textColor="@color/xemu_green_light" />
+
+            <LinearLayout
+              android:id="@+id/layout_flag_rows"
+              android:layout_width="match_parent"
+              android:layout_height="wrap_content"
+              android:orientation="vertical" />
+
           </LinearLayout>
 
           <View
@@ -1020,6 +1064,32 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/settings_show_fps"
+            android:textColor="@color/xemu_text_muted" />
+
+          <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/layout_fps_template"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="@string/settings_fps_template_hint"
+            style="@style/Widget.Material3.TextInputLayout.OutlinedBox">
+            <com.google.android.material.textfield.TextInputEditText
+              android:id="@+id/edit_fps_template"
+              android:layout_width="match_parent"
+              android:layout_height="wrap_content"
+              android:inputType="text"
+              android:maxLines="1"
+              android:fontFamily="monospace"
+              android:textSize="12sp" />
+          </com.google.android.material.textfield.TextInputLayout>
+
+          <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:layout_marginBottom="8dp"
+            android:text="@string/settings_fps_template_tokens"
+            android:textAppearance="@style/TextAppearance.Material3.BodySmall"
             android:textColor="@color/xemu_text_muted" />
 
           <com.google.android.material.materialswitch.MaterialSwitch

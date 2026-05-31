@@ -19,6 +19,7 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.button.MaterialButtonToggleGroup
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.materialswitch.MaterialSwitch
+import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
 import java.io.BufferedOutputStream
 import java.io.BufferedInputStream
@@ -54,6 +55,95 @@ class SettingsActivity : AppCompatActivity() {
       "xemu.toml",
     )
     private val MANAGED_EMULATOR_FILE_NAMES = MANAGED_EMULATOR_FILE_ORDER.toSet()
+
+    private val KNOWN_ENV_VARS = listOf(
+      // JIT/CPU
+      "X1BOX_X87_INLINE",
+      "X1BOX_X87_LIB_MASK",
+      "X1BOX_X87_FP64_MASK",
+      "X1BOX_X87_FLUSH_EACH",
+      "X1BOX_X87_SHADOW",
+      "X1BOX_CC_INLINE",
+      "X1BOX_JC_INVAL_O1",
+      "X1BOX_CHAIN_MAX",
+      "X1BOX_CHAIN_JITTER",
+      "X1BOX_CRANELIFT_THRESHOLD",
+      "X1BOX_CRANELIFT_SWAP",
+      "X1BOX_HELPER_ROUTE_SHIM",
+      "X1BOX_CRANELIFT_MAX_INSTALLS",
+      "X1BOX_SSE_INLINE",
+      "X1BOX_BURST_DIAG",
+      // HLE
+      "X1BOX_HLE",
+      "X1BOX_HLE_RTL",
+      "X1BOX_HLE_KF",
+      "X1BOX_HLE_YIELD",
+      "X1BOX_HLE_DSOUND",
+      "X1BOX_HLE_KI_IDLE_YIELD_NS",
+      "X1BOX_HLE_KI_IDLE_GATE_MASK",
+      "X1BOX_HLE_HALO2_POW",
+      "X1BOX_HLE_HALO2_POW_SWAP",
+      // Graphics
+      "X1BOX_ENABLE_IDX_CACHE",
+      "X1BOX_DISABLE_VTX_FAST_PATH",
+      "X1BOX_ENABLE_SURF_SKIP",
+      "X1BOX_TEX_CACHE_MB",
+      "X1BOX_VK_SUBMIT_FRAMES",
+      "XEMU_ANDROID_FORCE_CPU_BLIT",
+      // Audio
+      "XEMU_ANDROID_AUDIO_SAMPLES",
+      "XEMU_ANDROID_AUDIO_FIFO_FRAMES",
+      "XEMU_ANDROID_VP_WORKERS",
+      // Scheduler
+      "X1BOX_SCHED_PROFILE",
+      "X1BOX_SCHED_UCLAMP_HOT",
+      "X1BOX_SCHED_UCLAMP_HOTWARM",
+      "X1BOX_SCHED_UCLAMP_WARM",
+      "X1BOX_SCHED_UCLAMP_COOL",
+      "X1BOX_SCHED_EXCLUDE_LITTLE",
+      "X1BOX_SCHED_PIN_TCG_BIG",
+      "X1BOX_SCHED_PIN_PFIFO_MID",
+      "X1BOX_SCHED_PIN_WARM_MID",
+      "X1BOX_SCHED_DEBUG",
+      // ADPF
+      "X1BOX_ADPF_ENABLED",
+      "X1BOX_ADPF_TARGET_NS",
+      "X1BOX_ADPF_TARGET_MAX_NS",
+      "X1BOX_ADPF_REPORT_PERIOD_MS",
+      "X1BOX_ADPF_THREAD_FILTER",
+      "X1BOX_ADPF_DEBUG",
+      // Android TCG/runtime
+      "XEMU_ANDROID_TCG_TUNING",
+      "XEMU_ANDROID_TCG_TB_SIZE",
+      "XEMU_ANDROID_EGL_OFFSCREEN",
+      "XEMU_ANDROID_INLINE_AIO",
+      "XEMU_ANDROID_GDB_PORT",
+      "XEMU_ANDROID_GDB_PAUSE",
+      // Debug
+      "X1BOX_SDL_BQL_KEEP_RENDER",
+      "X1BOX_SDL_BQL_KEEP_POST_UPDATE",
+    )
+
+    private val KNOWN_FLAG_FILES = listOf(
+      "audio_trace.flag",
+      "probe_nan.flag",
+      "frame_stats.flag",
+    )
+
+    // Default values as set by xemu_settings_load() / SyncSetupFiles defaults.
+    // A field not in this map starts blank (= "not set" = no override).
+    private val ENV_VAR_DEFAULTS = mapOf(
+      "X1BOX_HLE"                    to "1",
+      "X1BOX_HLE_DSOUND"             to "1",
+      "X1BOX_HLE_KI_IDLE_GATE_MASK"  to "0x3",
+      "X1BOX_SSE_INLINE"             to "0",
+      "X1BOX_HELPER_ROUTE_SHIM"      to "0",
+      "X1BOX_X87_LIB_MASK"           to "0xFFFFFFFF",
+      "XEMU_ANDROID_FORCE_CPU_BLIT"  to "0",
+      "XEMU_ANDROID_TCG_TUNING"      to "1",
+      "XEMU_ANDROID_TCG_TB_SIZE"     to "128",
+      "XEMU_ANDROID_VP_WORKERS"      to "1",
+    )
   }
 
   private val prefs by lazy { getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
@@ -173,6 +263,10 @@ class SettingsActivity : AppCompatActivity() {
 
   private lateinit var btnImportEmulatorFiles: MaterialButton
   private lateinit var btnExportEmulatorFiles: MaterialButton
+  private lateinit var layoutEnvVarRows: LinearLayout
+  private lateinit var layoutFlagRows: LinearLayout
+  private val envVarFields = mutableMapOf<String, TextInputEditText>()
+  private val flagSwitches = mutableMapOf<String, MaterialSwitch>()
   private lateinit var switchDebugLogs: MaterialSwitch
   private lateinit var switchNetworkEnable: MaterialSwitch
   private lateinit var driverStatusText: TextView
@@ -324,6 +418,8 @@ class SettingsActivity : AppCompatActivity() {
     val switchAsyncCompile = findViewById<MaterialSwitch>(R.id.switch_async_compile)
     val switchFrameSkip    = findViewById<MaterialSwitch>(R.id.switch_frame_skip)
     val switchShowFps      = findViewById<MaterialSwitch>(R.id.switch_show_fps)
+    val editFpsTemplate    = findViewById<com.google.android.material.textfield.TextInputEditText>(R.id.edit_fps_template)
+    val layoutFpsTemplate  = findViewById<com.google.android.material.textfield.TextInputLayout>(R.id.layout_fps_template)
     switchDebugLogs      = findViewById(R.id.switch_debug_logs)
     val toggleAudioDriver = findViewById<MaterialButtonToggleGroup>(R.id.toggle_audio_driver)
     val btnSave           = findViewById<MaterialButton>(R.id.btn_settings_save)
@@ -343,6 +439,12 @@ class SettingsActivity : AppCompatActivity() {
     btnRegisterInsignia  = findViewById(R.id.btn_register_insignia)
     btnImportDashboard   = findViewById(R.id.btn_import_dashboard)
     layoutAdvancedExperimentalContent = findViewById(R.id.layout_advanced_experimental_content)
+    layoutEnvVarRows = findViewById(R.id.layout_env_var_rows)
+    layoutFlagRows   = findViewById(R.id.layout_flag_rows)
+    populateEnvVarRows()
+    populateFlagRows()
+    loadEnvVarPrefs()
+    loadFlagPrefs()
     dropdownUiOrientation = findViewById(R.id.dropdown_app_orientation)
     dropdownGameOrientation = findViewById(R.id.dropdown_game_orientation)
     driverStatusText      = findViewById(R.id.settings_gpu_driver_status)
@@ -485,6 +587,11 @@ class SettingsActivity : AppCompatActivity() {
     switchAsyncCompile.isChecked = prefs.getBoolean("async_compile", false)
     switchFrameSkip.isChecked    = prefs.getBoolean("frame_skip", false)
     switchShowFps.isChecked      = prefs.getBoolean("show_fps", false)
+    editFpsTemplate.setText(prefs.getString("fps_overlay_template", "{fps} FPS"))
+    layoutFpsTemplate.visibility = if (switchShowFps.isChecked) android.view.View.VISIBLE else android.view.View.GONE
+    switchShowFps.setOnCheckedChangeListener { _, checked ->
+      layoutFpsTemplate.visibility = if (checked) android.view.View.VISIBLE else android.view.View.GONE
+    }
     switchDebugLogs.isChecked =
       prefs.getBoolean(DebugLog.PREF_ENABLED, false)
     switchNetworkEnable.isChecked =
@@ -598,6 +705,7 @@ class SettingsActivity : AppCompatActivity() {
         .putBoolean("async_compile", switchAsyncCompile.isChecked)
         .putBoolean("frame_skip", switchFrameSkip.isChecked)
         .putBoolean("show_fps", switchShowFps.isChecked)
+        .putString("fps_overlay_template", editFpsTemplate.text?.toString()?.ifBlank { "{fps} FPS" } ?: "{fps} FPS")
         .putBoolean(DebugLog.PREF_ENABLED, enableDebugLogs)
         .putBoolean("setting_network_enable", switchNetworkEnable.isChecked)
         .putString("setting_audio_driver", selectedAudioDriver)
@@ -605,6 +713,8 @@ class SettingsActivity : AppCompatActivity() {
         .putString("setting_renderer", selectedRenderer)
 
       edit.apply()
+      saveEnvVarPrefs()
+      saveFlagPrefs()
       DebugLog.setEnabled(
         context = this@SettingsActivity,
         value = enableDebugLogs,
@@ -2829,5 +2939,104 @@ class SettingsActivity : AppCompatActivity() {
       val col = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
       if (col >= 0 && cursor.moveToFirst()) cursor.getString(col) else null
     }
+  }
+
+  private fun x1boxDir(): File = File(getExternalFilesDir(null) ?: filesDir, "x1box")
+
+  private fun populateEnvVarRows() {
+    val dp8 = (8 * resources.displayMetrics.density).toInt()
+    for (name in KNOWN_ENV_VARS) {
+      val til = TextInputLayout(
+        this, null,
+        com.google.android.material.R.attr.textInputOutlinedStyle
+      ).apply {
+        layoutParams = LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.MATCH_PARENT,
+          LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.bottomMargin = dp8 }
+        hint = name
+      }
+      val edit = TextInputEditText(til.context).apply {
+        layoutParams = LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.MATCH_PARENT,
+          LinearLayout.LayoutParams.WRAP_CONTENT
+        )
+        setSingleLine(true)
+        inputType = android.text.InputType.TYPE_CLASS_TEXT or
+          android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+      }
+      til.addView(edit)
+      layoutEnvVarRows.addView(til)
+      envVarFields[name] = edit
+    }
+  }
+
+  private fun populateFlagRows() {
+    val dp4 = (4 * resources.displayMetrics.density).toInt()
+    val mutedColor = resources.getColor(R.color.xemu_text_muted, theme)
+    for (name in KNOWN_FLAG_FILES) {
+      val sw = MaterialSwitch(this).apply {
+        layoutParams = LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.MATCH_PARENT,
+          LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp4 }
+        text = name
+        setTextColor(mutedColor)
+      }
+      layoutFlagRows.addView(sw)
+      flagSwitches[name] = sw
+    }
+  }
+
+  private fun loadEnvVarPrefs() {
+    val raw = prefs.getString("env_vars", "") ?: ""
+    val map = mutableMapOf<String, String>()
+    var pos = 0
+    while (pos < raw.length) {
+      val next = run {
+        val idx = raw.indexOfAny(charArrayOf(';', '\n', '\r'), pos)
+        if (idx == -1) raw.length else idx
+      }
+      val entry = raw.substring(pos, next).trim()
+      pos = next + 1
+      if (entry.isEmpty()) continue
+      val eq = entry.indexOf('=')
+      if (eq > 0) map[entry.substring(0, eq)] = entry.substring(eq + 1)
+    }
+    for ((name, field) in envVarFields) {
+      field.setText(map[name] ?: ENV_VAR_DEFAULTS[name] ?: "")
+    }
+  }
+
+  private fun saveEnvVarPrefs() {
+    val pairs = envVarFields
+      .filter { (_, field) -> field.text?.isNotEmpty() == true }
+      .map { (name, field) -> "$name=${field.text}" }
+    prefs.edit().putString("env_vars", pairs.joinToString(";")).apply()
+  }
+
+  private fun loadFlagPrefs() {
+    val dir = x1boxDir()
+    for ((name, sw) in flagSwitches) {
+      val onDisk = File(dir, name).exists()
+      val inPrefs = prefs.getBoolean("flagfile_$name", false)
+      sw.isChecked = onDisk || inPrefs
+    }
+  }
+
+  private fun saveFlagPrefs() {
+    val dir = x1boxDir()
+    dir.mkdirs()
+    val edit = prefs.edit()
+    for ((name, sw) in flagSwitches) {
+      edit.putBoolean("flagfile_$name", sw.isChecked)
+      val file = File(dir, name)
+      if (sw.isChecked) {
+        if (!file.exists()) file.createNewFile()
+      } else {
+        file.delete()
+      }
+    }
+    edit.apply()
   }
 }
