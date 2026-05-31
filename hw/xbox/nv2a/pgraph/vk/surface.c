@@ -3094,6 +3094,27 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
             bool unshelved = false;
             surface = get_shelved_surface(r, target.vram_addr, &target);
             if (surface) {
+                /*
+                 * Reusing the shelved VkImage skips the VRAM re-upload, so its
+                 * GPU contents must be complete before the new binding samples
+                 * it: (1) any deferred download still READING this image must
+                 * finish, and (2) the draws that WROTE it must retire. Read the
+                 * shelved binding's last_write_submit BEFORE migrate/overwrite.
+                 * Blind reuse read stale data (the per-frame surface flicker) on
+                 * BOTH Mali and Adreno — this is the only surface-reuse path with
+                 * no in-flight guard (the invalid-surface path has
+                 * surface_in_flight()). Applied to all vendors: both waits
+                 * short-circuit when the image is already retired (the common
+                 * case for a surface shelved across frames), so the cost is only
+                 * paid on the actual race.
+                 */
+                {
+                    uint32_t shelved_write = surface->last_write_submit;
+                    if (r->num_deferred_downloads > 0) {
+                        pgraph_vk_download_surface_complete_deferred(d);
+                    }
+                    pgraph_vk_wait_for_submit(pg, shelved_write);
+                }
                 migrate_surface_image(&target, surface);
                 unshelved = true;
             } else {

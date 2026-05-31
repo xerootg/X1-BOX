@@ -2390,6 +2390,28 @@ const enum NV2A_PROF_COUNTERS_ENUM finish_reason_to_counter_enum[] = {
     [VK_FINISH_REASON_STALLED] = NV2A_PROF_FINISH_STALLED,
 };
 
+void pgraph_vk_wait_for_submit(PGRAPHState *pg, uint32_t submit_idx)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    /*
+     * "In flight" iff fewer than num_active_frames submits have completed since
+     * this one — same conservative test the texture hazard gates used inline.
+     * submit_idx is always <= submit_count (stamped from it), so the unsigned
+     * add cannot wrap in practice.
+     *
+     * When still in flight we use pgraph_vk_flush_all_frames(), which does
+     * pgraph_vk_render_thread_wait_idle() before waiting the frame fences.
+     * Hand-rolling a single frame_fence wait here would race the render
+     * thread's own fence management (it resets/waits these fences and runs a
+     * 4 s Mali safety wait), risking deadlock/DEVICE_LOST. A precise
+     * single-slot wait is a possible future optimization once a submit->slot
+     * map is maintained.
+     */
+    if (submit_idx + r->num_active_frames > r->submit_count) {
+        pgraph_vk_flush_all_frames(pg);
+    }
+}
+
 void pgraph_vk_flush_all_frames(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
@@ -2521,19 +2543,37 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
         /* WAR barrier: previous submissions may still be reading from shared
          * destination buffers (UNIFORM, INDEX, VERTEX_INLINE, VERTEX_RAM).
          * The staging sync below overwrites these from offset 0. Ensure all
-         * previous reads complete before we write. */
-        VkMemoryBarrier war_barrier = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT |
-                             VK_ACCESS_MEMORY_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT |
-                             VK_ACCESS_MEMORY_WRITE_BIT,
-        };
-        vkCmdPipelineBarrier(
-            cmd,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            0, 1, &war_barrier, 0, NULL, 0, NULL);
+         * previous reads complete before we write.
+         *
+         * Skip entirely when no staging buffer has pending data and vertex_ram
+         * has no dirty range: the sync_staging_buffer()/flush_memory_buffer()
+         * calls below all self-skip in that case, so this coarse
+         * ALL_COMMANDS->ALL_COMMANDS barrier would order nothing. Provably safe
+         * (there are no writes to protect) and removes a full-pipeline barrier
+         * on staging-free submits. */
+        {
+            FrameStagingState *fs_war = &r->frame_staging[r->current_frame];
+            bool any_staging =
+                get_staging_buffer(r, BUFFER_INDEX_STAGING)->buffer_offset ||
+                get_staging_buffer(r, BUFFER_VERTEX_INLINE_STAGING)
+                    ->buffer_offset ||
+                get_staging_buffer(r, BUFFER_UNIFORM_STAGING)->buffer_offset ||
+                (fs_war->vertex_ram_flush_min < fs_war->vertex_ram_flush_max);
+            if (any_staging) {
+                VkMemoryBarrier war_barrier = {
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                                     VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                                     VK_ACCESS_MEMORY_WRITE_BIT,
+                };
+                vkCmdPipelineBarrier(
+                    cmd,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    0, 1, &war_barrier, 0, NULL, 0, NULL);
+            }
+        }
 
         sync_staging_buffer(pg, cmd, BUFFER_INDEX_STAGING, BUFFER_INDEX);
         sync_staging_buffer(pg, cmd, BUFFER_VERTEX_INLINE_STAGING,
@@ -6073,6 +6113,7 @@ void pgraph_vk_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta)
         r->color_binding->draw_dirty |= color;
         if (color) {
             r->color_binding->draw_generation++;
+            r->color_binding->last_write_submit = r->submit_count;
         }
         r->color_binding->frame_time = pg->frame_time;
         r->color_binding->cleared = false;
@@ -6082,6 +6123,7 @@ void pgraph_vk_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta)
         r->zeta_binding->draw_dirty |= zeta;
         if (zeta) {
             r->zeta_binding->draw_generation++;
+            r->zeta_binding->last_write_submit = r->submit_count;
         }
         r->zeta_binding->frame_time = pg->frame_time;
         r->zeta_binding->cleared = false;

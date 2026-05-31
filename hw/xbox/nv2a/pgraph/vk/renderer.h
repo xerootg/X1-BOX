@@ -291,6 +291,12 @@ typedef struct SurfaceBinding {
     uint32_t draw_generation;
     uint32_t download_generation;
 
+    /* r->submit_count at the time this surface's image was last written by a
+     * draw (stamped in pgraph_vk_set_surface_dirty). Gates sampling/reuse of
+     * the image on its OWN GPU write completing, instead of a global frame
+     * flush. See pgraph_vk_wait_for_submit(). */
+    uint32_t last_write_submit;
+
     BasicSurfaceFormatInfo fmt;
     SurfaceFormatInfo host_fmt;
 
@@ -1691,6 +1697,12 @@ void pgraph_vk_draw_begin(NV2AState *d);
 void pgraph_vk_draw_end(NV2AState *d);
 void pgraph_vk_finish(PGRAPHState *pg, FinishReason why);
 void pgraph_vk_flush_all_frames(PGRAPHState *pg);
+/* Wait until the GPU submit identified by `submit_idx` (a value previously read
+ * from r->submit_count, e.g. SurfaceBinding.last_write_submit) has retired. No-op
+ * if already retired; otherwise falls back to the render-thread-coordinated
+ * pgraph_vk_flush_all_frames(). Used to gate RT->texture sampling and surface
+ * image reuse on the specific surface's write rather than a blanket flush. */
+void pgraph_vk_wait_for_submit(PGRAPHState *pg, uint32_t submit_idx);
 void pgraph_vk_flush_draw(NV2AState *d);
 void pgraph_vk_flush_draw_queue(NV2AState *d);
 void pgraph_vk_flush_reorder_window(NV2AState *d);

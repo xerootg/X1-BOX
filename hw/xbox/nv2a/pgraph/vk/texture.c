@@ -1676,9 +1676,15 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         bool did_upload = false;
         if (surface_to_texture) {
             if (surface->draw_time != snode->draw_time) {
-                if (snode->submit_time + r->num_active_frames > r->submit_count) {
-                    pgraph_vk_flush_all_frames(pg);
-                }
+                /*
+                 * Sampling a render target as a texture: wait on the SURFACE's
+                 * own last write rather than the texture node's submit_time (a
+                 * weaker/indirect signal) before the direct bind / copy. The
+                 * helper short-circuits when the write is already retired and
+                 * otherwise does the render-thread-coordinated wait. All
+                 * vendors: a per-surface wait is <= the prior global flush.
+                 */
+                pgraph_vk_wait_for_submit(pg, surface->last_write_submit);
                 bool can_direct_bind =
                     (surface->color ||
                      !(surface->host_fmt.aspect & VK_IMAGE_ASPECT_STENCIL_BIT))
@@ -1747,9 +1753,14 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
             }
         } else {
             if (possibly_dirty && content_hash != snode->hash) {
-                if (snode->submit_time + r->num_active_frames > r->submit_count) {
-                    pgraph_vk_flush_all_frames(pg);
-                }
+                /*
+                 * Re-uploading overwrites the texture image, so wait on the
+                 * texture node's own last GPU use (snode->submit_time) to avoid
+                 * stomping an in-flight read. Routed through the helper for a
+                 * single wait path; semantics unchanged from the prior inline
+                 * gate.
+                 */
+                pgraph_vk_wait_for_submit(pg, snode->submit_time);
                 upload_texture_image(pg, texture_idx, snode);
                 snode->hash = content_hash;
                 did_upload = true;
