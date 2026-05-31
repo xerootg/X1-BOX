@@ -1241,8 +1241,13 @@ def measure_fps(duration: float = 5.0) -> str:
 # JIT periodic stats line from hw/xbox/nv2a/pgraph/profile.c (every ~2s):
 #   xemu-jit: win=<ms> tb_gen/s=N tb_inval/s=N tb_flush/s=N
 #             jc_hit%=P jc_miss/s=N lru_hit%=P lru_call/s=N
-#             phint_hit%=P phint_call/s=N
+#             lru_way=W0/W1/W2/W3 phint_hit%=P phint_call/s=N
 #             chain_runs/s=N chain_avg=A.BB irq/s=N
+#             [fpcr=0xH FZ=N FZ16=N DN=N] [route_shim=N route_hit%=P route_call/s=N]
+# lru_way is the per-way hit histogram of the 4-way set-associative helper
+# LRU (MRU→LRU); a fat tail (high W2/W3) means the set is under associativity
+# pressure. This field was added after the original regex and is what made
+# the match silently fail until 2026-05-30.
 # Only emitted by debug + perftest builds in the :xemu process. If you
 # don't see lines, either the build predates the instrumentation or
 # the emulator hasn't reached FLIP_STALL yet (still on the boot logo).
@@ -1255,6 +1260,7 @@ _JIT_STAT_RE = re.compile(
     r"jc_miss/s=(?P<jc_miss>\d+)\s+"
     r"lru_hit%=(?P<lru_hit_pct>\d+)\s+"
     r"lru_call/s=(?P<lru_calls>\d+)\s+"
+    r"lru_way=(?P<lru_way0>\d+)/(?P<lru_way1>\d+)/(?P<lru_way2>\d+)/(?P<lru_way3>\d+)\s+"
     r"phint_hit%=(?P<phint_hit_pct>\d+)\s+"
     r"phint_call/s=(?P<phint_calls>\d+)\s+"
     r"chain_runs/s=(?P<chain_runs>\d+)\s+"
@@ -1331,6 +1337,8 @@ def jit_stats(samples: int = 5) -> str:
             "jc_miss":    int(d["jc_miss"]),
             "lru_hit_pct":int(d["lru_hit_pct"]),
             "lru_calls":  int(d["lru_calls"]),
+            "lru_way":    [int(d["lru_way0"]), int(d["lru_way1"]),
+                           int(d["lru_way2"]), int(d["lru_way3"])],
             "phint_hit_pct": int(d["phint_hit_pct"]),
             "phint_calls":   int(d["phint_calls"]),
             "chain_runs": int(d["chain_runs"]),
@@ -1353,18 +1361,20 @@ def jit_stats(samples: int = 5) -> str:
     out.append(f"Last {len(parsed)} xemu-jit samples (each window ~2s):")
     out.append("")
     out.append("  TB pool                  jmp_cache       helper LRU   "
-               "phint        chain         irq/s")
+               "phint        chain         irq/s   LRU way% (MRU→LRU)")
     out.append("  gen/s inval/s flush/s   hit%  miss/s     hit% call/s   "
                "hit% call/s  runs/s  avg")
     out.append("  " + "-" * 96)
     for r in parsed:
+        way_tot = sum(r["lru_way"]) or 1
+        way_pct = "/".join(f"{round(100 * w / way_tot)}" for w in r["lru_way"])
         out.append(
             f"  {r['tb_gen']:>5} {r['tb_inval']:>7} {r['tb_flush']:>7}   "
             f"{r['jc_hit_pct']:>3}%  {r['jc_miss']:>7}    "
             f"{r['lru_hit_pct']:>3}% {r['lru_calls']:>6}   "
             f"{r['phint_hit_pct']:>3}% {r['phint_calls']:>6}  "
             f"{r['chain_runs']:>6}  {r['chain_avg']:>4.1f}   "
-            f"{r['irq']:>5}"
+            f"{r['irq']:>5}   {way_pct}"
         )
 
     last = parsed[-1]
