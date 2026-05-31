@@ -60,8 +60,35 @@ typedef uint64_t cpu_mask_t;
 #endif
 
 /* ------------------------------------------------------------------ */
-/* sched_setattr glue                                                  */
+/* sched_setattr / sched_getaffinity glue                              */
 /* ------------------------------------------------------------------ */
+
+#ifndef __NR_sched_getaffinity
+#  if defined(__aarch64__)
+#    define __NR_sched_getaffinity 223
+#  elif defined(__x86_64__)
+#    define __NR_sched_getaffinity 204
+#  elif defined(__arm__)
+#    define __NR_sched_getaffinity 242
+#  elif defined(__i386__)
+#    define __NR_sched_getaffinity 242
+#  endif
+#endif
+
+static int x1b_sched_getaffinity(pid_t pid, cpu_mask_t *mask)
+{
+#ifdef __NR_sched_getaffinity
+    *mask = 0;
+    return (int)syscall(__NR_sched_getaffinity, pid, sizeof(*mask), mask);
+#else
+    (void)pid; *mask = 0; errno = ENOSYS; return -1;
+#endif
+}
+
+/* Set once on first EPERM from sched_setattr; skips all future calls.
+ * uclamp.min requires CAP_SYS_NICE which unprivileged Android apps never
+ * have. Avoid burning a syscall every repin pass for a call we know fails. */
+static bool g_uclamp_eperm = false;
 
 #ifndef SCHED_FLAG_KEEP_PARAMS
 #define SCHED_FLAG_KEEP_PARAMS    0x10
@@ -569,6 +596,7 @@ void sched_android_init(void)
  * one operation gated on CAP_SYS_NICE, which we know EPERMs). */
 static void apply_uclamp_min(pid_t tid, uint32_t min_val)
 {
+    if (g_uclamp_eperm) return;
     struct x1b_sched_attr a;
     memset(&a, 0, sizeof(a));
     a.size           = sizeof(a);
@@ -577,7 +605,10 @@ static void apply_uclamp_min(pid_t tid, uint32_t min_val)
     a.sched_util_min = min_val;
     a.sched_util_max = 1024;
     if (x1b_sched_setattr(tid, &a, 0) != 0) {
-        if (g_cfg.debug) {
+        if (errno == EPERM || errno == EACCES) {
+            g_uclamp_eperm = true;
+            SCHED_LOGW("sched_setattr uclamp.min: EPERM — skipping all future uclamp calls");
+        } else if (g_cfg.debug) {
             SCHED_LOGW("sched_setattr(tid=%d uclamp.min=%u) failed: errno=%d (%s)",
                        (int)tid, min_val, errno, strerror(errno));
         }
@@ -780,6 +811,34 @@ static void scanner_pass(void)
 }
 
 /*
+ * Compute the affinity mask we'd set for a policy class.  Returns 0 if
+ * the class has no affinity constraint (POLICY_COOL) or topology is
+ * unavailable.  Used by scanner_repin_pass to detect actual drift
+ * before issuing a sched_setaffinity — a read-only sched_getaffinity +
+ * compare is far cheaper than an unconditional sched_setaffinity, which
+ * acquires the run-queue lock and triggers a migration check even when
+ * the mask hasn't changed.
+ */
+static cpu_mask_t policy_expected_mask(PolicyClass cls)
+{
+    if (!g_topo.valid) return CPU_MASK_ZERO();
+    struct class_policy *p = &g_cfg.by_class[cls];
+    if (!p->set_affinity) return CPU_MASK_ZERO();
+    if (p->pin_biggest && g_topo.biggest_cpu >= 0) {
+        cpu_mask_t m = CPU_MASK_ZERO();
+        CPU_MASK_SET(g_topo.biggest_cpu, &m);
+        return m;
+    }
+    if (p->pin_mid && CPU_MASK_COUNT(g_topo.mid_only_mask) > 0) {
+        return g_topo.mid_only_mask;
+    }
+    if (p->exclude_little) {
+        return g_topo.midbig_mask;
+    }
+    return CPU_MASK_ZERO();
+}
+
+/*
  * Periodically re-apply policy to every TID we already classified.
  *
  * Android can quietly migrate a thread off its pinned mask in a few
@@ -789,17 +848,20 @@ static void scanner_pass(void)
  * services tinkering with sched attrs on perceived idle. Cemu's
  * pinning watchdog exists for exactly these scenarios.
  *
- * This is pure defence in depth. If nothing disturbs us, every
- * sched_setaffinity call here is a no-op (kernel sees mask is already
- * the requested one). Walks our fixed-size tracked-TID array, re-reads
- * comm to handle TID reuse (a recycled TID may now be a non-perf
- * thread we should drop), and re-applies the same policy that
- * scanner_pass() used at first-discovery time.
+ * Optimization: we only issue sched_setaffinity if the thread has
+ * *actually drifted* off its expected mask.  sched_getaffinity is a
+ * read-only kernel op (no migration trigger); sched_setaffinity even
+ * with an identical mask acquires the run-queue lock and queues a
+ * migration check — which causes measurable scheduling jitter on the
+ * pinned threads every 500 ms.  We accept a tiny false-negative window
+ * (Android resets affinity between getaffinity and setaffinity) because
+ * the next 500 ms pass will catch and correct it.
  */
 static void scanner_repin_pass(void)
 {
     pid_t self_tid = (pid_t)syscall(__NR_gettid);
     int repinned = 0;
+    int skipped = 0;
     int dropped = 0;
     for (int i = 0; i < g_scanner_tids_n; ) {
         pid_t tid = g_scanner_tids[i];
@@ -818,13 +880,28 @@ static void scanner_repin_pass(void)
             dropped++;
             continue;
         }
+
+        /* Only re-apply affinity if the thread actually drifted.
+         * sched_getaffinity is a read-only op; sched_setaffinity even
+         * with an unchanged mask acquires the rq lock and triggers a
+         * migration check — enough to produce visible jitter. */
+        cpu_mask_t want = policy_expected_mask(cls);
+        if (want != CPU_MASK_ZERO()) {
+            cpu_mask_t cur = CPU_MASK_ZERO();
+            if (x1b_sched_getaffinity(tid, &cur) == 0 && cur == want) {
+                skipped++;
+                i++;
+                continue;
+            }
+        }
+
         apply_policy_to(tid, comm);
         repinned++;
         i++;
     }
-    if (g_cfg.debug && (repinned > 0 || dropped > 0)) {
-        SCHED_LOGI("scanner: re-pinned %d, dropped %d (total tracked=%d)",
-                   repinned, dropped, g_scanner_tids_n);
+    if (g_cfg.debug && (repinned > 0 || dropped > 0 || skipped > 0)) {
+        SCHED_LOGI("scanner: re-pinned %d, skipped %d, dropped %d (total tracked=%d)",
+                   repinned, skipped, dropped, g_scanner_tids_n);
     }
 }
 
